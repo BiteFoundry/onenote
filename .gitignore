@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# npm packaging
+node_modules/
+npm-debug.log*
+*.tgz
+npm/*/bin/onenote
+npm/*/bin/onenote.exe
+
+# local release staging
+/dist-release/

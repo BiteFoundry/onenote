@@ -1,0 +1,968 @@
+//! Application configuration, local paths, settings (`config.toml`), and note drafts (`drafts.json`).
+//!
+//! Shared foundation module: treat public signatures here as stable across all modules.
+
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+pub const APP_DIR_NAME: &str = "onenote-cli";
+pub const LEGACY_TEAMS_APP_DIR_NAME: &str = "teams-cli";
+pub const DEFAULT_GRAPH_BASE_URL: &str = "https://graph.microsoft.com/v1.0";
+pub const DEFAULT_AUTH_BASE_URL: &str = "https://login.microsoftonline.com";
+/// Default Microsoft multi-tenant public client ID fallback when user does not supply a custom Azure App Client ID.
+/// Users can always override via `--client-id`, `ONENOTE_CLIENT_ID`, `TEAMS_CLIENT_ID`, `AZURE_CLIENT_ID`, or `config.toml`.
+pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
+pub const DEFAULT_TENANT_ID: &str = "common";
+pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/onenote";
+pub const DEFAULT_SERVE_PORT: u16 = 8788;
+
+/// List density mode in TUI (`Cozy` default vs `Compact`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DensityMode {
+    #[default]
+    Cozy,
+    Compact,
+}
+
+impl DensityMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Cozy => Self::Compact,
+            Self::Compact => Self::Cozy,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cozy => "Cozy",
+            Self::Compact => "Compact",
+        }
+    }
+}
+
+/// Terminal color theme preset (`Auto` detects `NO_COLOR`, `COLORTERM`, and `TERM`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreset {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+    Ansi256,
+    Ansi16,
+    NoColor,
+}
+
+impl ThemePreset {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Dark,
+            Self::Dark => Self::Light,
+            Self::Light => Self::Ansi256,
+            Self::Ansi256 => Self::Ansi16,
+            Self::Ansi16 => Self::NoColor,
+            Self::NoColor => Self::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Dark => "Midnight Dark",
+            Self::Light => "Daylight Light",
+            Self::Ansi256 => "ANSI 256",
+            Self::Ansi16 => "ANSI 16",
+            Self::NoColor => "No Color",
+        }
+    }
+}
+
+/// Terminal image rendering protocol preference (`auto` detects Kitty / iTerm2 / Sixel / Halfblock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageProtocolPreference {
+    #[default]
+    Auto,
+    Kitty,
+    #[serde(alias = "iterm")]
+    Iterm2,
+    Sixel,
+    #[serde(alias = "halfblocks", alias = "ansi")]
+    Halfblock,
+}
+
+impl ImageProtocolPreference {
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Some(Self::Auto),
+            "kitty" => Some(Self::Kitty),
+            "iterm2" | "iterm" => Some(Self::Iterm2),
+            "sixel" => Some(Self::Sixel),
+            "halfblock" | "halfblocks" | "ansi" => Some(Self::Halfblock),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Kitty => "kitty",
+            Self::Iterm2 => "iterm2",
+            Self::Sixel => "sixel",
+            Self::Halfblock => "halfblock",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Kitty => "Kitty",
+            Self::Iterm2 => "iTerm2",
+            Self::Sixel => "Sixel",
+            Self::Halfblock => "Halfblock",
+        }
+    }
+}
+
+/// Entry persona (`onenote`), kept as an enum for stable configuration/caller ergonomics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Persona {
+    #[default]
+    Onenote,
+}
+
+impl Persona {
+    /// Detects entry persona (standalone Microsoft OneNote).
+    pub fn detect() -> Self {
+        Self::Onenote
+    }
+
+    pub fn bin_name(self) -> &'static str {
+        match self {
+            Self::Onenote => "onenote",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppConfig {
+    /// Entra ID Application (client) ID.
+    pub client_id: String,
+    /// Entra ID Tenant ID (`common`, `organizations`, domain, or tenant GUID).
+    pub tenant_id: String,
+    /// Optional OAuth scopes override. Empty uses the standard Microsoft OneNote delegated scope set.
+    pub scopes: Vec<String>,
+    /// Base URL for Microsoft Graph v1.0 (overridable for sovereign clouds or mock testing).
+    pub graph_base_url: String,
+    /// Base URL for Entra OAuth2 endpoints (overridable for sovereign clouds or mock testing).
+    pub auth_base_url: String,
+    /// GitHub `owner/repo` used by `onenote update`.
+    pub github_repo: String,
+    /// Enable desktop toast/bell notifications in TUI.
+    pub notify: bool,
+    /// Show left notebook sidebar in wide/medium layout.
+    pub show_nav_rail: bool,
+    /// Render inline image thumbnails directly inside OneNote page reader.
+    pub inline_images: bool,
+    /// Show inline hyperlink `href` URLs next to link text in OneNote page reader (toggleable with `h`).
+    pub show_inline_hrefs: bool,
+    /// Preferred terminal image rendering protocol (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`).
+    pub image_protocol: ImageProtocolPreference,
+    /// Custom download directory. Empty defaults to `Downloads/onenote`.
+    pub download_dir: String,
+    /// Active section/page fast poll interval (ms) in TUI.
+    pub active_poll_ms: u64,
+    /// Background notebook/section hierarchy poll interval (ms).
+    pub hierarchy_poll_ms: u64,
+    /// Optional external token file path (`ONENOTE_TOKEN_FILE` or `config.toml`), read live on demand.
+    pub token_file: String,
+    /// Refresh command string (`ONENOTE_TOKEN_REFRESH_CMD` or `config.toml`), executed when token is missing or within `token_refresh_mins` of expiry.
+    pub token_refresh_cmd: String,
+    /// Refresh threshold in minutes before token expiry (`ONENOTE_TOKEN_REFRESH_MINS`, default `5`).
+    pub token_refresh_mins: u64,
+    /// Allow falling back to `TEAMS_TOKEN_FILE` or `teams-cli` stored M365 tokens when no `onenote-cli` token is configured (`ONENOTE_SHARE_M365_AUTH`, default `true`).
+    pub share_m365_auth: bool,
+    /// CLI local cache TTL in seconds (`ONENOTE_CLI_CACHE_SECS`, default `0`).
+    /// Defaults to `0` so CLI invocations fetch fresh unless `ONENOTE_CLI_CACHE_SECS`, `cli_cache_ttl_secs`, or `--cached` is used.
+    pub cli_cache_ttl_secs: u64,
+    /// Automatically start and attach to the lightweight background sync daemon (`ONENOTE_AUTO_DAEMON=1|true`, default `false`).
+    pub auto_daemon: bool,
+    /// TUI list density (`cozy` or `compact`).
+    pub density: DensityMode,
+    /// TUI color theme preset (`auto`, `dark`, `light`, `ansi256`, `ansi16`, `nocolor`).
+    pub theme: ThemePreset,
+    /// User-pinned notebook keys shown at the top of the Notebooks sidebar.
+    pub pinned_notebooks: Vec<String>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            client_id: first_non_empty_env(&[
+                "ONENOTE_CLIENT_ID",
+                "TEAMS_CLIENT_ID",
+                "AZURE_CLIENT_ID",
+            ])
+            .unwrap_or_else(|| DEFAULT_PUBLIC_CLIENT_ID.to_string()),
+            tenant_id: first_non_empty_env(&[
+                "ONENOTE_TENANT_ID",
+                "TEAMS_TENANT_ID",
+                "AZURE_TENANT_ID",
+            ])
+            .unwrap_or_else(|| DEFAULT_TENANT_ID.to_string()),
+            scopes: Vec::new(),
+            graph_base_url: first_non_empty_env(&["ONENOTE_GRAPH_BASE_URL"])
+                .unwrap_or_else(|| DEFAULT_GRAPH_BASE_URL.to_string()),
+            auth_base_url: first_non_empty_env(&["ONENOTE_AUTH_BASE_URL"])
+                .unwrap_or_else(|| DEFAULT_AUTH_BASE_URL.to_string()),
+            github_repo: first_non_empty_env(&["ONENOTE_GITHUB_REPO"])
+                .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string()),
+            notify: true,
+            show_nav_rail: true,
+            inline_images: true,
+            show_inline_hrefs: false,
+            image_protocol: first_non_empty_env(&[
+                "ONENOTE_IMAGE_PROTOCOL",
+                "TEAMS_IMAGE_PROTOCOL",
+            ])
+            .and_then(|s| ImageProtocolPreference::parse_str(&s))
+            .unwrap_or_default(),
+            download_dir: String::new(),
+            active_poll_ms: 10_000,
+            hierarchy_poll_ms: 60_000,
+            token_file: std::env::var("ONENOTE_TOKEN_FILE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            token_refresh_cmd: std::env::var("ONENOTE_TOKEN_REFRESH_CMD")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            token_refresh_mins: std::env::var("ONENOTE_TOKEN_REFRESH_MINS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(5),
+            share_m365_auth: std::env::var("ONENOTE_SHARE_M365_AUTH")
+                .ok()
+                .and_then(|s| parse_env_bool(&s))
+                .unwrap_or(true),
+            cli_cache_ttl_secs: std::env::var("ONENOTE_CLI_CACHE_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0),
+            auto_daemon: std::env::var("ONENOTE_AUTO_DAEMON")
+                .ok()
+                .and_then(|s| parse_env_bool(&s))
+                .unwrap_or(false),
+            density: DensityMode::default(),
+            theme: ThemePreset::default(),
+            pinned_notebooks: Vec::new(),
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn load() -> Self {
+        let Ok(mut cfg) = Self::load_from(&config_file_path()) else {
+            return Self::default();
+        };
+        // Environment variables take precedence over file values when set.
+        if let Some(cid) =
+            first_non_empty_env(&["ONENOTE_CLIENT_ID", "TEAMS_CLIENT_ID", "AZURE_CLIENT_ID"])
+        {
+            cfg.client_id = cid;
+        }
+        if let Some(tid) =
+            first_non_empty_env(&["ONENOTE_TENANT_ID", "TEAMS_TENANT_ID", "AZURE_TENANT_ID"])
+        {
+            cfg.tenant_id = tid;
+        }
+        if let Some(gurl) = first_non_empty_env(&["ONENOTE_GRAPH_BASE_URL"]) {
+            cfg.graph_base_url = gurl;
+        }
+        if let Some(aurl) = first_non_empty_env(&["ONENOTE_AUTH_BASE_URL"]) {
+            cfg.auth_base_url = aurl;
+        }
+        if let Some(repo) = first_non_empty_env(&["ONENOTE_GITHUB_REPO"]) {
+            cfg.github_repo = repo;
+        }
+        if let Some(tf) = first_non_empty_env(&["ONENOTE_TOKEN_FILE"]) {
+            cfg.token_file = tf;
+        }
+        if let Some(rcmd) = first_non_empty_env(&["ONENOTE_TOKEN_REFRESH_CMD"]) {
+            cfg.token_refresh_cmd = rcmd;
+        }
+        if let Ok(rmins) = std::env::var("ONENOTE_TOKEN_REFRESH_MINS") {
+            if let Ok(parsed) = rmins.trim().parse::<u64>() {
+                cfg.token_refresh_mins = parsed;
+            }
+        }
+        if let Ok(share) = std::env::var("ONENOTE_SHARE_M365_AUTH") {
+            if let Some(parsed) = parse_env_bool(&share) {
+                cfg.share_m365_auth = parsed;
+            }
+        }
+        if let Ok(ttl) = std::env::var("ONENOTE_CLI_CACHE_SECS") {
+            if let Ok(parsed) = ttl.trim().parse::<u64>() {
+                cfg.cli_cache_ttl_secs = parsed;
+            }
+        }
+        if let Ok(ad) = std::env::var("ONENOTE_AUTO_DAEMON") {
+            if let Some(parsed) = parse_env_bool(&ad) {
+                cfg.auto_daemon = parsed;
+            }
+        }
+        if let Some(proto) =
+            first_non_empty_env(&["ONENOTE_IMAGE_PROTOCOL", "TEAMS_IMAGE_PROTOCOL"])
+        {
+            if let Some(parsed) = ImageProtocolPreference::parse_str(&proto) {
+                cfg.image_protocol = parsed;
+            }
+        }
+        cfg
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        toml::from_str(&raw)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.save_to(&config_file_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        ensure_parent(path)?;
+        let raw = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        write_atomic(path, raw.as_bytes())
+    }
+
+    pub fn effective_scopes(&self) -> Vec<String> {
+        if !self.scopes.is_empty() {
+            return self.scopes.clone();
+        }
+        vec![
+            "Notes.Read".to_string(),
+            "Notes.ReadWrite".to_string(),
+            "Notes.Create".to_string(),
+            "User.Read".to_string(),
+            "offline_access".to_string(),
+        ]
+    }
+
+    pub fn resolved_download_dir(&self) -> PathBuf {
+        if self.download_dir.trim().is_empty() {
+            default_download_dir()
+        } else {
+            expand_tilde(self.download_dir.trim())
+        }
+    }
+
+    pub fn resolved_token_file(&self) -> Option<PathBuf> {
+        let trimmed = self.token_file.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(expand_tilde(trimmed))
+        }
+    }
+}
+
+pub fn config_dir() -> PathBuf {
+    if let Ok(override_dir) = std::env::var("ONENOTE_CONFIG_DIR") {
+        if !override_dir.trim().is_empty() {
+            return PathBuf::from(override_dir.trim());
+        }
+    }
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(APP_DIR_NAME)
+}
+
+pub fn data_dir() -> PathBuf {
+    if let Ok(override_dir) = std::env::var("ONENOTE_DATA_DIR") {
+        if !override_dir.trim().is_empty() {
+            return PathBuf::from(override_dir.trim());
+        }
+    }
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(APP_DIR_NAME)
+}
+
+/// Returns the legacy `teams-cli` config directory so `auth.rs` can inspect
+/// `teams-cli/config.toml` and `teams-cli/credentials.json` read-only when `share_m365_auth` is enabled.
+pub fn legacy_teams_config_dir() -> Option<PathBuf> {
+    if let Ok(override_dir) = std::env::var("TEAMS_CONFIG_DIR") {
+        if !override_dir.trim().is_empty() {
+            return Some(PathBuf::from(override_dir.trim()));
+        }
+    }
+    dirs::config_dir().map(|dir| dir.join(LEGACY_TEAMS_APP_DIR_NAME))
+}
+
+pub fn config_file_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+pub fn credential_fallback_path() -> PathBuf {
+    config_dir().join("credentials.json")
+}
+
+pub fn drafts_path() -> PathBuf {
+    config_dir().join("drafts.json")
+}
+
+pub fn db_path(user_id: Option<&str>) -> PathBuf {
+    let bucket = user_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or("default");
+    let sanitized: String = bucket
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    data_dir().join(sanitized).join("cache.db")
+}
+
+pub fn default_download_dir() -> PathBuf {
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("onenote")
+}
+
+pub fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically writes `data` to `path` using a unique temp file (`create_new(true)`),
+/// flushing before rename and avoiding naked deletion of the destination before the
+/// replacement is ready. Files whose name contains `"credentials"` or `"drafts"` default to `0o600` on Unix.
+pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let is_secret = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            let lower = n.to_ascii_lowercase();
+            lower.contains("credentials") || lower.contains("drafts")
+        })
+        .unwrap_or(false);
+    write_atomic_with_mode(path, data, is_secret)
+}
+
+/// Atomically writes `data` to `path` with `0o600` permissions at creation time on Unix.
+pub fn write_atomic_0600(path: &Path, data: &[u8]) -> Result<()> {
+    write_atomic_with_mode(path, data, true)
+}
+
+fn write_atomic_with_mode(path: &Path, data: &[u8], mode_0600: bool) -> Result<()> {
+    ensure_parent(path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let pid = std::process::id();
+    let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.{pid}.{seq}.tmp"));
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if mode_0600 {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = mode_0600;
+
+    let write_res = (|| -> Result<()> {
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("Failed to create temp file: {}", tmp.display()))?;
+        file.write_all(data)
+            .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
+        file.flush()
+            .with_context(|| format!("Failed to flush temp file: {}", tmp.display()))?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    if let Err(rename_err) = fs::rename(&tmp, path) {
+        if let Err(replace_err) =
+            replace_existing_with_backup(&tmp, path, parent, name, pid, seq, rename_err)
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(replace_err);
+        }
+    }
+    Ok(())
+}
+
+fn replace_existing_with_backup(
+    tmp: &Path,
+    path: &Path,
+    parent: &Path,
+    name: &str,
+    pid: u32,
+    seq: u64,
+    original_err: std::io::Error,
+) -> Result<()> {
+    if path.symlink_metadata().is_err() {
+        return Err(original_err)
+            .with_context(|| format!("Failed to save file: {}", path.display()));
+    }
+    let backup = parent.join(format!(".{name}.{pid}.{seq}.bak"));
+    fs::rename(path, &backup)
+        .with_context(|| format!("Failed to back up existing file: {}", path.display()))?;
+    match fs::rename(tmp, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = fs::rename(&backup, path);
+            Err(err).with_context(|| format!("Atomic file save failed: {}", path.display()))
+        }
+    }
+}
+
+/// Structured draft entry for creating or editing a OneNote page or block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NoteDraftEntry {
+    pub title: String,
+    pub body: String,
+}
+
+impl NoteDraftEntry {
+    pub fn is_empty(&self) -> bool {
+        self.title.trim().is_empty() && self.body.trim().is_empty()
+    }
+}
+
+/// Persistent draft store backed by `drafts.json` (`0600` permissions on Unix).
+/// Supports structured `NoteDraftEntry` records alongside simple string entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DraftStore {
+    pub notes: HashMap<String, NoteDraftEntry>,
+    pub text: HashMap<String, String>,
+}
+
+impl DraftStore {
+    pub fn load() -> Self {
+        Self::load_from(&drafts_path()).unwrap_or_default()
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(path)?;
+        if raw.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        if let Ok(store) = serde_json::from_str::<Self>(&raw) {
+            if !store.notes.is_empty() || !store.text.is_empty() {
+                return Ok(store);
+            }
+        }
+        if let Ok(note_map) = serde_json::from_str::<HashMap<String, NoteDraftEntry>>(&raw) {
+            return Ok(Self {
+                notes: note_map,
+                text: HashMap::new(),
+            });
+        }
+        if let Ok(text_map) = serde_json::from_str::<HashMap<String, String>>(&raw) {
+            return Ok(Self {
+                notes: HashMap::new(),
+                text: text_map,
+            });
+        }
+        Ok(serde_json::from_str::<Self>(&raw)?)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.save_to(&drafts_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(self)?;
+        write_atomic_0600(path, &bytes)
+    }
+
+    pub fn get_note(&self, key: &str) -> Option<&NoteDraftEntry> {
+        self.notes.get(key)
+    }
+
+    pub fn set_note(&mut self, key: impl Into<String>, draft: NoteDraftEntry) {
+        let key = key.into();
+        if draft.is_empty() {
+            self.notes.remove(&key);
+        } else {
+            self.notes.insert(key, draft);
+        }
+    }
+
+    pub fn remove_note(&mut self, key: &str) -> Option<NoteDraftEntry> {
+        self.notes.remove(key)
+    }
+
+    pub fn get_text(&self, key: &str) -> Option<&str> {
+        self.text.get(key).map(String::as_str)
+    }
+
+    pub fn set_text(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        let value = value.into();
+        if value.trim().is_empty() {
+            self.text.remove(&key);
+        } else {
+            self.text.insert(key, value);
+        }
+    }
+}
+
+pub fn load_drafts() -> HashMap<String, String> {
+    load_drafts_from(&drafts_path()).unwrap_or_default()
+}
+
+pub fn load_drafts_from(path: &Path) -> Result<HashMap<String, String>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let raw = fs::read_to_string(path)?;
+    if raw.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+    if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&raw) {
+        return Ok(map);
+    }
+    Ok(DraftStore::load_from(path)?.text)
+}
+
+pub fn save_drafts(drafts: &HashMap<String, String>) -> Result<()> {
+    save_drafts_to(drafts, &drafts_path())
+}
+
+pub fn save_drafts_to(drafts: &HashMap<String, String>, path: &Path) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(drafts)?;
+    write_atomic_0600(path, &bytes)
+}
+
+fn first_non_empty_env(keys: &[&str]) -> Option<String> {
+    for &key in keys {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_env_bool(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn expand_tilde(input: &str) -> PathBuf {
+    if input == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = input
+        .strip_prefix("~/")
+        .or_else(|| input.strip_prefix("~\\"))
+    {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(input)
+}
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    pub(crate) fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let mut saved = Vec::with_capacity(vars.len());
+        for &(key, val) in vars {
+            saved.push((key, std::env::var(key).ok()));
+            match val {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        Self { saved }
+    }
+
+    pub(crate) fn clear_auth_env() -> Self {
+        Self::set(&[
+            ("ONENOTE_CONFIG_DIR", None),
+            ("ONENOTE_DATA_DIR", None),
+            ("ONENOTE_CLIENT_ID", None),
+            ("ONENOTE_TENANT_ID", None),
+            ("ONENOTE_CLIENT_SECRET", None),
+            ("ONENOTE_GRAPH_BASE_URL", None),
+            ("ONENOTE_AUTH_BASE_URL", None),
+            ("ONENOTE_GITHUB_REPO", None),
+            ("ONENOTE_TOKEN_FILE", None),
+            ("ONENOTE_TOKEN_REFRESH_CMD", None),
+            ("ONENOTE_TOKEN_REFRESH_MINS", None),
+            ("ONENOTE_SHARE_M365_AUTH", None),
+            ("ONENOTE_CLI_CACHE_SECS", None),
+            ("ONENOTE_AUTO_DAEMON", None),
+            ("ONENOTE_IMAGE_PROTOCOL", None),
+            ("ONENOTE_ACCESS_TOKEN", None),
+            ("ONENOTE_DISABLE_KEYRING", None),
+            ("ONENOTE_NO_BROWSER", None),
+            ("ONENOTE_TOKEN_ORIGIN", None),
+            ("TEAMS_CONFIG_DIR", None),
+            ("TEAMS_DATA_DIR", None),
+            ("TEAMS_CLIENT_ID", None),
+            ("TEAMS_TENANT_ID", None),
+            ("TEAMS_IMAGE_PROTOCOL", None),
+            ("TEAMS_TOKEN_FILE", None),
+            ("TEAMS_NO_BROWSER", None),
+            ("TEAMS_ACCESS_TOKEN", None),
+            ("AZURE_CLIENT_ID", None),
+            ("AZURE_TENANT_ID", None),
+            ("AZURE_CLIENT_SECRET", None),
+        ])
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (key, orig) in self.saved.drain(..) {
+            match orig {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_config_toml_parses_unknown_keys_and_onenote_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.toml");
+        fs::write(
+            &legacy_path,
+            "notify = false\nactive_poll_ms = 7500\nbackground_all_personas = true\ncli_cache_ttl_secs = 45\nshow_inline_hrefs = true\n",
+        )
+        .unwrap();
+
+        let _lock = TEST_ENV_LOCK.blocking_lock();
+        let _guard = EnvVarGuard::set(&[
+            ("ONENOTE_CLI_CACHE_SECS", None),
+            ("ONENOTE_SHARE_M365_AUTH", None),
+        ]);
+
+        let cfg = AppConfig::load_from(&legacy_path).unwrap();
+        assert!(!cfg.notify);
+        assert_eq!(cfg.active_poll_ms, 7500);
+        assert_eq!(cfg.hierarchy_poll_ms, 60_000);
+        assert_eq!(cfg.cli_cache_ttl_secs, 45);
+        assert!(cfg.show_inline_hrefs);
+        assert!(cfg.share_m365_auth);
+    }
+
+    #[test]
+    fn test_app_config_env_overrides_and_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        fs::write(
+            &cfg_path,
+            "cli_cache_ttl_secs = 15\nshare_m365_auth = true\n",
+        )
+        .unwrap();
+
+        let _lock = TEST_ENV_LOCK.blocking_lock();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+
+        {
+            let _guard = EnvVarGuard::set(&[
+                ("ONENOTE_CONFIG_DIR", Some(&dir_str)),
+                ("TEAMS_CONFIG_DIR", Some("/should/not/affect/onenote")),
+                ("ONENOTE_CLI_CACHE_SECS", Some("120")),
+                ("ONENOTE_CLIENT_ID", Some("onenote-cid")),
+                ("TEAMS_CLIENT_ID", Some("teams-cid")),
+                ("ONENOTE_TENANT_ID", None),
+                ("TEAMS_TENANT_ID", Some("teams-tid")),
+                ("AZURE_TENANT_ID", Some("azure-tid")),
+                ("ONENOTE_SHARE_M365_AUTH", Some("false")),
+                ("ONENOTE_TOKEN_FILE", Some("/tmp/onenote-token.txt")),
+            ]);
+            let cfg = AppConfig::load();
+            assert_eq!(config_dir(), PathBuf::from(&dir_str));
+            assert_eq!(cfg.cli_cache_ttl_secs, 120);
+            assert_eq!(cfg.client_id, "onenote-cid");
+            assert_eq!(cfg.tenant_id, "teams-tid");
+            assert!(!cfg.share_m365_auth);
+            assert_eq!(cfg.token_file, "/tmp/onenote-token.txt");
+            assert_eq!(
+                legacy_teams_config_dir(),
+                Some(PathBuf::from("/should/not/affect/onenote"))
+            );
+        }
+
+        {
+            let _guard = EnvVarGuard::set(&[
+                ("ONENOTE_CONFIG_DIR", Some(&dir_str)),
+                ("ONENOTE_DATA_DIR", Some(&dir_str)),
+                ("TEAMS_CONFIG_DIR", None),
+                ("TEAMS_DATA_DIR", Some("/should/not/affect/data")),
+                ("ONENOTE_CLI_CACHE_SECS", None),
+                ("ONENOTE_CLIENT_ID", None),
+                ("TEAMS_CLIENT_ID", None),
+                ("AZURE_CLIENT_ID", Some("azure-cid")),
+                ("ONENOTE_SHARE_M365_AUTH", None),
+            ]);
+            assert_eq!(data_dir(), PathBuf::from(&dir_str));
+            let def = AppConfig::default();
+            assert_eq!(def.cli_cache_ttl_secs, 0);
+            assert_eq!(def.client_id, "azure-cid");
+            assert!(def.share_m365_auth);
+            let scopes = def.effective_scopes();
+            assert!(scopes.iter().any(|s| s == "Notes.Read"));
+            assert!(scopes.iter().any(|s| s == "Notes.ReadWrite"));
+            assert!(scopes.iter().any(|s| s == "Notes.Create"));
+            assert!(scopes.iter().any(|s| s == "User.Read"));
+            assert!(scopes.iter().any(|s| s == "offline_access"));
+            assert!(!scopes.iter().any(|s| s.starts_with("Mail.")));
+            assert!(!scopes.iter().any(|s| s.starts_with("Chat.")));
+        }
+        assert_eq!(Persona::detect(), Persona::Onenote);
+        assert_eq!(Persona::Onenote.bin_name(), "onenote");
+        assert_eq!(DEFAULT_SERVE_PORT, 8788);
+        assert_eq!(
+            default_download_dir().file_name().and_then(|n| n.to_str()),
+            Some("onenote")
+        );
+    }
+
+    #[test]
+    fn test_parse_env_bool_values() {
+        assert_eq!(parse_env_bool("1"), Some(true));
+        assert_eq!(parse_env_bool(" true "), Some(true));
+        assert_eq!(parse_env_bool("TRUE"), Some(true));
+        assert_eq!(parse_env_bool("0"), Some(false));
+        assert_eq!(parse_env_bool("false"), Some(false));
+        assert_eq!(parse_env_bool("invalid"), None);
+    }
+
+    #[test]
+    fn test_write_atomic_and_draft_store_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("sub/settings.toml");
+        write_atomic(&target, b"first = 1\n").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first = 1\n");
+
+        write_atomic(&target, b"second = 2\n").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second = 2\n");
+
+        let drafts_file = dir.path().join("sub/drafts.json");
+        let mut store = DraftStore::default();
+        store.set_note(
+            "create:sec-1",
+            NoteDraftEntry {
+                title: "Sprint Notes".to_string(),
+                body: "# Agenda\n- [ ] Ship v0.1.0".to_string(),
+            },
+        );
+        store.set_text("quick", "Note");
+        store.save_to(&drafts_file).unwrap();
+
+        let reloaded = DraftStore::load_from(&drafts_file).unwrap();
+        assert_eq!(reloaded, store);
+
+        let legacy_drafts_file = dir.path().join("sub/legacy_drafts.json");
+        let mut raw_map = HashMap::new();
+        raw_map.insert("page:p1".to_string(), "Appended draft".to_string());
+        save_drafts_to(&raw_map, &legacy_drafts_file).unwrap();
+        assert_eq!(load_drafts_from(&legacy_drafts_file).unwrap(), raw_map);
+        let loaded_store = DraftStore::load_from(&legacy_drafts_file).unwrap();
+        assert_eq!(loaded_store.get_text("page:p1"), Some("Appended draft"));
+
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join("sub"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                s.ends_with(".tmp") || s.ends_with(".bak")
+            })
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn test_image_protocol_preference_and_onenote_env_override() {
+        assert_eq!(
+            ImageProtocolPreference::parse_str("iterm"),
+            Some(ImageProtocolPreference::Iterm2)
+        );
+        assert_eq!(
+            ImageProtocolPreference::parse_str("halfblocks"),
+            Some(ImageProtocolPreference::Halfblock)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let _lock = TEST_ENV_LOCK.blocking_lock();
+        let _guard = EnvVarGuard::set(&[
+            ("ONENOTE_CONFIG_DIR", Some(&dir_str)),
+            ("ONENOTE_IMAGE_PROTOCOL", Some("kitty")),
+            ("TEAMS_IMAGE_PROTOCOL", Some("sixel")),
+        ]);
+        let cfg = AppConfig::load();
+        assert_eq!(cfg.image_protocol, ImageProtocolPreference::Kitty);
+    }
+}

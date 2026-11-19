@@ -1,0 +1,20 @@
+{
+  "name": "@shinick/onenote-linux-x64",
+  "version": "0.1.0",
+  "description": "Prebuilt onenote binary for Linux x64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shinick-dev/onenote.git",
+    "directory": "npm/onenote-linux-x64"
+  },
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ]
+}

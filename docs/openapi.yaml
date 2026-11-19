@@ -1,0 +1,312 @@
+openapi: 3.1.0
+info:
+  title: OneNote CLI Local HTTP API (@shinick/onenote)
+  version: 0.1.0
+  description: >
+    Local HTTP JSON API exposed by `onenote serve` (default `127.0.0.1:8788`).
+    All `/v1/onenote/*` routes are also mirrored under `/onenote/*`.
+servers:
+  - url: http://127.0.0.1:8788
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ResourceDownloadResult:
+      type: object
+      required: [ok, path, file_name, mime_type, size_bytes, is_image]
+      properties:
+        ok: { type: boolean }
+        path: { type: string }
+        file_name: { type: string }
+        mime_type: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        is_image: { type: boolean }
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Service status
+  /v1/whoami:
+    get:
+      summary: Return signed-in Microsoft 365 profile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: User profile
+  /v1/onenote/notebooks:
+    get:
+      summary: List OneNote notebooks
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: include_teams
+          in: query
+          schema: { type: boolean, default: true }
+        - name: refresh
+          in: query
+          schema: { type: boolean, default: false }
+        - name: offline
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Notebook list
+    post:
+      summary: Create a OneNote notebook
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                group_id: { type: string }
+                site_id: { type: string }
+      responses:
+        '201':
+          description: Created notebook
+  /v1/onenote/sections:
+    get:
+      summary: List OneNote sections
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: notebook
+          in: query
+          schema: { type: string }
+        - name: refresh
+          in: query
+          schema: { type: boolean, default: false }
+        - name: offline
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Section list
+    post:
+      summary: Create a OneNote section
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [notebook, name]
+              properties:
+                notebook: { type: string }
+                name: { type: string }
+      responses:
+        '201':
+          description: Created section
+  /v1/onenote/pages:
+    get:
+      summary: List OneNote pages in a section
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: section
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+        - name: refresh
+          in: query
+          schema: { type: boolean, default: false }
+        - name: offline
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Page summaries
+    post:
+      summary: Create a OneNote page from Markdown
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [section, title]
+              properties:
+                section: { type: string }
+                title: { type: string }
+                markdown: { type: string }
+                level: { type: integer, minimum: 0, maximum: 2, default: 0 }
+                images:
+                  type: array
+                  items: { type: string }
+      responses:
+        '201':
+          description: Created page summary
+  /v1/onenote/pages/{page}:
+    get:
+      summary: Read a OneNote page detail (blocks, Markdown, resources)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: path
+          required: true
+          schema: { type: string }
+        - name: section
+          in: query
+          schema: { type: string }
+        - name: refresh
+          in: query
+          schema: { type: boolean, default: false }
+        - name: offline
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Page detail
+    patch:
+      summary: Surgically replace a block or update page title/body
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                block_id: { type: string }
+                title: { type: string }
+                markdown: { type: string }
+                section: { type: string }
+      responses:
+        '200':
+          description: Updated page detail
+    delete:
+      summary: Delete a OneNote page
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: path
+          required: true
+          schema: { type: string }
+        - name: section
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Deletion result
+  /v1/onenote/pages/{page}/append:
+    post:
+      summary: Append Markdown and optional images to a page
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [markdown]
+              properties:
+                markdown: { type: string }
+                images:
+                  type: array
+                  items: { type: string }
+                section: { type: string }
+      responses:
+        '200':
+          description: Updated page detail
+  /v1/onenote/pages/{page}/todo:
+    post:
+      summary: Toggle or set a OneNote checkbox on a block
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [block_id]
+              properties:
+                block_id: { type: string }
+                completed: { type: boolean }
+                section: { type: string }
+      responses:
+        '200':
+          description: Updated page detail
+  /v1/onenote/search:
+    get:
+      summary: Full-text search across cached OneNote pages
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: section
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: refresh
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Search hits
+  /v1/onenote/resources/download:
+    post:
+      summary: Download an embedded OneNote image or file attachment
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [page]
+              properties:
+                page: { type: string }
+                index: { type: integer }
+                url: { type: string }
+                out: { type: string }
+                section: { type: string }
+      responses:
+        '200':
+          description: Downloaded resource metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResourceDownloadResult'
