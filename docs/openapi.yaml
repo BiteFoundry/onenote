@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: OneNote CLI Local HTTP API (@shinick/onenote)
+  title: OneNote CLI Local HTTP API (@bitefoundry/onenote)
   version: 0.1.0
   description: >
     Local HTTP JSON API exposed by `onenote serve` (default `127.0.0.1:8788`).

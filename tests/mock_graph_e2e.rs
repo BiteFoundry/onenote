@@ -1,4 +1,4 @@
-//! End-to-end integration tests for standalone `@shinick/onenote` (`onenote-cli`)
+//! End-to-end integration tests for standalone `@bitefoundry/onenote` (`onenote-cli`)
 //! against an in-process mock Microsoft Graph v1.0 server:
 //! - Notebooks, sections, and pages CRUD
 //! - OneNote XHTML (`?includeIDs=true`) block parsing, GFM Markdown, surgical PATCH block updates & to-do toggles

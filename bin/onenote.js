@@ -23,7 +23,7 @@ function fail(message) {
 const platform = process.platform;
 const arch = process.arch;
 const platformKey = `${platform}-${arch}`;
-const packageName = `@shinick/onenote-${platformKey}`;
+const packageName = `@bitefoundry/onenote-${platformKey}`;
 const binaryName = platform === 'win32' ? 'onenote.exe' : 'onenote';
 
 let packageDir = null;
@@ -45,9 +45,9 @@ if (!binaryPath || !fs.existsSync(binaryPath)) {
     `Supported platforms: ${SUPPORTED.join(', ')}`,
     '',
     'Try one of:',
-    '  npm install -g @shinick/onenote --include=optional',
-    '  npm install @shinick/onenote --include=optional',
-    '  npx --yes @shinick/onenote',
+    '  npm install -g @bitefoundry/onenote --include=optional',
+    '  npm install @bitefoundry/onenote --include=optional',
+    '  npx --yes @bitefoundry/onenote',
     '',
     'If you are on an unsupported platform (for example Alpine/musl Linux),',
     'build from source with Cargo:',

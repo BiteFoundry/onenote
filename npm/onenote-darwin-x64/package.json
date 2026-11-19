@@ -1,10 +1,10 @@
 {
-  "name": "@shinick/onenote-darwin-x64",
+  "name": "@bitefoundry/onenote-darwin-x64",
   "version": "0.1.0",
   "description": "Prebuilt onenote binary for macOS x64",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shinick-dev/onenote.git",
+    "url": "git+https://github.com/BiteFoundry/onenote.git",
     "directory": "npm/onenote-darwin-x64"
   },
   "license": "MIT",

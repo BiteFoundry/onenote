@@ -2,7 +2,7 @@
 // Zero-Node-Process npm native binary linker.
 //
 // On Unix (linux/darwin): replaces installed `bin/onenote.js` and `bin/note.js` with
-// hardlinks/symlinks directly to `@shinick/onenote-<platform>-<arch>/bin/onenote` so npm's
+// hardlinks/symlinks directly to `@bitefoundry/onenote-<platform>-<arch>/bin/onenote` so npm's
 // bin symlink execve's the native Rust binary directly (0ms Node startup, 0MB Node RSS).
 //
 // On Windows (win32): creates NTFS hardlinks (fallback copy) `bin/onenote.exe` & `bin/note.exe`
@@ -75,11 +75,11 @@ function collectWindowsShimDirs(pkgRoot, env = process.env) {
   const parentScope = path.dirname(pkgRoot);
   const nodeModulesDir = path.dirname(parentScope);
   if (
-    path.basename(parentScope) === '@shinick' &&
+    path.basename(parentScope) === '@bitefoundry' &&
     path.basename(nodeModulesDir) === 'node_modules'
   ) {
     dirs.push(path.join(nodeModulesDir, '.bin'));
-    // On global Windows npm installs (`%APPDATA%\npm\node_modules\@shinick\onenote`),
+    // On global Windows npm installs (`%APPDATA%\npm\node_modules\@bitefoundry\onenote`),
     // shims sit directly in the parent of `node_modules` even when `npm_config_prefix` is unset in npm v9+.
     dirs.push(path.dirname(nodeModulesDir));
   }
@@ -96,7 +96,7 @@ function collectWindowsShimDirs(pkgRoot, env = process.env) {
 function shimReferencesLauncher(content, name) {
   const normalized = content.replace(/\\/g, '/').toLowerCase();
   return (
-    normalized.includes('@shinick/onenote') &&
+    normalized.includes('@bitefoundry/onenote') &&
     normalized.includes(`bin/${name}.js`)
   );
 }
@@ -191,7 +191,7 @@ export function runPostinstall(options = {}) {
   }
 
   const platformKey = `${platform}-${arch}`;
-  const packageName = `@shinick/onenote-${platformKey}`;
+  const packageName = `@bitefoundry/onenote-${platformKey}`;
   const binaryName = platform === 'win32' ? 'onenote.exe' : 'onenote';
 
   let packageDir = null;

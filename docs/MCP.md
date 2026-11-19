@@ -24,7 +24,7 @@ If installed via `npx`:
   "mcpServers": {
     "onenote": {
       "command": "npx",
-      "args": ["-y", "@shinick/onenote", "mcp"]
+      "args": ["-y", "@bitefoundry/onenote", "mcp"]
     }
   }
 }

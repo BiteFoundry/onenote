@@ -1,28 +1,28 @@
 # npm distribution
 
-`@shinick/onenote` is distributed on npm as a small JavaScript launcher plus one
+`@bitefoundry/onenote` is distributed on npm as a small JavaScript launcher plus one
 optional dependency per platform. The launcher resolves the prebuilt Rust binary
 and execs it directly (with `scripts/postinstall.mjs` linking the native binary
 into `bin/` and Windows shims for zero-Node-startup execution), so there is no
 compiler, Node native addon, or network download during install.
 
 The Rust crate is named `onenote-cli` and produces the standalone **Microsoft OneNote**
-binary (`onenote` / `onenote.exe`). The npm package is scoped as `@shinick/onenote`
+binary (`onenote` / `onenote.exe`). The npm package is scoped as `@bitefoundry/onenote`
 and installs both **`onenote`** and the short alias **`note`**.
 
 ## Install and run
 
 ```sh
 # one-off
-npx @shinick/onenote --version
+npx @bitefoundry/onenote --version
 
 # global install (installs `onenote` and `note`)
-npm install -g @shinick/onenote
+npm install -g @bitefoundry/onenote
 onenote --version
 note --version
 
 # project-local
-npm install @shinick/onenote
+npm install @bitefoundry/onenote
 npx onenote notebooks
 ```
 
@@ -47,12 +47,12 @@ and the interactive TUI).
 
 | npm package                     | OS      | CPU   | Rust target                         |
 | ------------------------------- | ------- | ----- | ----------------------------------- |
-| `@shinick/onenote-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`            |
-| `@shinick/onenote-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`           |
-| `@shinick/onenote-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`               |
-| `@shinick/onenote-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`              |
-| `@shinick/onenote-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu` (2.28)   |
-| `@shinick/onenote-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` (2.28)  |
+| `@bitefoundry/onenote-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`            |
+| `@bitefoundry/onenote-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`           |
+| `@bitefoundry/onenote-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`               |
+| `@bitefoundry/onenote-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`              |
+| `@bitefoundry/onenote-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu` (2.28)   |
+| `@bitefoundry/onenote-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` (2.28)  |
 
 Linux packages are cross-compiled in CI with `cargo-zigbuild` against **GLIBC 2.28** (`*.2.28`)
 and verified with `scripts/verify-glibc.mjs` plus an `almalinux:8` container smoke test, so
@@ -62,8 +62,8 @@ build from source with Cargo (`cargo build --release`).
 
 ## How resolution works
 
-`bin/onenote.js` and `bin/note.js` look up `@shinick/onenote-<platform>-<arch>` through
-`require.resolve`, then execute `node_modules/@shinick/onenote-<platform>-<arch>/bin/onenote`
+`bin/onenote.js` and `bin/note.js` look up `@bitefoundry/onenote-<platform>-<arch>` through
+`require.resolve`, then execute `node_modules/@bitefoundry/onenote-<platform>-<arch>/bin/onenote`
 (or `onenote.exe` on Windows) with `stdio: 'inherit'`. On `npm install`, `scripts/postinstall.mjs`
 additionally links the native binary directly for zero-Node-startup execution.
 Signals (`SIGINT`, `SIGTERM`, `SIGHUP`) are forwarded and the launcher exits with the child's
@@ -73,7 +73,7 @@ and the `--include=optional` hint instead of a stack trace.
 ## Layout
 
 ```
-package.json                  # @shinick/onenote launcher package (bin: onenote, note)
+package.json                  # @bitefoundry/onenote launcher package (bin: onenote, note)
 bin/onenote.js                # onenote launcher
 bin/note.js                   # note shorthand launcher
 scripts/postinstall.mjs       # zero-Node native binary linker on npm install
@@ -131,12 +131,12 @@ token_refresh_mins = 5
 | `ONENOTE_NO_BROWSER` | Disable automatic browser launch during login (`1` / `true`) |
 | `ONENOTE_AUTO_DAEMON` | Auto-start/attach to the background sync daemon (`1` / `true`, default `false`) |
 | `ONENOTE_IMAGE_PROTOCOL` | Terminal image protocol override (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`) |
-| `ONENOTE_GITHUB_REPO` | Override GitHub `owner/repo` used by `onenote self-update` (default `shinick-dev/onenote`) |
+| `ONENOTE_GITHUB_REPO` | Override GitHub `owner/repo` used by `onenote self-update` (default `BiteFoundry/onenote`) |
 | `ONENOTE_GITHUB_TOKEN` | GitHub token for private release checks in `onenote self-update` |
 
 ## Troubleshooting
 
 - **`no prebuilt binary found for <platform>-<arch>`** — reinstall with
-  `npm install -g @shinick/onenote --include=optional`.
+  `npm install -g @bitefoundry/onenote --include=optional`.
 - **Older Linux (`GLIBC < 2.28`) or Alpine/musl Linux** — build from source with Cargo (`cargo build --release`).
-- **Verify the binary** — `node -p "require.resolve('@shinick/onenote-win32-x64/package.json')"` (adjust for your platform).
+- **Verify the binary** — `node -p "require.resolve('@bitefoundry/onenote-win32-x64/package.json')"` (adjust for your platform).

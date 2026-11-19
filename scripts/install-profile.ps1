@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     1. Ensures <RepoRoot>\target\release\onenote.exe exists (downloads the prebuilt
-       release binary from GitHub `shinick-dev/onenote` via `gh` when missing, so
+       release binary from GitHub `BiteFoundry/onenote` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
     2. Registers/updates `# >>> onenote launcher >>>` (`function onenote` & `Set-Alias note onenote`) in PowerShell $PROFILE.
     3. If $HOME\Tools\bin exists, also writes `onenote.cmd` and `note.cmd` there so already-open shells
@@ -37,9 +37,9 @@ $releaseExe = Join-Path $releaseDir 'onenote.exe'
 if (-not (Test-Path -LiteralPath $releaseExe)) {
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if ($gh) {
-        Write-Output "[onenote] Downloading prebuilt onenote.exe from shinick-dev/onenote GitHub Release..."
+        Write-Output "[onenote] Downloading prebuilt onenote.exe from BiteFoundry/onenote GitHub Release..."
         New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-        & $gh.Source release download -R 'shinick-dev/onenote' --pattern 'onenote.exe' --dir $releaseDir --clobber
+        & $gh.Source release download -R 'BiteFoundry/onenote' --pattern 'onenote.exe' --dir $releaseDir --clobber
     }
 }
 
@@ -57,7 +57,7 @@ function onenote {
         if (Get-Command gh -ErrorAction SilentlyContinue) {
             `$relDir = Split-Path -Parent `$exe
             New-Item -ItemType Directory -Force -Path `$relDir | Out-Null
-            gh release download -R 'shinick-dev/onenote' --pattern 'onenote.exe' --dir `$relDir --clobber 2>`$null
+            gh release download -R 'BiteFoundry/onenote' --pattern 'onenote.exe' --dir `$relDir --clobber 2>`$null
         }
     }
     if (-not (Test-Path -LiteralPath `$exe)) {
