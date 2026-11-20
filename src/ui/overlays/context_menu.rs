@@ -55,6 +55,7 @@ impl ContextMenu {
                 MenuItem::new("New Subpage", Some("N"), Action::OpenOnenoteCreatePage { level: 1 }),
                 MenuItem::new("Append Markdown", Some("a"), Action::OpenOnenoteAppend),
                 MenuItem::new("Extract Links", Some("u"), Action::OpenLinkExtractor),
+                MenuItem::new("Inspect Page HTML", Some("H"), Action::OpenHtmlPreview),
                 MenuItem::new("Open in Browser", Some("o"), Action::OnenoteOpenWeb),
                 MenuItem::new("Copy Page Markdown", Some("y"), Action::CopyActivePageMarkdown),
                 MenuItem::new("Delete Page", Some("D"), Action::ConfirmDeleteOnenotePage),
@@ -65,6 +66,7 @@ impl ContextMenu {
                 MenuItem::new("Append Markdown", Some("a"), Action::OpenOnenoteAppend),
                 MenuItem::new("Extract Links", Some("u"), Action::OpenLinkExtractor),
                 MenuItem::new("Toggle Inline Link URLs", Some("h"), Action::ToggleShowLinkUrls),
+                MenuItem::new("Inspect Page HTML", Some("H"), Action::OpenHtmlPreview),
                 MenuItem::new("Preview Images", Some("v"), Action::OpenImagePreview),
                 MenuItem::new(
                     "Resources & Attachments",

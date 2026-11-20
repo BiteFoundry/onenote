@@ -1,14 +1,17 @@
 //! TUI entry shell: terminal raw mode, mouse capture, keyboard enhancement, event loop, external editor.
 
+use std::borrow::Cow;
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+#[cfg(not(windows))]
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
+    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -17,12 +20,16 @@ use crossterm::terminal::{
 };
 use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::{mpsc, watch};
 
 use crate::auth::AuthManager;
-use crate::config::{AppConfig, Persona};
+use crate::config::{AppConfig, ImageProtocolPreference, Persona};
 use crate::graph::GraphClient;
+use crate::img_preview::{
+    self, ActivePixelGraphic, TerminalGraphicsCaps, TerminalImageProtocol,
+};
 use crate::models::CoreEvent;
 use crate::storage::Storage;
 use crate::sync::{self, FocusTarget, SyncCommand, SyncController};
@@ -31,23 +38,277 @@ use crate::ui::{
     action::Action,
     app::{AppState, UiMsg, UiState},
     composer, event,
+    overlays::Overlay,
 };
+
+static KITTY_USED_GLOBAL: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+mod win_console {
+    use std::ptr::null_mut;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+
+    const ENABLE_WINDOW_INPUT: u32 = 0x0008;
+    const ENABLE_MOUSE_INPUT: u32 = 0x0010;
+    pub const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+
+    /// Raw-mode + ConPTY mouse capture console input mode (`0x0098`):
+    /// enables `ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS`,
+    /// explicitly clearing `ENABLE_QUICK_EDIT_MODE`, `ENABLE_VIRTUAL_TERMINAL_INPUT`,
+    /// `ENABLE_LINE_INPUT`, `ENABLE_ECHO_INPUT`, and `ENABLE_PROCESSED_INPUT`.
+    pub const TUI_MOUSE_CAPTURE_MODE: u32 =
+        ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut std::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: isize,
+        ) -> isize;
+        fn CloseHandle(h_object: isize) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn GetConsoleMode(h_console_handle: isize, lp_mode: *mut u32) -> i32;
+        fn SetConsoleMode(h_console_handle: isize, dw_mode: u32) -> i32;
+    }
+
+    fn with_conin_handle<T>(f: impl FnOnce(isize) -> Option<T>) -> Option<T> {
+        const CONIN_WIDE: [u16; 7] = [
+            b'C' as u16,
+            b'O' as u16,
+            b'N' as u16,
+            b'I' as u16,
+            b'N' as u16,
+            b'$' as u16,
+            0,
+        ];
+        let conin = unsafe {
+            CreateFileW(
+                CONIN_WIDE.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null_mut(),
+                OPEN_EXISTING,
+                0,
+                0,
+            )
+        };
+        if conin != 0 && conin != INVALID_HANDLE_VALUE {
+            let res = f(conin);
+            unsafe {
+                CloseHandle(conin);
+            }
+            return res;
+        }
+        let std_in = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if std_in != 0 && std_in != INVALID_HANDLE_VALUE {
+            f(std_in)
+        } else {
+            None
+        }
+    }
+
+    pub fn snapshot_console_mode() -> Option<u32> {
+        with_conin_handle(|h| {
+            let mut mode = 0u32;
+            if unsafe { GetConsoleMode(h, &mut mode) } != 0 {
+                Some(mode)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn enforce_windows_mouse_capture() {
+        let _ = with_conin_handle(|h| {
+            unsafe {
+                SetConsoleMode(h, TUI_MOUSE_CAPTURE_MODE);
+            }
+            Some(())
+        });
+    }
+
+    pub fn restore_console_mode(orig_mode: Option<u32>) {
+        if let Some(mode) = orig_mode {
+            let _ = with_conin_handle(|h| {
+                unsafe {
+                    SetConsoleMode(h, mode | ENABLE_EXTENDED_FLAGS);
+                }
+                Some(())
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PixelReconcilePlan {
+    erase_and_redraw: bool,
+    erase_in_place_only: bool,
+    delete_kitty: bool,
+    erase_rects: Vec<Rect>,
+    emit_desired: bool,
+}
+
+#[derive(Debug, Default)]
+struct PixelLayerTracker {
+    active: Option<ActivePixelGraphic>,
+    last_term_size: (u16, u16),
+}
+
+impl PixelLayerTracker {
+    fn clear(&mut self) {
+        self.active = None;
+    }
+
+    fn plan_transition(
+        &self,
+        desired: Option<&ActivePixelGraphic>,
+        term_size: (u16, u16),
+        kitty_used: bool,
+    ) -> PixelReconcilePlan {
+        let term_resized = self.last_term_size != term_size;
+        if self.active.as_ref() == desired && !term_resized {
+            return PixelReconcilePlan {
+                erase_and_redraw: false,
+                erase_in_place_only: false,
+                delete_kitty: false,
+                erase_rects: Vec::new(),
+                emit_desired: false,
+            };
+        }
+
+        // Fast path for Sixel viewport scroll on the exact same rect & base image:
+        // erase only the previous rect in place (no full `terminal.clear()` flicker).
+        let sixel_crop_only_update = !term_resized
+            && match (&self.active, desired) {
+                (Some(prev), Some(next))
+                    if prev.protocol == TerminalImageProtocol::Sixel
+                        && next.protocol == TerminalImageProtocol::Sixel
+                        && prev.rect == next.rect =>
+                {
+                    let (prev_base, _) = parse_pixel_key(&prev.cache_key);
+                    let (next_base, _) = parse_pixel_key(&next.cache_key);
+                    prev_base == next_base
+                }
+                _ => false,
+            };
+
+        let erase_rects = self
+            .active
+            .iter()
+            .map(|prev| {
+                Rect::new(
+                    prev.rect.x,
+                    prev.rect.y,
+                    prev.rect.width.max(prev.cols),
+                    prev.rect.height.max(prev.rows),
+                )
+            })
+            .collect();
+
+        if sixel_crop_only_update {
+            return PixelReconcilePlan {
+                erase_and_redraw: false,
+                erase_in_place_only: true,
+                delete_kitty: false,
+                erase_rects,
+                emit_desired: true,
+            };
+        }
+
+        let had_active = self.active.is_some();
+        let delete_kitty = had_active
+            && (kitty_used
+                || self
+                    .active
+                    .as_ref()
+                    .is_some_and(|g| g.protocol == TerminalImageProtocol::Kitty));
+
+        PixelReconcilePlan {
+            erase_and_redraw: had_active,
+            erase_in_place_only: false,
+            delete_kitty,
+            erase_rects,
+            emit_desired: desired.is_some(),
+        }
+    }
+
+    fn commit(&mut self, desired: Option<ActivePixelGraphic>, term_size: (u16, u16)) {
+        self.active = desired;
+        self.last_term_size = term_size;
+    }
+}
+
+/// Overlay Z-order guard: allows modal pixel graphics only when `ImagePreview` is the top-most overlay,
+/// and blocks all pixel graphics whenever another modal (e.g., `ConfirmDialog`, `CommandPalette`) sits on top.
+fn pixel_graphics_allowed_for_overlays(overlays: &[Overlay], cache_key: &str) -> bool {
+    if overlays.is_empty() {
+        !cache_key.starts_with("hd:")
+    } else if matches!(overlays.last(), Some(Overlay::ImagePreview(_))) {
+        !cache_key.starts_with("inline:")
+    } else {
+        false
+    }
+}
+
+fn parse_pixel_key(key: &str) -> (&str, Option<(u16, u16, u16, u16)>) {
+    if let Some((base, crop_str)) = key.rsplit_once("#crop:") {
+        let mut parts = crop_str.split(',');
+        if let (Some(sx), Some(sy), Some(vw), Some(vh), None) = (
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next(),
+        ) {
+            return (base, Some((sx, sy, vw, vh)));
+        }
+    }
+    (key, None)
+}
 
 struct TerminalGuard {
     keyboard_enhanced: bool,
     kitty_used: bool,
+    pixel_tracker: PixelLayerTracker,
+    #[cfg(windows)]
+    orig_conin_mode: Option<u32>,
 }
 
 impl TerminalGuard {
-    fn enter() -> Result<(Self, Terminal<CrosstermBackend<Stdout>>)> {
+    fn enter(
+        image_protocol: ImageProtocolPreference,
+    ) -> Result<(Self, Terminal<CrosstermBackend<Stdout>>, TerminalGraphicsCaps)> {
+        #[cfg(windows)]
+        let orig_conin_mode = win_console::snapshot_console_mode();
+
         enable_raw_mode()?;
+        // Probe graphics & cell pixel dimensions while raw mode is active, BEFORE entering
+        // alternate screen / mouse capture so Windows VT probe never clobbers ConPTY mouse mode.
+        let graphics_caps = img_preview::probe_terminal_graphics_caps(image_protocol);
+
         let mut stdout = io::stdout();
+        #[cfg(not(windows))]
         execute!(
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
+        #[cfg(windows)]
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
         let keyboard_enhanced = if supports_keyboard_enhancement().unwrap_or(false) {
             execute!(
                 stdout,
@@ -61,6 +322,9 @@ impl TerminalGuard {
             false
         };
 
+        #[cfg(windows)]
+        win_console::enforce_windows_mouse_capture();
+
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
@@ -70,28 +334,38 @@ impl TerminalGuard {
             Self {
                 keyboard_enhanced,
                 kitty_used: false,
+                pixel_tracker: PixelLayerTracker::default(),
+                #[cfg(windows)]
+                orig_conin_mode,
             },
             terminal,
+            graphics_caps,
         ))
     }
 
     fn restore(&self) {
         use std::io::Write;
         let mut stdout = io::stdout();
-        if self.kitty_used {
-            let _ = stdout.write_all(crate::img_preview::kitty_delete_preview_sequence().as_bytes());
+        if self.kitty_used || KITTY_USED_GLOBAL.load(Ordering::Relaxed) {
+            let _ = stdout.write_all(img_preview::kitty_delete_preview_sequence().as_bytes());
+            let _ = stdout.write_all(img_preview::kitty_delete_all_sequence().as_bytes());
             let _ = stdout.flush();
         }
         if self.keyboard_enhanced {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
+        #[cfg(not(windows))]
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        #[cfg(windows)]
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
+        #[cfg(windows)]
+        win_console::restore_console_mode(self.orig_conin_mode);
     }
 }
 
@@ -101,20 +375,33 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn install_panic_hook(keyboard_enhanced: bool) {
+fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
+    #[cfg(not(windows))]
+    let _ = orig_conin_mode;
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
         let mut stdout = io::stdout();
+        if KITTY_USED_GLOBAL.load(Ordering::Relaxed) {
+            let _ = stdout.write_all(img_preview::kitty_delete_preview_sequence().as_bytes());
+            let _ = stdout.write_all(img_preview::kitty_delete_all_sequence().as_bytes());
+            let _ = stdout.flush();
+        }
         if keyboard_enhanced {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
+        #[cfg(not(windows))]
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        #[cfg(windows)]
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
+        #[cfg(windows)]
+        win_console::restore_console_mode(orig_conin_mode);
         prev(info);
     }));
 }
@@ -302,10 +589,8 @@ fn draw_frame(
     guard: &mut TerminalGuard,
 ) -> Result<()> {
     use std::io::Write;
-    use crate::img_preview::{self, TerminalImageProtocol};
 
     let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
-    let prev_graphic = ui.active_pixel_graphic.clone();
 
     let draw_res: Result<()> = (|| {
         let mut cursor_pos = None;
@@ -313,59 +598,144 @@ fn draw_frame(
             cursor_pos = ui::draw(frame, app, ui);
         })?;
 
-        let pending_matches_prev = match (&prev_graphic, &ui.pending_pixel_graphic) {
-            (None, None) => true,
-            (Some((pk, pr, pp)), Some(pg)) => {
-                pk == &pg.cache_key && pr == &pg.rect && pp == &pg.protocol
+        // Resolve desired pixel graphic with overlay Z-order and bottom-row safety guards.
+        let desired: Option<ActivePixelGraphic> = ui.pending_pixel_graphic.clone().and_then(|pg| {
+            if !pixel_graphics_allowed_for_overlays(&ui.overlays, &pg.cache_key) {
+                return None;
             }
-            _ => false,
-        };
-
-        if !pending_matches_prev {
-            if let Some((_, _, prev_proto)) = &prev_graphic {
-                if *prev_proto == TerminalImageProtocol::Kitty {
-                    terminal
-                        .backend_mut()
-                        .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
-                }
-                terminal.clear()?;
-                ui.active_pixel_graphic = None;
-                terminal.draw(|frame| {
-                    cursor_pos = ui::draw(frame, app, ui);
-                })?;
+            // Never allow pixel graphics to touch the bottom-most status row (`term_height - 1`).
+            let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
+            let safe_max_w = ui.term_width.saturating_sub(pg.rect.x);
+            let fit_w = pg.rect.width.min(safe_max_w);
+            let fit_h = pg.rect.height.min(safe_max_h);
+            if fit_w == 0 || fit_h == 0 {
+                return None;
             }
 
-            if let Some(pg) = ui.pending_pixel_graphic.clone() {
-                let already_active = ui.active_pixel_graphic.as_ref().is_some_and(
-                    |(ak, ar, ap)| ak == &pg.cache_key && *ar == pg.rect && *ap == pg.protocol,
+            let (base_key, _crop) = parse_pixel_key(&pg.cache_key);
+            let rendered = app.image_cache.get(base_key)?;
+            let payload_len = rendered.pixel_payload.as_deref()?.len();
+            Some(ActivePixelGraphic {
+                cache_key: pg.cache_key,
+                rect: Rect::new(pg.rect.x, pg.rect.y, fit_w, fit_h),
+                protocol: pg.protocol,
+                cols: fit_w,
+                rows: fit_h,
+                payload_len,
+            })
+        });
+
+        let term_size = (ui.term_width, ui.term_height);
+        let plan = guard
+            .pixel_tracker
+            .plan_transition(desired.as_ref(), term_size, guard.kitty_used);
+
+        if plan.erase_and_redraw {
+            if plan.delete_kitty {
+                terminal
+                    .backend_mut()
+                    .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+                terminal
+                    .backend_mut()
+                    .write_all(img_preview::kitty_delete_all_sequence().as_bytes())?;
+            }
+            for rect in &plan.erase_rects {
+                let erase = img_preview::erase_pixel_rect_sequence(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    ui.term_width,
+                    ui.term_height,
                 );
-                if !already_active {
-                    if let Some(payload) = app
-                        .image_cache
-                        .get(&pg.cache_key)
-                        .and_then(|r| r.pixel_payload.as_deref())
-                    {
-                        if pg.protocol == TerminalImageProtocol::Kitty {
-                            terminal
-                                .backend_mut()
-                                .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
-                            guard.kitty_used = true;
+                if !erase.is_empty() {
+                    terminal.backend_mut().write_all(erase.as_bytes())?;
+                }
+            }
+            terminal.backend_mut().flush()?;
+            terminal.clear()?;
+            ui.active_pixel_graphic = None;
+            terminal.draw(|frame| {
+                cursor_pos = ui::draw(frame, app, ui);
+            })?;
+        } else if plan.erase_in_place_only {
+            for rect in &plan.erase_rects {
+                let erase = img_preview::erase_pixel_rect_sequence(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    ui.term_width,
+                    ui.term_height,
+                );
+                if !erase.is_empty() {
+                    terminal.backend_mut().write_all(erase.as_bytes())?;
+                }
+            }
+        }
+
+        let mut committed_graphic = desired.clone();
+        if plan.emit_desired {
+            if let Some(graphic) = &desired {
+                let (base_key, crop) = parse_pixel_key(&graphic.cache_key);
+                let payload: Option<Cow<'_, str>> =
+                    app.image_cache.get(base_key).and_then(|rendered| {
+                        if let Some((sx, sy, vw, vh)) = crop {
+                            let safe_max_w = ui.term_width.saturating_sub(graphic.rect.x);
+                            let safe_max_h = ui
+                                .term_height
+                                .saturating_sub(1)
+                                .saturating_sub(graphic.rect.y);
+                            let eff_vw = vw.min(safe_max_w);
+                            let eff_vh = vh.min(safe_max_h);
+                            rendered
+                                .viewport_pixel_payload(sx, sy, eff_vw, eff_vh)
+                                .map(|(p, _, _)| Cow::Owned(p))
+                                .or_else(|| {
+                                    if rendered.cols <= eff_vw && rendered.rows <= eff_vh {
+                                        rendered.pixel_payload.as_deref().map(Cow::Borrowed)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        } else {
+                            rendered.pixel_payload.as_deref().map(Cow::Borrowed)
                         }
-                        crossterm::queue!(
-                            terminal.backend_mut(),
-                            crossterm::cursor::MoveTo(pg.rect.x, pg.rect.y)
-                        )?;
-                        terminal.backend_mut().write_all(payload.as_bytes())?;
-                        terminal.backend_mut().flush()?;
-                        ui.active_pixel_graphic = Some((pg.cache_key, pg.rect, pg.protocol));
-                    } else {
-                        ui.active_pixel_graphic = None;
+                    });
+                if let Some(payload) = payload {
+                    if graphic.protocol == TerminalImageProtocol::Kitty {
+                        terminal
+                            .backend_mut()
+                            .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+                        guard.kitty_used = true;
+                        KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
                     }
+                    crossterm::queue!(
+                        terminal.backend_mut(),
+                        crossterm::cursor::MoveTo(graphic.rect.x, graphic.rect.y)
+                    )?;
+                    terminal.backend_mut().write_all(payload.as_bytes())?;
+                    terminal.backend_mut().flush()?;
+                    ui.active_pixel_graphic =
+                        Some((graphic.cache_key.clone(), graphic.rect, graphic.protocol));
+                } else {
+                    committed_graphic = None;
+                    ui.active_pixel_graphic = None;
                 }
             } else {
+                committed_graphic = None;
+                ui.active_pixel_graphic = None;
+            }
+        } else {
+            if plan.delete_kitty {
+                guard.kitty_used = false;
+            }
+            if desired.is_none() {
                 ui.active_pixel_graphic = None;
             }
         }
+
+        guard.pixel_tracker.commit(committed_graphic, term_size);
 
         if let Some((cx, cy)) = cursor_pos {
             let _ = terminal.show_cursor();
@@ -606,9 +976,13 @@ pub async fn run_with_persona(
     graph: GraphClient,
     storage: Storage,
 ) -> Result<()> {
-    // Enter alternate screen and raw mode first so the terminal responds in <5ms.
-    let (mut guard, mut terminal) = TerminalGuard::enter()?;
-    install_panic_hook(guard.keyboard_enhanced);
+    // Enter raw mode, probe graphics caps BEFORE alternate screen / mouse capture, then configure terminal.
+    let (mut guard, mut terminal, graphics_caps) = TerminalGuard::enter(config.image_protocol)?;
+    #[cfg(windows)]
+    let orig_conin_mode = guard.orig_conin_mode;
+    #[cfg(not(windows))]
+    let orig_conin_mode = None;
+    install_panic_hook(guard.keyboard_enhanced, orig_conin_mode);
 
     let (core_tx, mut core_rx) = mpsc::unbounded_channel::<CoreEvent>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
@@ -618,7 +992,11 @@ pub async fn run_with_persona(
     let sync_ctrl = SyncController::from_channels(proxy_focus_tx, proxy_nudge_tx);
 
     let mut ui = UiState::from_config(&config);
-    ui.graphics_caps = crate::img_preview::probe_terminal_graphics_caps(config.image_protocol);
+    if let Ok(sz) = terminal.size() {
+        ui.term_width = sz.width;
+        ui.term_height = sz.height;
+    }
+    ui.graphics_caps = graphics_caps;
     ui.kitty_keyboard_supported = guard.keyboard_enhanced;
     let mut app = AppState::new(
         config.clone(),
@@ -651,17 +1029,17 @@ pub async fn run_with_persona(
     loop {
         if ui.editor_requested {
             ui.editor_requested = false;
-            if ui
-                .active_pixel_graphic
-                .as_ref()
-                .is_some_and(|(_, _, p)| *p == crate::img_preview::TerminalImageProtocol::Kitty)
-            {
+            if guard.kitty_used || KITTY_USED_GLOBAL.load(Ordering::Relaxed) {
                 use std::io::Write;
                 let _ = terminal
                     .backend_mut()
-                    .write_all(crate::img_preview::kitty_delete_preview_sequence().as_bytes());
+                    .write_all(img_preview::kitty_delete_preview_sequence().as_bytes());
+                let _ = terminal
+                    .backend_mut()
+                    .write_all(img_preview::kitty_delete_all_sequence().as_bytes());
                 let _ = terminal.backend_mut().flush();
             }
+            guard.pixel_tracker.clear();
             ui.active_pixel_graphic = None;
             guard.restore();
             let initial_body = match ui.overlays.last() {
@@ -671,12 +1049,15 @@ pub async fn run_with_persona(
             let result = composer::external_edit(&initial_body);
             let mut stdout = io::stdout();
             enable_raw_mode()?;
+            #[cfg(not(windows))]
             execute!(
                 stdout,
                 EnterAlternateScreen,
                 EnableMouseCapture,
                 EnableBracketedPaste
             )?;
+            #[cfg(windows)]
+            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
             if guard.keyboard_enhanced {
                 let _ = execute!(
                     stdout,
@@ -686,6 +1067,8 @@ pub async fn run_with_persona(
                     )
                 );
             }
+            #[cfg(windows)]
+            win_console::enforce_windows_mouse_capture();
             terminal.clear()?;
             dirty = true;
 
@@ -854,6 +1237,7 @@ pub async fn run_with_persona(
             }
         }
     }
+    app.html_server.shutdown();
     let _ = sync_ctrl.request(SyncCommand::Shutdown);
     drop(guard);
     Ok(())
@@ -904,5 +1288,108 @@ mod tests {
             KeyCode::Enter,
             KeyModifiers::ALT
         )));
+    }
+
+    #[test]
+    fn test_parse_pixel_key_extracts_base_and_crop() {
+        assert_eq!(
+            parse_pixel_key("hd:me|p1:0:92:100:Sixel#crop:2,10,80,25"),
+            ("hd:me|p1:0:92:100:Sixel", Some((2, 10, 80, 25)))
+        );
+        assert_eq!(
+            parse_pixel_key("hd:me|p1:0:92:100:Sixel"),
+            ("hd:me|p1:0:92:100:Sixel", None)
+        );
+        assert_eq!(
+            parse_pixel_key("hd:me|p1:0:92:100:Sixel#crop:bad"),
+            ("hd:me|p1:0:92:100:Sixel#crop:bad", None)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_mouse_capture_mode_bits() {
+        // 0x0098 = ENABLE_WINDOW_INPUT (0x0008) | ENABLE_MOUSE_INPUT (0x0010) | ENABLE_EXTENDED_FLAGS (0x0080)
+        assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE, 0x0098);
+        assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0040, 0); // QuickEdit cleared
+        assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0200, 0); // VTInput cleared
+    }
+
+    #[test]
+    fn test_pixel_tracker_erase_on_close_switch_scroll_and_overlay_z_order() {
+        let mut tracker = PixelLayerTracker::default();
+        let sixel_a = ActivePixelGraphic {
+            cache_key: "hd:me|p1:0:80:100:Sixel#crop:0,0,78,24".to_string(),
+            rect: Rect::new(4, 3, 78, 24),
+            protocol: TerminalImageProtocol::Sixel,
+            cols: 78,
+            rows: 24,
+            payload_len: 4096,
+        };
+        let sixel_a_scrolled = ActivePixelGraphic {
+            cache_key: "hd:me|p1:0:80:100:Sixel#crop:0,6,78,24".to_string(),
+            rect: Rect::new(4, 3, 78, 24),
+            protocol: TerminalImageProtocol::Sixel,
+            cols: 78,
+            rows: 24,
+            payload_len: 4096,
+        };
+        let kitty_b = ActivePixelGraphic {
+            cache_key: "hd:me|p2:0:80:100:Kitty#crop:0,0,78,24".to_string(),
+            rect: Rect::new(4, 3, 78, 24),
+            protocol: TerminalImageProtocol::Kitty,
+            cols: 78,
+            rows: 24,
+            payload_len: 3000,
+        };
+
+        // Initial paint emits desired with no prior erase
+        let init_plan = tracker.plan_transition(Some(&sixel_a), (120, 34), false);
+        assert!(!init_plan.erase_and_redraw);
+        assert!(!init_plan.erase_in_place_only);
+        assert!(init_plan.emit_desired);
+        tracker.commit(Some(sixel_a.clone()), (120, 34));
+
+        // Unchanged spinner tick skips erase and re-emit
+        let noop_plan = tracker.plan_transition(Some(&sixel_a), (120, 34), false);
+        assert!(!noop_plan.erase_and_redraw);
+        assert!(!noop_plan.erase_in_place_only);
+        assert!(!noop_plan.emit_desired);
+
+        // Sixel vertical scroll on same rect uses fast in-place rect erase without full clear
+        let scroll_plan = tracker.plan_transition(Some(&sixel_a_scrolled), (120, 34), false);
+        assert!(!scroll_plan.erase_and_redraw);
+        assert!(scroll_plan.erase_in_place_only);
+        assert_eq!(scroll_plan.erase_rects, vec![sixel_a.rect]);
+        assert!(scroll_plan.emit_desired);
+        tracker.commit(Some(sixel_a_scrolled.clone()), (120, 34));
+
+        // Closing modal (desired = None) triggers full erase_and_redraw + rect erase
+        let close_plan = tracker.plan_transition(None, (120, 34), false);
+        assert!(close_plan.erase_and_redraw);
+        assert!(!close_plan.delete_kitty);
+        assert_eq!(close_plan.erase_rects, vec![sixel_a_scrolled.rect]);
+        assert!(!close_plan.emit_desired);
+
+        // Kitty image closed -> delete_kitty = true
+        tracker.commit(Some(kitty_b.clone()), (120, 34));
+        let kitty_close = tracker.plan_transition(None, (120, 34), true);
+        assert!(kitty_close.erase_and_redraw);
+        assert!(kitty_close.delete_kitty);
+        assert_eq!(kitty_close.erase_rects, vec![kitty_b.rect]);
+
+        // Overlay Z-order guard: modal pixel graphic allowed ONLY when ImagePreview is top overlay
+        assert!(!pixel_graphics_allowed_for_overlays(&[], "hd:me|p1:0:80:100:Sixel"));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &[Overlay::command_palette()],
+            "hd:me|p1:0:80:100:Sixel"
+        ));
+        let confirm_over_preview = vec![
+            Overlay::confirm("Quit Microsoft OneNote TUI?", Some(Action::Quit)),
+        ];
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &confirm_over_preview,
+            "hd:me|p1:0:80:100:Sixel"
+        ));
     }
 }

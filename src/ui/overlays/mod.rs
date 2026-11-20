@@ -5,6 +5,7 @@ pub mod command_palette;
 pub mod confirm;
 pub mod context_menu;
 pub mod file_picker;
+pub mod html_preview;
 pub mod image_preview;
 pub mod links;
 pub mod onenote_form;
@@ -27,9 +28,9 @@ use crate::ui::{
     overlays::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
         context_menu::ContextMenu, file_picker::FilePickerOverlay,
-        image_preview::ImagePreviewOverlay, links::LinkExtractorOverlay,
-        onenote_form::OnenoteFormOverlay, path_input::PathInputState, search::SearchOverlay,
-        settings::SettingsState,
+        html_preview::HtmlPreviewOverlay, image_preview::ImagePreviewOverlay,
+        links::LinkExtractorOverlay, onenote_form::OnenoteFormOverlay,
+        path_input::PathInputState, search::SearchOverlay, settings::SettingsState,
     },
 };
 
@@ -45,6 +46,7 @@ pub enum OverlayKind {
     Links,
     OnenoteForm,
     ImagePreview,
+    HtmlPreview,
     Help,
     Confirm,
 }
@@ -58,7 +60,7 @@ pub enum OverlayOutcome {
     NotHandled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Overlay {
     ContextMenu(ContextMenu),
     CommandPalette(CommandPalette),
@@ -70,6 +72,7 @@ pub enum Overlay {
     Links(LinkExtractorOverlay),
     OnenoteForm(OnenoteFormOverlay),
     ImagePreview(ImagePreviewOverlay),
+    HtmlPreview(HtmlPreviewOverlay),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -87,6 +90,7 @@ impl Overlay {
             Overlay::Links(_) => OverlayKind::Links,
             Overlay::OnenoteForm(_) => OverlayKind::OnenoteForm,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
+            Overlay::HtmlPreview(_) => OverlayKind::HtmlPreview,
             Overlay::Help(_) => OverlayKind::Help,
             Overlay::Confirm(_) => OverlayKind::Confirm,
         }
@@ -99,6 +103,7 @@ impl Overlay {
             | Overlay::PathInput(_)
             | Overlay::FilePicker(_) => true,
             Overlay::OnenoteForm(form) => form.accepts_text(),
+            Overlay::HtmlPreview(html) => html.accepts_text(),
             _ => false,
         }
     }
@@ -180,6 +185,7 @@ impl Overlay {
             Overlay::Links(links) => links.handle(action),
             Overlay::OnenoteForm(form) => form.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
+            Overlay::HtmlPreview(html) => html.handle(action, ui),
             Overlay::Help(_) => match action {
                 Action::CloseOverlay | Action::Activate | Action::Input('q') => {
                     OverlayOutcome::Close
@@ -202,6 +208,7 @@ impl Overlay {
             Overlay::Links(links) => links.select(index),
             Overlay::OnenoteForm(form) => form.select(index),
             Overlay::ImagePreview(_)
+            | Overlay::HtmlPreview(_)
             | Overlay::PathInput(_)
             | Overlay::Help(_)
             | Overlay::Confirm(_) => {}
@@ -227,6 +234,7 @@ impl Overlay {
             Overlay::Links(links) => links.draw(frame, area, ui, hitmap),
             Overlay::OnenoteForm(form) => form.draw(frame, area, ui, hitmap),
             Overlay::ImagePreview(preview) => preview.draw(frame, area, app, ui, hitmap),
+            Overlay::HtmlPreview(html) => html.draw(frame, area, ui, hitmap),
             Overlay::Help(help) => help.draw(frame, area, ui, hitmap),
             Overlay::Confirm(dialog) => dialog.draw(frame, area, ui, hitmap),
         }
@@ -275,6 +283,7 @@ impl HelpOverlay {
             Line::from(""),
             Line::from(Span::styled("Reader, Links & Media", theme.title(true))),
             Line::from("  u / h                 Link Extractor modal / Toggle inline href URLs"),
+            Line::from("  H / [H: HTML]         Interactive HTML Viewer (m Raw · o Local Browser)"),
             Line::from("  v / Alt+v / A         HD Image Preview / Resources & Attachments tray"),
             Line::from("  Ctrl+F                Interactive File Picker (z = zoxide jump)"),
             Line::from("  . / Right-click       Context Menu"),

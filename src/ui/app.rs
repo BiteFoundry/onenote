@@ -140,6 +140,19 @@ pub enum UiMsg {
         cache_key: String,
         error: String,
     },
+    ImageRoutedToHtml {
+        cache_key: String,
+        title: String,
+        html: String,
+    },
+    HtmlResourceLoaded {
+        task_id: u64,
+        title: String,
+        html: String,
+    },
+    HtmlServed {
+        url: String,
+    },
     UpdateResult {
         task_id: u64,
         result: UpdateCheckResult,
@@ -281,6 +294,29 @@ pub struct AppState {
 
     pub image_cache: HashMap<String, RenderedTerminalImage>,
     pub inflight_images: HashSet<String>,
+    pub html_server: bitefoundry_html::NativeHtmlServer,
+}
+
+/// Returns `true` when MIME type or file name identifies an HTML resource (`.html`/`.htm`/`.xhtml` or `text/html`).
+pub fn is_html_resource_meta(mime_type: Option<&str>, file_name: Option<&str>) -> bool {
+    bitefoundry_html::sniff_content_kind(mime_type, file_name, None)
+        == bitefoundry_html::ContentKind::Html
+}
+
+/// Sniffs downloaded preview bytes via `bitefoundry_html::sniff_content_kind`; returns decoded HTML string
+/// when the payload is HTML (even if the URL/MIME claimed to be an image).
+pub fn sniff_preview_bytes_as_html(
+    mime_hint: Option<&str>,
+    file_name: Option<&str>,
+    bytes: &[u8],
+) -> Option<String> {
+    if bitefoundry_html::sniff_content_kind(mime_hint, file_name, Some(bytes))
+        == bitefoundry_html::ContentKind::Html
+    {
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    } else {
+        None
+    }
 }
 
 impl AppState {
@@ -321,6 +357,7 @@ impl AppState {
             search_results: Vec::new(),
             image_cache: HashMap::new(),
             inflight_images: HashSet::new(),
+            html_server: bitefoundry_html::NativeHtmlServer::new(),
         }
     }
 
@@ -506,6 +543,33 @@ impl AppState {
         caps: TerminalGraphicsCaps,
         halfblock_only: bool,
     ) {
+        self.request_onenote_image_with_meta(
+            cache_key,
+            resource_url,
+            None,
+            None,
+            cols,
+            rows,
+            caps,
+            halfblock_only,
+        );
+    }
+
+    /// Requests a OneNote image resource with optional display name & MIME hint.
+    /// When `halfblock_only == false` (fullscreen `LoadPreviewImage`), sniffs bytes via
+    /// `bitefoundry_html::sniff_content_kind` and routes `ContentKind::Html` to `Overlay::HtmlPreview`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_onenote_image_with_meta(
+        &mut self,
+        cache_key: String,
+        resource_url: String,
+        display_name: Option<String>,
+        mime_hint: Option<String>,
+        cols: u16,
+        rows: u16,
+        caps: TerminalGraphicsCaps,
+        halfblock_only: bool,
+    ) {
         if self.image_cache.contains_key(&cache_key) || self.inflight_images.contains(&cache_key) {
             return;
         }
@@ -514,7 +578,33 @@ impl AppState {
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             match graph.fetch_onenote_resource_bytes(&resource_url).await {
-                Ok((_, bytes)) => {
+                Ok((fetched_mime, bytes)) => {
+                    let effective_mime = if fetched_mime == "application/octet-stream" {
+                        mime_hint.as_deref()
+                    } else {
+                        Some(fetched_mime.as_str())
+                    };
+                    if let Some(html) =
+                        sniff_preview_bytes_as_html(effective_mime, display_name.as_deref(), &bytes)
+                    {
+                        if !halfblock_only {
+                            let title = display_name
+                                .filter(|s| !s.trim().is_empty())
+                                .unwrap_or_else(|| "HTML Resource".to_string());
+                            let _ = tx.send(UiMsg::ImageRoutedToHtml {
+                                cache_key,
+                                title,
+                                html,
+                            });
+                        } else {
+                            let _ = tx.send(UiMsg::ImageLoadFailed {
+                                cache_key,
+                                error: "Resource is HTML, not a raster image".to_string(),
+                            });
+                        }
+                        return;
+                    }
+
                     let render_res = tokio::task::spawn_blocking(move || {
                         if halfblock_only {
                             crate::img_preview::decode_and_render_halfblocks(
@@ -560,6 +650,72 @@ impl AppState {
                         cache_key,
                         error: err.to_string(),
                     });
+                }
+            }
+        });
+    }
+
+    /// Fetches a `.html`/`.htm` OneNote resource and opens it in `Overlay::HtmlPreview`.
+    pub fn spawn_load_html_resource(&mut self, resource_idx: usize, ui: &mut UiState) {
+        let Some(detail) = self.active_page_detail() else {
+            ui.warn("No page loaded");
+            return;
+        };
+        let Some(res) = detail.resources.get(resource_idx).cloned() else {
+            ui.warn("Resource not found");
+            return;
+        };
+        let url = res
+            .fullres_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&res.resource_url)
+            .to_string();
+        let title = res
+            .file_name
+            .as_deref()
+            .or(res.alt_text.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("resource-{}.html", resource_idx + 1));
+        let task_id = ui.tasks.start(format!("Loading HTML '{title}'"));
+        let graph = self.graph.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            match graph.fetch_onenote_resource_bytes(&url).await {
+                Ok((_, bytes)) => {
+                    let html = String::from_utf8_lossy(&bytes).into_owned();
+                    let _ = tx.send(UiMsg::HtmlResourceLoaded {
+                        task_id,
+                        title,
+                        html,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskFailed {
+                        task_id,
+                        error: format!("Failed to load HTML resource: {err}"),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Serves HTML natively via the lazy localhost `NativeHtmlServer` and sends `UiMsg::HtmlServed`.
+    pub fn spawn_serve_html_in_browser(&mut self, title: String, html: String, ui: &mut UiState) {
+        let server = self.html_server.clone();
+        let tx = self.ui_tx.clone();
+        ui.info("Starting local HTML preview server...");
+        tokio::spawn(async move {
+            match server.serve_html(&title, &html).await {
+                Ok(url) => {
+                    let _ = tx.send(UiMsg::HtmlServed { url });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::Error(format!(
+                        "Failed to serve HTML locally: {err}"
+                    )));
                 }
             }
         });
@@ -1112,6 +1268,34 @@ impl AppState {
                     preview.error = Some(error);
                 }
             }
+            UiMsg::ImageRoutedToHtml {
+                cache_key,
+                title,
+                html,
+            } => {
+                self.inflight_images.remove(&cache_key);
+                if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                    ui.overlays.pop();
+                }
+                ui.overlays.push(Overlay::HtmlPreview(
+                    crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(Some(title), html),
+                ));
+                ui.info("Resource returned HTML — opened in interactive HTML viewer");
+            }
+            UiMsg::HtmlResourceLoaded {
+                task_id,
+                title,
+                html,
+            } => {
+                ui.tasks.finish(task_id);
+                ui.overlays.push(Overlay::HtmlPreview(
+                    crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(Some(title), html),
+                ));
+            }
+            UiMsg::HtmlServed { url } => match open::that(&url) {
+                Ok(()) => ui.success(format!("Opened local HTML preview: {url}")),
+                Err(err) => ui.error(format!("Served at {url}, but browser open failed: {err}")),
+            },
             UiMsg::UpdateResult { task_id, result } => {
                 ui.tasks.finish(task_id);
                 if result.updated {

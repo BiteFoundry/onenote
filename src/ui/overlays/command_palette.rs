@@ -44,6 +44,7 @@ fn palette_commands() -> Vec<PaletteItem> {
         ("Search OneNote Pages (FTS5)", "/", Action::OpenSearch),
         ("Extract Links from Page", "u", Action::OpenLinkExtractor),
         ("Toggle Inline Link URLs (href)", "h", Action::ToggleShowLinkUrls),
+        ("Inspect Page HTML (Interactive)", "H", Action::OpenHtmlPreview),
         ("Preview Embedded Images", "v / Alt+v", Action::OpenImagePreview),
         ("Page Resources & Attachments", "A", Action::OpenOverlay(OverlayKind::Attachments)),
         ("Open File Picker (zoxide)", "Ctrl+F", Action::OpenFilePicker),

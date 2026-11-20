@@ -923,6 +923,7 @@ impl OnenoteXhtmlParser {
         let element_id = non_empty_attr(el_ref, "id");
         let tag = parse_data_tag(el.attr("data-tag"));
 
+        let is_image = crate::img_preview::is_image_mime_or_name(&mime_type, None);
         let resource_index = self.resources.len();
         self.resources.push(OnenoteResource {
             element_id: element_id.clone(),
@@ -930,7 +931,7 @@ impl OnenoteXhtmlParser {
             fullres_url,
             mime_type,
             file_name: None,
-            is_image: true,
+            is_image,
             alt_text: alt.clone(),
         });
 

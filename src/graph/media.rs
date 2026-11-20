@@ -36,6 +36,10 @@ impl GraphClient {
                 _ => "application/octet-stream",
             }
             .to_string()
+        } else if crate::img_preview::looks_like_html_bytes(&bytes) {
+            "text/html".to_string()
+        } else if crate::img_preview::looks_like_svg_bytes(&bytes) {
+            "image/svg+xml".to_string()
         } else {
             "application/octet-stream".to_string()
         };
@@ -109,7 +113,7 @@ impl GraphClient {
                 None => (initial_path, initial_name),
             };
 
-        let sniffed_mime = sniff_file_mime(&final_path).await;
+        let (header_bytes, sniffed_mime) = sniff_file_header_and_mime(&final_path).await;
         let mime_type = sniffed_mime
             .map(str::to_string)
             .or_else(|| {
@@ -119,7 +123,7 @@ impl GraphClient {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| guess_mime_type(&final_path).to_string());
-        let is_image = mime_type.to_ascii_lowercase().starts_with("image/");
+        let is_image = is_raster_image_resource(&mime_type, &final_name, &header_bytes);
 
         Ok(DownloadedResource {
             ok: true,
@@ -130,6 +134,21 @@ impl GraphClient {
             is_image,
         })
     }
+}
+
+/// Returns `true` only when the resource MIME/filename represents a supported raster image
+/// and the downloaded header bytes are neither HTML nor SVG markup.
+pub(crate) fn is_raster_image_resource(
+    mime_type: &str,
+    file_name: &str,
+    header_bytes: &[u8],
+) -> bool {
+    if crate::img_preview::looks_like_html_bytes(header_bytes)
+        || crate::img_preview::looks_like_svg_bytes(header_bytes)
+    {
+        return false;
+    }
+    crate::img_preview::is_image_mime_or_name(mime_type, Some(file_name))
 }
 
 fn derive_resource_filename(url_or_path: &str, mime_hint: Option<&str>) -> Option<String> {
@@ -168,27 +187,32 @@ fn derive_resource_filename(url_or_path: &str, mime_hint: Option<&str>) -> Optio
     }
 }
 
-async fn sniff_file_mime(path: &Path) -> Option<&'static str> {
-    let mut header = [0u8; 16];
-    let n = {
-        let mut f = tokio::fs::File::open(path).await.ok()?;
-        let mut read = 0usize;
-        while read < header.len() {
-            let chunk = f.read(&mut header[read..]).await.ok()?;
-            if chunk == 0 {
-                break;
+async fn sniff_file_header_and_mime(path: &Path) -> (Vec<u8>, Option<&'static str>) {
+    let mut header = [0u8; 512];
+    let n = match tokio::fs::File::open(path).await {
+        Ok(mut f) => {
+            let mut read = 0usize;
+            while read < header.len() {
+                match f.read(&mut header[read..]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(chunk) => read += chunk,
+                }
             }
-            read += chunk;
+            read
         }
-        read
+        Err(_) => 0,
     };
-    match sniff_image_extension(&header[..n])? {
-        "png" => Some("image/png"),
-        "jpg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
+    let slice = &header[..n];
+    let mime = match sniff_image_extension(slice) {
+        Some("png") => Some("image/png"),
+        Some("jpg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        _ if crate::img_preview::looks_like_html_bytes(slice) => Some("text/html"),
+        _ if crate::img_preview::looks_like_svg_bytes(slice) => Some("image/svg+xml"),
         _ => None,
-    }
+    };
+    (slice.to_vec(), mime)
 }
 
 pub fn should_send_bearer(graph_base_url: &str, target_url: &str) -> bool {
@@ -493,5 +517,37 @@ mod tests {
             "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         );
         assert_eq!(guess_mime_type(Path::new("photo.PNG")), "image/png");
+    }
+
+    #[tokio::test]
+    async fn test_svg_and_html_rejected_as_raster_image() {
+        let dir = tempdir().unwrap();
+
+        // 1. SVG file must never be classified as raster image
+        let svg_path = dir.path().join("diagram.svg");
+        let svg_bytes = br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>"#;
+        std::fs::write(&svg_path, svg_bytes).unwrap();
+        let (hdr, sniffed) = sniff_file_header_and_mime(&svg_path).await;
+        assert_eq!(sniffed, Some("image/svg+xml"));
+        assert!(!is_raster_image_resource("image/svg+xml", "diagram.svg", &hdr));
+        // Even if server lied and named it .png with image/png hint, SVG bytes are rejected
+        assert!(!is_raster_image_resource("image/png", "diagram.png", &hdr));
+
+        // 2. HTML error/login page disguised as .png must be rejected
+        let html_path = dir.path().join("photo.png");
+        let html_bytes = b"<!DOCTYPE html><html><body>Sign in required</body></html>";
+        std::fs::write(&html_path, html_bytes).unwrap();
+        let (html_hdr, html_sniffed) = sniff_file_header_and_mime(&html_path).await;
+        assert_eq!(html_sniffed, Some("text/html"));
+        assert!(!is_raster_image_resource("image/png", "photo.png", &html_hdr));
+        assert!(!is_raster_image_resource("text/html", "photo.png", &html_hdr));
+
+        // 3. Valid raster PNG is accepted
+        let png_path = dir.path().join("real.png");
+        let png_hdr = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+        std::fs::write(&png_path, png_hdr).unwrap();
+        let (real_hdr, real_sniffed) = sniff_file_header_and_mime(&png_path).await;
+        assert_eq!(real_sniffed, Some("image/png"));
+        assert!(is_raster_image_resource("image/png", "real.png", &real_hdr));
     }
 }

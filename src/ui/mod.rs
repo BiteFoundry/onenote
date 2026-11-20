@@ -214,10 +214,16 @@ fn draw_status_bar(
         ));
     }
 
+    let density_label = match ui.density {
+        crate::config::DensityMode::Cozy => " [Cozy]",
+        crate::config::DensityMode::Compact => " [Cmpct]",
+    };
     let right_buttons = [
-        (" [/ Search] ", ButtonId::Search),
-        (" [Ctrl+P] ", ButtonId::CommandPalette),
-        (" [Ctrl+,] ", ButtonId::Settings),
+        (" [r Sync]", ButtonId::Refresh),
+        (density_label, ButtonId::DensityToggle),
+        (" [/ Search]", ButtonId::Search),
+        (" [Ctrl+P]", ButtonId::CommandPalette),
+        (" [Ctrl+,]", ButtonId::Settings),
         (" [? Help] ", ButtonId::Help),
     ];
     let right_total: u16 = right_buttons.iter().map(|(l, _)| l.len() as u16).sum();

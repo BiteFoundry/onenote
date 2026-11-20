@@ -346,18 +346,30 @@ fn draw_action_toolbar(
     theme: &Theme,
     hitmap: &mut HitMap,
 ) {
-    let buttons: [(&str, ButtonId); 10] = [
-        ("[+Page n]", ButtonId::OnenoteNewPage),
-        ("[+Subpage N]", ButtonId::OnenoteNewSubpage),
-        ("[Append a]", ButtonId::OnenoteAppend),
+    let buttons: [(&str, ButtonId); 12] = [
+        ("[+Pg n]", ButtonId::OnenoteNewPage),
+        ("[Sub N]", ButtonId::OnenoteNewSubpage),
+        ("[Add a]", ButtonId::OnenoteAppend),
         ("[Edit e]", ButtonId::OnenoteEditBlock),
-        ("[Todo Space]", ButtonId::OnenoteToggleTodo),
-        ("[Links u]", ButtonId::OnenoteLinks),
+        ("[Todo x]", ButtonId::OnenoteToggleTodo),
+        ("[Url u]", ButtonId::OnenoteLinks),
         ("[Href h]", ButtonId::OnenoteToggleHrefs),
         ("[Img v]", ButtonId::ImagePreview),
+        ("[H: HTML]", ButtonId::HtmlPreview),
+        ("[Att A]", ButtonId::Attachments),
         ("[Web o]", ButtonId::OnenoteOpenWeb),
         ("[Del D]", ButtonId::OnenoteDeletePage),
     ];
+
+    let total_raw_w: u16 = buttons
+        .iter()
+        .map(|(lbl, _)| UnicodeWidthStr::width(*lbl) as u16)
+        .sum();
+    let gap: u16 = if total_raw_w + (buttons.len().saturating_sub(1) as u16) <= area.width {
+        1
+    } else {
+        0
+    };
 
     let mut spans = Vec::new();
     let mut x = area.x;
@@ -365,20 +377,27 @@ fn draw_action_toolbar(
         .fg(ONENOTE_PURPLE)
         .add_modifier(Modifier::BOLD);
 
-    for &(label, btn_id) in &buttons {
+    for (idx, &(label, btn_id)) in buttons.iter().enumerate() {
         let w = UnicodeWidthStr::width(label) as u16;
         if x.saturating_sub(area.x) + w > area.width {
             break;
         }
         let style = if btn_id == ButtonId::OnenoteDeletePage {
             Style::default().fg(theme.error)
+        } else if btn_id == ButtonId::HtmlPreview {
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD)
         } else {
             btn_style
         };
         spans.push(Span::styled(label, style));
-        spans.push(Span::raw(" "));
         hitmap.add_line(x, area.y, w, HitTarget::Button(btn_id));
-        x = x.saturating_add(w + 1);
+        x = x.saturating_add(w);
+        if gap > 0 && idx + 1 < buttons.len() && x.saturating_sub(area.x) < area.width {
+            spans.push(Span::raw(" "));
+            x = x.saturating_add(gap);
+        }
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -732,13 +751,18 @@ pub fn build_page_canvas_lines_with_opts(
     let mut lines: Vec<RenderedLine> = Vec::new();
     let mut ranges: HashMap<usize, (usize, usize)> = HashMap::new();
 
-    // Page Title Header
+    // Page Title Header with inline clickable `[H: HTML]` pill
     let page_title = if detail.summary.title.trim().is_empty() {
         "(Untitled page)"
     } else {
         detail.summary.title.trim()
     };
-    lines.push(RenderedLine::plain(Line::from(vec![
+    let html_pill = "[H: HTML]";
+    let html_pill_w = UnicodeWidthStr::width(html_pill);
+    let title_budget = width.saturating_sub(2 + html_pill_w + 2).max(8);
+    let shown_title = truncate_clean(page_title, title_budget);
+    let pill_col = (2 + UnicodeWidthStr::width(shown_title.as_str()) + 2) as u16;
+    let mut title_spans = vec![
         Span::styled(
             "# ",
             Style::default()
@@ -746,12 +770,32 @@ pub fn build_page_canvas_lines_with_opts(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            page_title.to_string(),
+            shown_title,
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-    ])));
+    ];
+    let mut title_hits = Vec::new();
+    if (pill_col as usize) + html_pill_w <= width {
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(
+            html_pill,
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        ));
+        title_hits.push((
+            pill_col,
+            html_pill_w as u16,
+            HitTarget::Button(ButtonId::HtmlPreview),
+        ));
+    }
+    lines.push(RenderedLine::with_inline(
+        Line::from(title_spans),
+        None,
+        title_hits,
+    ));
 
     // Metadata line: `{notebook_name} › {section_name} · Modified {last_modified} · {blocks.len()} blocks`
     let nb = detail
@@ -1222,7 +1266,12 @@ fn render_block_into(
             mime_type,
             ..
         } => {
-            let chip = format!("[FILE {name} ({mime_type}) — A download]");
+            let is_html = crate::ui::app::is_html_resource_meta(Some(mime_type), Some(name));
+            let chip = if is_html {
+                format!("[HTML {name} ({mime_type}) — Enter/click preview]")
+            } else {
+                format!("[FILE {name} ({mime_type}) — A download]")
+            };
             let chip_w = UnicodeWidthStr::width(chip.as_str()) as u16;
             let mut chip_style = theme.accent_style().add_modifier(Modifier::BOLD);
             if let Some(bg) = row_bg {

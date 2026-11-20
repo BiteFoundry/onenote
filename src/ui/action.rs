@@ -14,6 +14,7 @@ use crate::{
         hitmap::{ButtonId, HitTarget},
         overlays::{
             context_menu::{ContextMenu, ContextTarget},
+            html_preview::HtmlPreviewOverlay,
             image_preview::ImagePreviewOverlay,
             links::LinkExtractorOverlay,
             onenote_form::OnenoteFormOverlay,
@@ -63,6 +64,10 @@ pub enum Action {
     OpenImagePreview,
     OpenImagePreviewAt(usize),
     LoadPreviewImage,
+    OpenHtmlPreview,
+    OpenHtmlContent { title: String, html: String },
+    OpenHtmlResource(usize),
+    ServeHtmlPreviewInBrowser,
     OpenContextMenu { col: u16, row: u16 },
     RequestExternalEditor,
 
@@ -174,12 +179,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         match outcome {
             OverlayOutcome::Handled | OverlayOutcome::Close => return false,
             OverlayOutcome::Dispatch(next) | OverlayOutcome::CloseAndDispatch(next) => {
-                return dispatch(next, app, ui);
+                return dispatch_inner(next, app, ui);
             }
             OverlayOutcome::NotHandled => {}
         }
     }
 
+    dispatch_inner(action, app, ui)
+}
+
+fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     match action {
         Action::Noop => false,
         Action::Quit => true,
@@ -328,9 +337,17 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             }
                             if let crate::models::OnenoteBlockKind::Attachment {
                                 resource_index,
+                                ref name,
+                                ref mime_type,
                                 ..
                             } = blk.kind
                             {
+                                if crate::ui::app::is_html_resource_meta(
+                                    Some(mime_type),
+                                    Some(name),
+                                ) {
+                                    return dispatch(Action::OpenHtmlResource(resource_index), app, ui);
+                                }
                                 app.spawn_download_resource(resource_index, ui);
                                 return false;
                             }
@@ -357,6 +374,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 OverlayKind::Help => ui.overlays.push(Overlay::help()),
                 OverlayKind::Links => return dispatch(Action::OpenLinkExtractor, app, ui),
                 OverlayKind::ImagePreview => return dispatch(Action::OpenImagePreview, app, ui),
+                OverlayKind::HtmlPreview => return dispatch(Action::OpenHtmlPreview, app, ui),
                 _ => {}
             }
             false
@@ -397,6 +415,14 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::OpenImagePreviewAt(res_idx) => {
             if let Some(detail) = app.active_page_detail() {
+                if let Some(res) = detail.resources.get(res_idx) {
+                    if crate::ui::app::is_html_resource_meta(
+                        Some(&res.mime_type),
+                        res.file_name.as_deref(),
+                    ) {
+                        return dispatch(Action::OpenHtmlResource(res_idx), app, ui);
+                    }
+                }
                 if let Some(ov) = ImagePreviewOverlay::from_onenote_page(detail, Some(res_idx)) {
                     ui.overlays.push(Overlay::ImagePreview(ov));
                     return dispatch(Action::LoadPreviewImage, app, ui);
@@ -414,13 +440,58 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         "hd:{}:{}:{}:{}:{:?}",
                         target.page_key, target.resource_index, cols, rows, proto
                     );
-                    (cache_key, target.url.clone(), cols, rows)
+                    (
+                        cache_key,
+                        target.url.clone(),
+                        target.display_name.clone(),
+                        target.mime_type.clone(),
+                        cols,
+                        rows,
+                    )
                 })
             } else {
                 None
             };
-            if let Some((cache_key, url, cols, rows)) = req {
-                app.request_onenote_image(cache_key, url, cols, rows, ui.graphics_caps, false);
+            if let Some((cache_key, url, display_name, mime_type, cols, rows)) = req {
+                app.request_onenote_image_with_meta(
+                    cache_key,
+                    url,
+                    Some(display_name),
+                    Some(mime_type),
+                    cols,
+                    rows,
+                    ui.graphics_caps,
+                    false,
+                );
+            }
+            false
+        }
+        Action::OpenHtmlPreview => {
+            if let Some(detail) = app.active_page_detail() {
+                let ov = HtmlPreviewOverlay::from_onenote_page(detail);
+                ui.overlays.push(Overlay::HtmlPreview(ov));
+            } else {
+                ui.warn("Open a OneNote page first to inspect HTML");
+            }
+            false
+        }
+        Action::OpenHtmlContent { title, html } => {
+            ui.overlays
+                .push(Overlay::HtmlPreview(HtmlPreviewOverlay::new(Some(title), html)));
+            false
+        }
+        Action::OpenHtmlResource(res_idx) => {
+            app.spawn_load_html_resource(res_idx, ui);
+            false
+        }
+        Action::ServeHtmlPreviewInBrowser => {
+            let payload = if let Some(Overlay::HtmlPreview(preview)) = ui.overlays.last() {
+                Some((preview.title(), preview.raw_html().to_string()))
+            } else {
+                None
+            };
+            if let Some((title, html)) = payload {
+                app.spawn_serve_html_in_browser(title, html, ui);
             }
             false
         }
@@ -800,7 +871,18 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::MouseClick { target, col, row } => {
             handle_mouse_click(target, col, row, app, ui)
         }
-        Action::MouseScroll { delta, .. } => {
+        Action::MouseScroll { delta, column, row } => {
+            if let Some(Overlay::ImagePreview(preview)) = ui.overlays.last_mut() {
+                let _ = preview.handle(&Action::MouseScroll { delta, column, row });
+                return false;
+            }
+            if matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))) {
+                if let Some(mut top) = ui.overlays.pop() {
+                    let _ = top.handle(&Action::MouseScroll { delta, column, row }, app, ui);
+                    ui.overlays.push(top);
+                }
+                return false;
+            }
             if !ui.overlays.is_empty() {
                 let act = if delta < 0 {
                     Action::MoveUp
@@ -893,13 +975,37 @@ fn move_page_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
 
 fn handle_mouse_click(
     target: HitTarget,
-    _col: u16,
-    _row: u16,
+    col: u16,
+    row: u16,
     app: &mut AppState,
     ui: &mut UiState,
 ) -> bool {
     match target {
-        HitTarget::OverlayBody => false,
+        HitTarget::OverlayBackdrop => {
+            ui.overlays.pop();
+            false
+        }
+        HitTarget::OverlayBody => {
+            if matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))) {
+                let outcome = if let Some(Overlay::HtmlPreview(mut preview)) = ui.overlays.pop() {
+                    let res = preview.handle_click(col, row, ui);
+                    match &res {
+                        OverlayOutcome::Close | OverlayOutcome::CloseAndDispatch(_) => {}
+                        _ => ui.overlays.push(Overlay::HtmlPreview(preview)),
+                    }
+                    res
+                } else {
+                    OverlayOutcome::Handled
+                };
+                match outcome {
+                    OverlayOutcome::Dispatch(next) | OverlayOutcome::CloseAndDispatch(next) => {
+                        return dispatch_inner(next, app, ui);
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
         HitTarget::OverlayItem { index } => {
             if let Some(top) = ui.overlays.last_mut() {
                 top.select(index);
@@ -951,50 +1057,561 @@ fn handle_mouse_click(
         }
         HitTarget::OnenoteResource(res_idx) => {
             ui.overlays.clear();
-            if app
+            let res_meta = app
                 .active_page_detail()
                 .and_then(|d| d.resources.get(res_idx))
-                .is_some_and(|r| r.is_image)
-            {
-                dispatch(Action::OpenImagePreviewAt(res_idx), app, ui)
-            } else {
-                app.spawn_download_resource(res_idx, ui);
-                false
+                .map(|r| (r.is_image, r.mime_type.clone(), r.file_name.clone()));
+            match res_meta {
+                Some((_, mime, name))
+                    if crate::ui::app::is_html_resource_meta(Some(&mime), name.as_deref()) =>
+                {
+                    dispatch(Action::OpenHtmlResource(res_idx), app, ui)
+                }
+                Some((true, _, _)) => dispatch(Action::OpenImagePreviewAt(res_idx), app, ui),
+                _ => {
+                    app.spawn_download_resource(res_idx, ui);
+                    false
+                }
             }
         }
-        HitTarget::Button(btn) => match btn {
-            ButtonId::ConfirmOk => dispatch(Action::Activate, app, ui),
-            ButtonId::ConfirmCancel => dispatch(Action::CloseOverlay, app, ui),
-            ButtonId::Search => dispatch(Action::OpenSearch, app, ui),
-            ButtonId::CommandPalette => {
-                dispatch(Action::OpenOverlay(OverlayKind::CommandPalette), app, ui)
+        HitTarget::Button(btn) => {
+            if !matches!(
+                btn,
+                ButtonId::ConfirmOk
+                    | ButtonId::ConfirmCancel
+                    | ButtonId::HtmlToggleRaw
+                    | ButtonId::HtmlServeBrowser
+            ) {
+                ui.overlays.clear();
             }
-            ButtonId::DensityToggle => dispatch(Action::ToggleDensity, app, ui),
-            ButtonId::Help => dispatch(Action::OpenOverlay(OverlayKind::Help), app, ui),
-            ButtonId::Settings => dispatch(Action::OpenOverlay(OverlayKind::Settings), app, ui),
-            ButtonId::Refresh => dispatch(Action::RefreshAll, app, ui),
-            ButtonId::OnenoteNewNotebook => dispatch(Action::OpenOnenoteCreateNotebook, app, ui),
-            ButtonId::OnenoteNewSection => dispatch(Action::OpenOnenoteCreateSection, app, ui),
-            ButtonId::OnenoteNewPage => {
-                dispatch(Action::OpenOnenoteCreatePage { level: 0 }, app, ui)
+            match btn {
+                ButtonId::ConfirmOk => dispatch(Action::Activate, app, ui),
+                ButtonId::ConfirmCancel => dispatch(Action::CloseOverlay, app, ui),
+                ButtonId::HtmlPreview => dispatch(Action::OpenHtmlPreview, app, ui),
+                ButtonId::HtmlToggleRaw => {
+                    if let Some(Overlay::HtmlPreview(ref mut preview)) = ui.overlays.last_mut() {
+                        preview.toggle_raw_mode();
+                    }
+                    false
+                }
+                ButtonId::HtmlServeBrowser => {
+                    dispatch_inner(Action::ServeHtmlPreviewInBrowser, app, ui)
+                }
+                ButtonId::Search => dispatch(Action::OpenSearch, app, ui),
+                ButtonId::CommandPalette => {
+                    dispatch(Action::OpenOverlay(OverlayKind::CommandPalette), app, ui)
+                }
+                ButtonId::DensityToggle => dispatch(Action::ToggleDensity, app, ui),
+                ButtonId::Help => dispatch(Action::OpenOverlay(OverlayKind::Help), app, ui),
+                ButtonId::Settings => dispatch(Action::OpenOverlay(OverlayKind::Settings), app, ui),
+                ButtonId::Refresh => dispatch(Action::RefreshAll, app, ui),
+                ButtonId::OnenoteNewNotebook => dispatch(Action::OpenOnenoteCreateNotebook, app, ui),
+                ButtonId::OnenoteNewSection => dispatch(Action::OpenOnenoteCreateSection, app, ui),
+                ButtonId::OnenoteNewPage => {
+                    dispatch(Action::OpenOnenoteCreatePage { level: 0 }, app, ui)
+                }
+                ButtonId::OnenoteNewSubpage => {
+                    dispatch(Action::OpenOnenoteCreatePage { level: 1 }, app, ui)
+                }
+                ButtonId::OnenoteAppend => dispatch(Action::OpenOnenoteAppend, app, ui),
+                ButtonId::OnenoteEditBlock => dispatch(Action::OpenOnenoteEditBlock, app, ui),
+                ButtonId::OnenoteToggleTodo => dispatch(Action::OnenoteToggleTodo(None), app, ui),
+                ButtonId::OnenoteDeletePage => dispatch(Action::ConfirmDeleteOnenotePage, app, ui),
+                ButtonId::OnenoteOpenWeb => dispatch(Action::OnenoteOpenWeb, app, ui),
+                ButtonId::OnenoteLinks => dispatch(Action::OpenLinkExtractor, app, ui),
+                ButtonId::OnenoteToggleHrefs => dispatch(Action::ToggleShowLinkUrls, app, ui),
+                ButtonId::Attachments => {
+                    dispatch(Action::OpenOverlay(OverlayKind::Attachments), app, ui)
+                }
+                ButtonId::ImagePreview => dispatch(Action::OpenImagePreview, app, ui),
+                ButtonId::NarrowNotebooks => dispatch(Action::SetFocus(Focus::Nav), app, ui),
+                ButtonId::NarrowPages => dispatch(Action::SetFocus(Focus::Pages), app, ui),
+                ButtonId::NarrowCanvas => dispatch(Action::SetFocus(Focus::Canvas), app, ui),
             }
-            ButtonId::OnenoteNewSubpage => {
-                dispatch(Action::OpenOnenoteCreatePage { level: 1 }, app, ui)
-            }
-            ButtonId::OnenoteAppend => dispatch(Action::OpenOnenoteAppend, app, ui),
-            ButtonId::OnenoteEditBlock => dispatch(Action::OpenOnenoteEditBlock, app, ui),
-            ButtonId::OnenoteToggleTodo => dispatch(Action::OnenoteToggleTodo(None), app, ui),
-            ButtonId::OnenoteDeletePage => dispatch(Action::ConfirmDeleteOnenotePage, app, ui),
-            ButtonId::OnenoteOpenWeb => dispatch(Action::OnenoteOpenWeb, app, ui),
-            ButtonId::OnenoteLinks => dispatch(Action::OpenLinkExtractor, app, ui),
-            ButtonId::OnenoteToggleHrefs => dispatch(Action::ToggleShowLinkUrls, app, ui),
-            ButtonId::Attachments => {
-                dispatch(Action::OpenOverlay(OverlayKind::Attachments), app, ui)
-            }
-            ButtonId::ImagePreview => dispatch(Action::OpenImagePreview, app, ui),
-            ButtonId::NarrowNotebooks => dispatch(Action::SetFocus(Focus::Nav), app, ui),
-            ButtonId::NarrowPages => dispatch(Action::SetFocus(Focus::Pages), app, ui),
-            ButtonId::NarrowCanvas => dispatch(Action::SetFocus(Focus::Canvas), app, ui),
-        },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::{mpsc, watch};
+
+    use super::*;
+    use crate::{
+        auth::{AuthManager, StoredTokens},
+        config::AppConfig,
+        graph::GraphClient,
+        models::{OnenoteNotebook, OnenotePageSummary, OnenoteScope, OnenoteSection},
+        storage::Storage,
+        sync::{FocusTarget, SyncController},
+        ui::{self, app::UiMsg},
+    };
+
+    fn make_ui_test_harness() -> (AppState, UiState, mpsc::UnboundedReceiver<SyncCommand>) {
+        let cfg = AppConfig::default();
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("u1".to_string()),
+            user_display_name: Some("Tester".to_string()),
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiMsg>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        app.notebooks.push(OnenoteNotebook {
+            notebook_key: "me|nb1".to_string(),
+            id: "nb1".to_string(),
+            scope: OnenoteScope::Me,
+            display_name: "Eng".to_string(),
+            color: None,
+            is_default: true,
+            is_shared: false,
+            user_role: None,
+            created_at: None,
+            last_modified_at: None,
+            created_by: None,
+            web_url: None,
+        });
+        app.sections.push(OnenoteSection {
+            section_key: "me|sec1".to_string(),
+            id: "sec1".to_string(),
+            scope: OnenoteScope::Me,
+            notebook_id: Some("nb1".to_string()),
+            notebook_name: Some("Eng".to_string()),
+            parent_section_group_id: None,
+            parent_section_group_name: None,
+            display_name: "Notes".to_string(),
+            color: None,
+            is_default: true,
+            pages_url: None,
+            created_at: None,
+            last_modified_at: None,
+            web_url: None,
+        });
+        app.pages.push(OnenotePageSummary {
+            page_key: "me|p1".to_string(),
+            id: "p1".to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec1".to_string(),
+            section_name: Some("Notes".to_string()),
+            notebook_id: Some("nb1".to_string()),
+            notebook_name: Some("Eng".to_string()),
+            title: "Page 1".to_string(),
+            level: 0,
+            order: 0,
+            created_at: None,
+            last_modified_at: None,
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        });
+        app.active_notebook_key = Some("me|nb1".to_string());
+        app.active_section_key = Some("me|sec1".to_string());
+        app.active_page_key = Some("me|p1".to_string());
+
+        let ui = UiState::from_config(&cfg);
+        (app, ui, nudge_rx)
+    }
+
+    #[test]
+    fn test_all_header_toolbar_and_status_buttons_register_and_dispatch_clicks() {
+        let (mut app, mut ui, mut nudge_rx) = make_ui_test_harness();
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // Every wide-mode button must be registered in HitMap
+        let expected_wide_buttons = [
+            ButtonId::Refresh,
+            ButtonId::DensityToggle,
+            ButtonId::Search,
+            ButtonId::CommandPalette,
+            ButtonId::Settings,
+            ButtonId::Help,
+            ButtonId::OnenoteNewNotebook,
+            ButtonId::OnenoteNewSection,
+            ButtonId::OnenoteNewPage,
+            ButtonId::OnenoteNewSubpage,
+            ButtonId::OnenoteAppend,
+            ButtonId::OnenoteEditBlock,
+            ButtonId::OnenoteToggleTodo,
+            ButtonId::OnenoteLinks,
+            ButtonId::OnenoteToggleHrefs,
+            ButtonId::ImagePreview,
+            ButtonId::HtmlPreview,
+            ButtonId::Attachments,
+            ButtonId::OnenoteOpenWeb,
+            ButtonId::OnenoteDeletePage,
+        ];
+        for btn in expected_wide_buttons {
+            assert!(
+                ui.hitmap.region_of(HitTarget::Button(btn)).is_some(),
+                "expected HitTarget::Button({btn:?}) to be registered in HitMap"
+            );
+        }
+
+        // Clicking DensityToggle flips Cozy <-> Compact
+        let initial_density = ui.density;
+        let density_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::DensityToggle))
+            .unwrap();
+        let target = ui.hitmap.hit(density_rect.y, density_rect.x).unwrap();
+        dispatch(
+            Action::MouseClick {
+                target,
+                col: density_rect.x,
+                row: density_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_ne!(ui.density, initial_density);
+
+        // Clicking Refresh triggers SyncCommand::RefreshAll
+        let refresh_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::Refresh))
+            .unwrap();
+        let target = ui.hitmap.hit(refresh_rect.y, refresh_rect.x).unwrap();
+        dispatch(
+            Action::MouseClick {
+                target,
+                col: refresh_rect.x,
+                row: refresh_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(app.syncing);
+        assert_eq!(nudge_rx.try_recv().ok(), Some(SyncCommand::RefreshAll));
+
+        // Clicking Attachments opens Attachments overlay
+        let att_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::Attachments))
+            .unwrap();
+        let target = ui.hitmap.hit(att_rect.y, att_rect.x).unwrap();
+        dispatch(
+            Action::MouseClick {
+                target,
+                col: att_rect.x,
+                row: att_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(matches!(ui.overlays.last(), Some(Overlay::Attachments(_))));
+
+        // Clicking Search while Attachments is open dismisses Attachments and opens Search
+        let search_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::Search))
+            .unwrap();
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::Search),
+                col: search_rect.x,
+                row: search_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(matches!(ui.overlays.last(), Some(Overlay::Search(_))));
+        assert_eq!(ui.overlays.len(), 1);
+    }
+
+    #[test]
+    fn test_narrow_bar_buttons_register_and_switch_focus() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        let mut terminal = Terminal::new(TestBackend::new(70, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        for (btn, expected_focus) in [
+            (ButtonId::NarrowNotebooks, Focus::Nav),
+            (ButtonId::NarrowPages, Focus::Pages),
+            (ButtonId::NarrowCanvas, Focus::Canvas),
+        ] {
+            let rect = ui
+                .hitmap
+                .region_of(HitTarget::Button(btn))
+                .expect("narrow bar button must be registered");
+            let hit = ui.hitmap.hit(rect.y, rect.x).unwrap();
+            assert_eq!(hit, HitTarget::Button(btn));
+            dispatch(
+                Action::MouseClick {
+                    target: hit,
+                    col: rect.x,
+                    row: rect.y,
+                },
+                &mut app,
+                &mut ui,
+            );
+            assert_eq!(ui.focus, expected_focus);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_html_preview_pill_shortcut_native_serving_and_click_outside() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        // Attach a separate ui_rx so we can inspect UiMsg::HtmlServed without launching a real browser
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
+        app.ui_tx = ui_tx;
+
+        let summary = app.pages[0].clone();
+        let raw_xhtml = r#"<!DOCTYPE html><html><head><title>Spec HTML</title></head><body><p id="out">Init</p><button onclick="document.getElementById('out').textContent='Clicked!'">Run</button></body></html>"#;
+        app.page_details.insert(
+            summary.page_key.clone(),
+            crate::models::OnenotePageDetail {
+                summary,
+                raw_xhtml: raw_xhtml.to_string(),
+                body_markdown: "Init".to_string(),
+                body_plain: "Init".to_string(),
+                blocks: Vec::new(),
+                resources: Vec::new(),
+                primary_div_id: None,
+                synced_at: None,
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // 1. Clicking [H: HTML] pill opens Overlay::HtmlPreview
+        let html_btn = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::HtmlPreview))
+            .expect("expected [H: HTML] pill in HitMap");
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::HtmlPreview),
+                col: html_btn.x,
+                row: html_btn.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))));
+
+        // Redraw with HtmlPreview open
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // 2. Clicking the HTML <button onclick> inside OverlayBody mutates DOM via QuickJS-NG
+        let (btn_col, btn_row) = {
+            let Some(Overlay::HtmlPreview(ref mut ov)) = ui.overlays.last_mut() else {
+                panic!("expected HtmlPreview");
+            };
+            let theme = ui.theme.to_html_theme();
+            let ctrl = ov
+                .session
+                .render(ov.content_rect.width, &theme, false)
+                .controls[0]
+                .clone();
+            (
+                ov.content_rect.x + ctrl.col_start + 1,
+                ov.content_rect.y + ctrl.line as u16,
+            )
+        };
+        let hit = ui.hitmap.hit(btn_row, btn_col).unwrap();
+        assert_eq!(hit, HitTarget::OverlayBody);
+        dispatch(
+            Action::MouseClick {
+                target: hit,
+                col: btn_col,
+                row: btn_row,
+            },
+            &mut app,
+            &mut ui,
+        );
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..34)
+            .flat_map(|y| (0..120).map(move |x| buf[(x, y)].symbol().to_string()))
+            .collect();
+        assert!(screen.contains("Clicked!"), "expected QuickJS onclick result on screen");
+
+        // 3. Pressing 'o' triggers native Axum serving via NativeHtmlServer::serve_html
+        dispatch(Action::Input('o'), &mut app, &mut ui);
+        let served_url = match tokio::time::timeout(std::time::Duration::from_secs(3), ui_rx.recv())
+            .await
+            .expect("timed out waiting for UiMsg::HtmlServed")
+        {
+            Some(UiMsg::HtmlServed { url }) => url,
+            other => panic!("expected UiMsg::HtmlServed, got {other:?}"),
+        };
+        assert!(served_url.starts_with("http://127.0.0.1:"));
+
+        // Verify live HTTP 200 text/html response from NativeHtmlServer
+        let without_scheme = served_url.strip_prefix("http://").unwrap();
+        let (host_port, path) = without_scheme.split_once('/').unwrap();
+        let mut stream = tokio::net::TcpStream::connect(host_port).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let req = format!("GET /{path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.to_ascii_lowercase().contains("content-type: text/html; charset=utf-8"));
+        assert!(resp.contains("Spec HTML"));
+
+        // 4. Clicking outside modal (OverlayBackdrop at (0,0)) closes HtmlPreview
+        let backdrop_hit = ui.hitmap.hit(0, 0).unwrap();
+        assert_eq!(backdrop_hit, HitTarget::OverlayBackdrop);
+        dispatch(
+            Action::MouseClick {
+                target: backdrop_hit,
+                col: 0,
+                row: 0,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.overlays.is_empty());
+
+        // 5. Key shortcut 'H' reopens HtmlPreview
+        let key_h = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('H'),
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        let act = crate::ui::event::key_to_action(key_h, Focus::Canvas, &ui.keymap, false);
+        assert_eq!(act, Some(Action::OpenHtmlPreview));
+        dispatch(act.unwrap(), &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))));
+
+        app.html_server.shutdown();
+    }
+
+    #[test]
+    fn test_html_resource_routing_in_attachments_and_image_preview_sniff() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        let summary = app.pages[0].clone();
+        app.page_details.insert(
+            summary.page_key.clone(),
+            crate::models::OnenotePageDetail {
+                summary,
+                raw_xhtml: "<html><body><p>Page</p></body></html>".to_string(),
+                body_markdown: "Page".to_string(),
+                body_plain: "Page".to_string(),
+                blocks: Vec::new(),
+                resources: vec![
+                    crate::models::OnenoteResource {
+                        element_id: Some("obj:1".to_string()),
+                        resource_url: "https://example.com/report.html".to_string(),
+                        fullres_url: None,
+                        mime_type: "text/html".to_string(),
+                        file_name: Some("report.html".to_string()),
+                        is_image: false,
+                        alt_text: None,
+                    },
+                    crate::models::OnenoteResource {
+                        element_id: Some("obj:2".to_string()),
+                        resource_url: "https://example.com/widget.htm".to_string(),
+                        fullres_url: None,
+                        mime_type: "application/octet-stream".to_string(),
+                        file_name: Some("widget.htm".to_string()),
+                        is_image: false,
+                        alt_text: None,
+                    },
+                    crate::models::OnenoteResource {
+                        element_id: Some("img:3".to_string()),
+                        resource_url: "https://example.com/photo.png".to_string(),
+                        fullres_url: None,
+                        mime_type: "image/png".to_string(),
+                        file_name: Some("photo.png".to_string()),
+                        is_image: true,
+                        alt_text: None,
+                    },
+                ],
+                primary_div_id: None,
+                synced_at: None,
+            },
+        );
+
+        // 1. Attachments overlay detects .html and .htm resources and routes Enter/v to OpenHtmlResource (NOT ImagePreview)
+        let mut tray = crate::ui::overlays::attachments::AttachmentsState::default();
+        assert_eq!(
+            tray.handle(&Action::Input('v'), &app),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
+        );
+        assert_eq!(
+            tray.handle(&Action::Activate, &app),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
+        );
+        tray.select(1);
+        assert_eq!(
+            tray.handle(&Action::Input('v'), &app),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(1))
+        );
+        tray.select(2);
+        assert_eq!(
+            tray.handle(&Action::Input('v'), &app),
+            OverlayOutcome::CloseAndDispatch(Action::OpenImagePreviewAt(2))
+        );
+
+        // 2. LoadPreviewImage byte sniffer detects HTML masquerading as image/png and routes to Overlay::HtmlPreview
+        let fake_png_html = b"<!DOCTYPE html><html><body><h1>Login Required</h1></body></html>";
+        let sniffed = crate::ui::app::sniff_preview_bytes_as_html(
+            Some("image/png"),
+            Some("photo.png"),
+            fake_png_html,
+        );
+        assert!(sniffed.is_some());
+
+        // Real PNG is NOT routed to HTML
+        let real_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        assert!(
+            crate::ui::app::sniff_preview_bytes_as_html(Some("image/png"), Some("photo.png"), real_png)
+                .is_none()
+        );
+
+        // Simulate ImagePreview open -> ImageRoutedToHtml arrives -> swaps ImagePreview for HtmlPreview
+        let detail = app.active_page_detail().unwrap();
+        let img_ov = ImagePreviewOverlay::from_onenote_page(detail, Some(2)).unwrap();
+        ui.overlays.push(Overlay::ImagePreview(img_ov));
+        app.inflight_images.insert("hd:key".to_string());
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ImageRoutedToHtml {
+                cache_key: "hd:key".to_string(),
+                title: "photo.png".to_string(),
+                html: sniffed.unwrap(),
+            },
+        );
+        assert!(!app.inflight_images.contains("hd:key"));
+        assert_eq!(ui.overlays.len(), 1);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))));
     }
 }

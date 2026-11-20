@@ -24,11 +24,18 @@ pub struct ResourceRow {
     pub name: String,
     pub mime_type: String,
     pub is_image: bool,
+    pub is_html: bool,
 }
 
 impl ResourceRow {
     pub fn label(&self) -> String {
-        let icon = if self.is_image { "[IMG]" } else { "[FILE]" };
+        let icon = if self.is_html {
+            "[HTML]"
+        } else if self.is_image {
+            "[IMG]"
+        } else {
+            "[FILE]"
+        };
         format!("{icon} {} ({})", self.name, self.mime_type)
     }
 }
@@ -53,11 +60,17 @@ pub fn rows_from_onenote_page(detail: &OnenotePageDetail) -> Vec<ResourceRow> {
                         format!("resource-{}", resource_index + 1)
                     }
                 });
+            let is_html = bitefoundry_html::sniff_content_kind(
+                Some(&res.mime_type),
+                res.file_name.as_deref().or(Some(name.as_str())),
+                None,
+            ) == bitefoundry_html::ContentKind::Html;
             ResourceRow {
                 resource_index,
                 name,
                 mime_type: res.mime_type.clone(),
-                is_image: res.is_image,
+                is_image: res.is_image && !is_html,
+                is_html,
             }
         })
         .collect()
@@ -89,7 +102,19 @@ impl AttachmentsState {
                 }
                 OverlayOutcome::Handled
             }
-            Action::Activate | Action::Input('d') => {
+            Action::Activate => {
+                let idx = self.selected.min(items.len().saturating_sub(1));
+                match items.get(idx) {
+                    Some(row) if row.is_html => OverlayOutcome::CloseAndDispatch(
+                        Action::OpenHtmlResource(row.resource_index),
+                    ),
+                    Some(row) => OverlayOutcome::CloseAndDispatch(Action::DownloadResource(
+                        row.resource_index,
+                    )),
+                    None => OverlayOutcome::Close,
+                }
+            }
+            Action::Input('d') => {
                 let idx = self.selected.min(items.len().saturating_sub(1));
                 match items.get(idx) {
                     Some(row) => OverlayOutcome::CloseAndDispatch(Action::DownloadResource(
@@ -98,9 +123,15 @@ impl AttachmentsState {
                     None => OverlayOutcome::Close,
                 }
             }
-            Action::Input('v') | Action::OpenImagePreview => {
+            Action::Input('v')
+            | Action::OpenImagePreview
+            | Action::OpenHtmlPreview
+            | Action::Input('H') => {
                 let idx = self.selected.min(items.len().saturating_sub(1));
                 match items.get(idx) {
+                    Some(row) if row.is_html => OverlayOutcome::CloseAndDispatch(
+                        Action::OpenHtmlResource(row.resource_index),
+                    ),
                     Some(row) if row.is_image => OverlayOutcome::CloseAndDispatch(
                         Action::OpenImagePreviewAt(row.resource_index),
                     ),
@@ -136,7 +167,7 @@ impl AttachmentsState {
             .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
                 format!(
-                    " Page Resources ({}) · Enter/d Download · v Preview · Esc Close ",
+                    " Page Resources ({}) · Enter/v Preview · d Download · Esc Close ",
                     items.len()
                 ),
                 theme.title(true),

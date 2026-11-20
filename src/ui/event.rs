@@ -38,6 +38,7 @@ pub fn key_to_action(
             KeyCommand::OpenLinkExtractor => Action::OpenLinkExtractor,
             KeyCommand::ToggleShowLinkUrls => Action::ToggleShowLinkUrls,
             KeyCommand::OpenImagePreview => Action::OpenImagePreview,
+            KeyCommand::OpenHtmlPreview => Action::OpenHtmlPreview,
             KeyCommand::OpenAttachments => Action::OpenOverlay(OverlayKind::Attachments),
             KeyCommand::NewNotebook => Action::OpenOnenoteCreateNotebook,
             KeyCommand::NewSection => Action::OpenOnenoteCreateSection,
@@ -121,7 +122,14 @@ pub fn mouse_to_action(mouse: MouseEvent, hitmap: &HitMap) -> Option<Action> {
         }
         MouseEventKind::Down(MouseButton::Right) => {
             let target = hitmap.hit(mouse.row, mouse.column);
-            if matches!(target, Some(HitTarget::OverlayBody | HitTarget::OverlayItem { .. })) {
+            if matches!(
+                target,
+                Some(
+                    HitTarget::OverlayBackdrop
+                        | HitTarget::OverlayBody
+                        | HitTarget::OverlayItem { .. }
+                )
+            ) {
                 return None;
             }
             Some(Action::OpenContextMenu {

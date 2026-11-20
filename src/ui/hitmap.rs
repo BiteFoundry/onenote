@@ -27,6 +27,9 @@ pub enum ButtonId {
     OnenoteToggleHrefs,
     Attachments,
     ImagePreview,
+    HtmlPreview,
+    HtmlToggleRaw,
+    HtmlServeBrowser,
     // Narrow responsive bar pills
     NarrowNotebooks,
     NarrowPages,
@@ -53,6 +56,8 @@ pub enum HitTarget {
     OnenoteResource(usize),
     /// Header / toolbar / status / modal button.
     Button(ButtonId),
+    /// Full-screen backdrop behind a modal (clicking outside the modal closes it).
+    OverlayBackdrop,
     /// Modal / overlay outer frame (prevents clicks inside modal padding from closing the modal).
     OverlayBody,
     /// Item inside the top overlay.

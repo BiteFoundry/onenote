@@ -506,6 +506,41 @@ impl Theme {
             _ => ("○", self.fg_muted),
         }
     }
+
+    /// Converts this TUI theme into a `bitefoundry_html::HtmlTheme` for interactive HTML previews.
+    pub fn to_html_theme(&self) -> bitefoundry_html::HtmlTheme {
+        if self.no_color {
+            return bitefoundry_html::HtmlTheme::no_color();
+        }
+        let is_light = self.bg_composer == Color::Rgb(255, 255, 255);
+        bitefoundry_html::HtmlTheme {
+            text: self.fg_primary,
+            muted: self.fg_muted,
+            heading: self.accent_soft,
+            accent: self.accent,
+            link: self.accent,
+            code_fg: self.code_fg,
+            code_bg: self.code_bg,
+            quote_border: self.border,
+            border: self.border,
+            control_fg: self.fg_primary,
+            control_bg: self.bg_selected,
+            focus_fg: if self.ansi16_only {
+                Color::Reset
+            } else if is_light {
+                Color::White
+            } else {
+                self.bg_header
+            },
+            focus_bg: if self.ansi16_only {
+                Color::Reset
+            } else {
+                self.accent
+            },
+            raw_tag: self.accent,
+            raw_attr: self.warning,
+        }
+    }
 }
 
 #[cfg(test)]

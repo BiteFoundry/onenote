@@ -4,12 +4,14 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Cursor, IsTerminal, Write as _};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
 use image::{imageops::FilterType, DynamicImage, ImageFormat, Rgba};
 use ratatui::{
+    layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
 };
@@ -24,6 +26,7 @@ pub const KITTY_PREVIEW_IMAGE_ID: u32 = 4242;
 
 const MAX_PIXEL_WIDTH: u32 = 1920;
 const MAX_PIXEL_HEIGHT: u32 = 1200;
+const MAX_SCROLLABLE_PIXEL_HEIGHT: u32 = 3600;
 const MAX_ITERM2_RAW_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,6 +99,34 @@ fn default_fallback_cell_px() -> (u16, u16) {
 }
 
 #[derive(Debug, Clone)]
+enum PixelScrollBacking {
+    SixelIndexed {
+        width: u32,
+        height: u32,
+        cell_px: (u16, u16),
+        palette: Vec<(u8, u8, u8)>,
+        indexed: Arc<Vec<u8>>,
+    },
+    Rgba {
+        width: u32,
+        height: u32,
+        cell_px: (u16, u16),
+        rgba: Arc<Vec<u8>>,
+    },
+}
+
+impl PixelScrollBacking {
+    fn approx_heap_bytes(&self) -> usize {
+        match self {
+            Self::SixelIndexed {
+                palette, indexed, ..
+            } => palette.capacity() * std::mem::size_of::<(u8, u8, u8)>() + indexed.capacity(),
+            Self::Rgba { rgba, .. } => rgba.capacity(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RenderedTerminalImage {
     pub width_px: u32,
     pub height_px: u32,
@@ -106,6 +137,8 @@ pub struct RenderedTerminalImage {
     pub lines: Vec<Line<'static>>,
     /// Pre-encoded escape sequence payload when `protocol.is_pixel()` is true (positioned by caller in TUI).
     pub pixel_payload: Option<String>,
+    /// Optional scrollable pixel backing used to generate viewport-cropped slices on scroll.
+    scroll_backing: Option<PixelScrollBacking>,
 }
 
 impl RenderedTerminalImage {
@@ -114,7 +147,11 @@ impl RenderedTerminalImage {
         let mut total = std::mem::size_of::<Self>()
             + self.format_label.capacity()
             + self.lines.capacity() * std::mem::size_of::<Line<'static>>()
-            + self.pixel_payload.as_ref().map_or(0, |s| s.capacity());
+            + self.pixel_payload.as_ref().map_or(0, |s| s.capacity())
+            + self
+                .scroll_backing
+                .as_ref()
+                .map_or(0, PixelScrollBacking::approx_heap_bytes);
         for line in &self.lines {
             total += line.spans.capacity() * std::mem::size_of::<Span<'static>>();
             for span in &line.spans {
@@ -123,11 +160,172 @@ impl RenderedTerminalImage {
         }
         total
     }
+
+    /// Returns a viewport-cropped pixel protocol payload `(payload, draw_cols, draw_rows)` guaranteed
+    /// to fit within `(view_cols, view_rows)` cells starting at cell offset `(scroll_x, scroll_y)`.
+    pub fn viewport_pixel_payload(
+        &self,
+        scroll_x: u16,
+        scroll_y: u16,
+        view_cols: u16,
+        view_rows: u16,
+    ) -> Option<(String, u16, u16)> {
+        if !self.protocol.is_pixel() || view_cols == 0 || view_rows == 0 {
+            return None;
+        }
+        if scroll_x == 0 && scroll_y == 0 && self.cols <= view_cols && self.rows <= view_rows {
+            return Some((self.pixel_payload.clone()?, self.cols, self.rows));
+        }
+
+        let backing = self.scroll_backing.as_ref()?;
+        match backing {
+            PixelScrollBacking::SixelIndexed {
+                width,
+                height,
+                cell_px,
+                palette,
+                indexed,
+            } => {
+                let cell_w = cell_px.0.max(1) as u32;
+                let cell_h = cell_px.1.max(1) as u32;
+                let x0 = (scroll_x as u32).saturating_mul(cell_w);
+                let y0 = (scroll_y as u32).saturating_mul(cell_h);
+                if x0 >= *width || y0 >= *height {
+                    return None;
+                }
+                let max_w = (view_cols as u32).saturating_mul(cell_w);
+                let max_h = (view_rows as u32).saturating_mul(cell_h);
+                let safe_h = compute_sixel_safe_pixel_height(view_rows, cell_px.1);
+                let effective_max_h = if safe_h >= 6 { safe_h } else { max_h };
+                let crop_w = (*width - x0).min(max_w);
+                let crop_h = (*height - y0).min(effective_max_h);
+                if crop_w == 0 || crop_h == 0 {
+                    return None;
+                }
+                let draw_cols = crop_w.div_ceil(cell_w).clamp(1, view_cols as u32) as u16;
+                let band_px_h = crop_h.div_ceil(6) * 6;
+                let draw_rows = band_px_h.div_ceil(cell_h).clamp(1, view_rows as u32) as u16;
+                let payload = encode_sixel_indexed_slice(
+                    palette,
+                    indexed,
+                    *width as usize,
+                    x0 as usize,
+                    y0 as usize,
+                    crop_w as usize,
+                    crop_h as usize,
+                );
+                Some((payload, draw_cols, draw_rows))
+            }
+            PixelScrollBacking::Rgba {
+                width,
+                height,
+                cell_px,
+                rgba,
+            } => {
+                let cell_w = cell_px.0.max(1) as u32;
+                let cell_h = cell_px.1.max(1) as u32;
+                let x0 = (scroll_x as u32).saturating_mul(cell_w);
+                let y0 = (scroll_y as u32).saturating_mul(cell_h);
+                if x0 >= *width || y0 >= *height {
+                    return None;
+                }
+                let max_w = (view_cols as u32).saturating_mul(cell_w);
+                let max_h = (view_rows as u32).saturating_mul(cell_h);
+                let crop_w = (*width - x0).min(max_w);
+                let crop_h = (*height - y0).min(max_h);
+                if crop_w == 0 || crop_h == 0 {
+                    return None;
+                }
+                let draw_cols = crop_w.div_ceil(cell_w).clamp(1, view_cols as u32) as u16;
+                let draw_rows = crop_h.div_ceil(cell_h).clamp(1, view_rows as u32) as u16;
+
+                let full_stride = (*width as usize) * 4;
+                let row_bytes = (crop_w as usize) * 4;
+                let x_byte_off = (x0 as usize) * 4;
+                let mut sub = Vec::with_capacity(row_bytes * crop_h as usize);
+                for dy in 0..(crop_h as usize) {
+                    let start = (y0 as usize + dy) * full_stride + x_byte_off;
+                    sub.extend_from_slice(&rgba[start..start + row_bytes]);
+                }
+                let sub_img = image::RgbaImage::from_raw(crop_w, crop_h, sub)?;
+                let png_bytes = encode_png(&DynamicImage::ImageRgba8(sub_img)).ok()?;
+                let payload = match self.protocol {
+                    TerminalImageProtocol::Kitty => {
+                        encode_kitty_tui_payload(&png_bytes, draw_cols, draw_rows)
+                    }
+                    TerminalImageProtocol::ITerm2 => {
+                        let b64 = B64_STANDARD.encode(&png_bytes);
+                        format!(
+                            "\x1b]1337;File=inline=1;width={draw_cols};height={draw_rows};preserveAspectRatio=1;doNotMoveCursor=1:{b64}\x07"
+                        )
+                    }
+                    TerminalImageProtocol::Sixel | TerminalImageProtocol::Halfblock => {
+                        return None;
+                    }
+                };
+                Some((payload, draw_cols, draw_rows))
+            }
+        }
+    }
+}
+
+/// Tracks an active terminal pixel graphic placement (Kitty / iTerm2 / Sixel) painted onto the screen
+/// so frame transitions can deterministically erase stale pixels before Ratatui redraws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePixelGraphic {
+    pub cache_key: String,
+    pub rect: Rect,
+    pub protocol: TerminalImageProtocol,
+    pub cols: u16,
+    pub rows: u16,
+    pub payload_len: usize,
 }
 
 /// Returns the Kitty graphics delete sequence for the fixed TUI preview placement (`q=2` suppresses terminal responses).
 pub fn kitty_delete_preview_sequence() -> &'static str {
     "\x1b_Ga=d,d=i,i=4242,q=2\x1b\\"
+}
+
+/// Deletes all visible Kitty graphics placements and frees unused image data (`d=A`, `q=2` quiet).
+pub fn kitty_delete_all_sequence() -> &'static str {
+    "\x1b_Ga=d,d=A,q=2\x1b\\"
+}
+
+/// Builds an ANSI sequence (`\x1b[0m` + row cursor moves + space runs) that overwrites `rect`
+/// (expanded by +2 cols / +2 rows and clamped to `term_cols x term_rows`) so Sixel and iTerm2
+/// cell-bound pixel tiles are deterministically erased before Ratatui redraws.
+pub fn erase_pixel_rect_sequence(
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    term_cols: u16,
+    term_rows: u16,
+) -> String {
+    if width == 0 || height == 0 || x >= term_cols || y >= term_rows {
+        return String::new();
+    }
+    let x_end = x.saturating_add(width).saturating_add(2).min(term_cols);
+    let y_end = y.saturating_add(height).saturating_add(2).min(term_rows);
+    if x >= x_end || y >= y_end {
+        return String::new();
+    }
+    let span_w = (x_end - x) as usize;
+    let rows = (y_end - y) as usize;
+    let spaces = " ".repeat(span_w);
+    let mut out = String::with_capacity(4 + rows * (12 + span_w));
+    out.push_str("\x1b[0m");
+    for row in y..y_end {
+        let _ = write!(out, "\x1b[{};{}H{spaces}", row + 1, x + 1);
+    }
+    out
+}
+
+/// Floors the maximum vertical pixel budget for Sixel encoding to a multiple of 6
+/// (`<= rows * cell_px_h`) so the final 6-pixel band never overhangs into the row below `rect`.
+pub fn compute_sixel_safe_pixel_height(rows: u16, cell_px_h: u16) -> u32 {
+    let budget = (rows as u32).saturating_mul(cell_px_h as u32);
+    (budget / 6) * 6
 }
 
 /// Resolves terminal graphics protocol and cell pixel dimensions without writing queries to stdin/stdout.
@@ -407,8 +605,26 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
     out
 }
 
+#[cfg(any(windows, test))]
+const WIN_ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+#[cfg(any(windows, test))]
+const WIN_ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+
+/// Restores Windows console input mode while always setting `ENABLE_EXTENDED_FLAGS` (`0x0080`)
+/// and clearing `ENABLE_QUICK_EDIT_MODE` (`0x0040`) so mouse capture is never clobbered by QuickEdit.
+#[cfg(any(windows, test))]
+pub(crate) fn restore_windows_console_mode_flags(prev_mode: u32) -> u32 {
+    (prev_mode | WIN_ENABLE_EXTENDED_FLAGS) & !WIN_ENABLE_QUICK_EDIT_MODE
+}
+
 #[cfg(windows)]
 fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID_HANDLE_VALUE: isize = -1;
     const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // -10i32 as u32
     const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
     const WAIT_OBJECT_0: u32 = 0x0000_0000;
@@ -442,17 +658,47 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
 
     #[link(name = "kernel32")]
     extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut std::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: isize,
+        ) -> isize;
+        fn CloseHandle(h_object: isize) -> i32;
         fn GetStdHandle(n_std_handle: u32) -> isize;
         fn GetConsoleMode(h_console_handle: isize, lp_mode: *mut u32) -> i32;
         fn SetConsoleMode(h_console_handle: isize, dw_mode: u32) -> i32;
         fn WaitForSingleObject(h_handle: isize, dw_milliseconds: u32) -> u32;
-        fn GetNumberOfConsoleInputEvents(h_console_input: isize, lpc_number_of_events: *mut u32) -> i32;
+        fn GetNumberOfConsoleInputEvents(
+            h_console_input: isize,
+            lpc_number_of_events: *mut u32,
+        ) -> i32;
+        fn PeekConsoleInputW(
+            h_console_input: isize,
+            lp_buffer: *mut InputRecord,
+            n_length: u32,
+            lp_number_of_events_read: *mut u32,
+        ) -> i32;
         fn ReadConsoleInputW(
             h_console_input: isize,
             lp_buffer: *mut InputRecord,
             n_length: u32,
             lp_number_of_events_read: *mut u32,
         ) -> i32;
+    }
+
+    struct OwnedHandle(Option<isize>);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if let Some(h) = self.0 {
+                unsafe {
+                    CloseHandle(h);
+                }
+            }
+        }
     }
 
     struct ModeRestore {
@@ -462,13 +708,41 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
     impl Drop for ModeRestore {
         fn drop(&mut self) {
             unsafe {
-                SetConsoleMode(self.handle, self.prev_mode);
+                SetConsoleMode(
+                    self.handle,
+                    restore_windows_console_mode_flags(self.prev_mode),
+                );
             }
         }
     }
 
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle == 0 || handle == -1 {
+    const CONIN_WIDE: [u16; 7] = [
+        b'C' as u16,
+        b'O' as u16,
+        b'N' as u16,
+        b'I' as u16,
+        b'N' as u16,
+        b'$' as u16,
+        0,
+    ];
+    let conin = unsafe {
+        CreateFileW(
+            CONIN_WIDE.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            0,
+        )
+    };
+    let (handle, _owned_handle) = if conin != 0 && conin != INVALID_HANDLE_VALUE {
+        (conin, OwnedHandle(Some(conin)))
+    } else {
+        let std_in = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        (std_in, OwnedHandle(None))
+    };
+    if handle == 0 || handle == INVALID_HANDLE_VALUE {
         return Vec::new();
     }
 
@@ -477,8 +751,10 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
         return Vec::new();
     }
 
-    let _restore = if (prev_mode & ENABLE_VIRTUAL_TERMINAL_INPUT) == 0 {
-        let _ = unsafe { SetConsoleMode(handle, prev_mode | ENABLE_VIRTUAL_TERMINAL_INPUT) };
+    // Declared after `_owned_handle` so `ModeRestore::drop` executes BEFORE `CloseHandle`.
+    let probe_mode = restore_windows_console_mode_flags(prev_mode) | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    let _restore = if prev_mode != probe_mode {
+        let _ = unsafe { SetConsoleMode(handle, probe_mode) };
         Some(ModeRestore { handle, prev_mode })
     } else {
         None
@@ -525,6 +801,46 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
         }
         if da1_reply_complete(&out) {
             break;
+        }
+    }
+
+    // Non-blocking drain of any trailing KEY_EVENT bytes from the probe burst so nothing leaks into EventStream.
+    for _ in 0..8 {
+        if unsafe { WaitForSingleObject(handle, 0) } != WAIT_OBJECT_0 {
+            break;
+        }
+        let mut avail = 0u32;
+        if unsafe { GetNumberOfConsoleInputEvents(handle, &mut avail) } == 0 || avail == 0 {
+            break;
+        }
+        let to_peek = (avail as usize).min(records.len()) as u32;
+        let mut peeked = 0u32;
+        if unsafe { PeekConsoleInputW(handle, records.as_mut_ptr(), to_peek, &mut peeked) } == 0
+            || peeked == 0
+        {
+            break;
+        }
+        let key_prefix = records[..peeked as usize]
+            .iter()
+            .take_while(|rec| rec.event_type == KEY_EVENT)
+            .count() as u32;
+        if key_prefix == 0 {
+            break;
+        }
+        let mut read_count = 0u32;
+        if unsafe { ReadConsoleInputW(handle, records.as_mut_ptr(), key_prefix, &mut read_count) }
+            == 0
+            || read_count == 0
+        {
+            break;
+        }
+        for rec in &records[..read_count as usize] {
+            if rec.event_type == KEY_EVENT {
+                let ke = unsafe { rec.event.key_event };
+                if ke.b_key_down != 0 && ke.u_char != 0 && ke.u_char <= 0x7f && out.len() < 4096 {
+                    out.push(ke.u_char as u8);
+                }
+            }
         }
     }
 
@@ -683,9 +999,115 @@ fn parse_cell_pixel_size(raw: &str) -> Option<(u16, u16)> {
     Some((w.clamp(4, 64), h.clamp(8, 128)))
 }
 
+/// Strips optional UTF-8 BOM and leading ASCII whitespace, returning up to `limit` ASCII-lowercased bytes.
+fn normalized_markup_prefix(bytes: &[u8], limit: usize) -> String {
+    let without_bom = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let trimmed = without_bom
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map(|idx| &without_bom[idx..])
+        .unwrap_or(&[]);
+    let sample = &trimmed[..trimmed.len().min(limit)];
+    sample
+        .iter()
+        .map(|&b| {
+            if b.is_ascii() {
+                (b as char).to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+/// Returns `true` if `bytes` looks like an HTML document (e.g. auth redirect or error page) rather than a raster image.
+pub fn looks_like_html_bytes(bytes: &[u8]) -> bool {
+    let prefix = normalized_markup_prefix(bytes, 512);
+    if prefix.is_empty() {
+        return false;
+    }
+    const HTML_STARTS: &[&str] = &[
+        "<!doctype html",
+        "<html",
+        "<head",
+        "<body",
+        "<title",
+        "<meta",
+        "<script",
+        "<style",
+        "<div",
+        "<table",
+        "<form",
+        "<iframe",
+        "<h1",
+        "<h2",
+        "<h3",
+        "<p>",
+        "<p ",
+    ];
+    if HTML_STARTS.iter().any(|p| prefix.starts_with(p)) {
+        return true;
+    }
+    if prefix.starts_with("<!--") || prefix.starts_with("<?xml") {
+        return prefix.contains("<!doctype html") || prefix.contains("<html");
+    }
+    false
+}
+
+/// Returns `true` if `bytes` looks like an SVG vector image (`image/svg+xml`).
+pub fn looks_like_svg_bytes(bytes: &[u8]) -> bool {
+    let prefix = normalized_markup_prefix(bytes, 1024);
+    if prefix.is_empty() {
+        return false;
+    }
+    if let Some(rest) = prefix.strip_prefix("<svg") {
+        return rest.is_empty()
+            || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/');
+    }
+    if prefix.starts_with("<!doctype svg") {
+        return true;
+    }
+    if (prefix.starts_with("<?xml") || prefix.starts_with("<!--"))
+        && !prefix.contains("<!doctype html")
+        && !prefix.contains("<html")
+    {
+        if let Some(pos) = prefix.find("<svg") {
+            let after = &prefix[pos + 4..];
+            return after.is_empty()
+                || after.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/');
+        }
+    }
+    false
+}
+
+fn validate_raster_image_bytes(bytes: &[u8]) -> Result<()> {
+    if looks_like_html_bytes(bytes) {
+        bail!(
+            "Received HTML document instead of raster image bytes (possible auth redirect or error page)"
+        );
+    }
+    if looks_like_svg_bytes(bytes) {
+        bail!(
+            "SVG vector images (image/svg+xml) are not supported for inline terminal raster preview"
+        );
+    }
+    Ok(())
+}
+
 /// Returns true if a MIME type or filename looks like a supported raster image (`png`, `jpeg`, `jpg`, `gif`, `webp`).
 pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> bool {
-    let ct = content_type.trim().to_ascii_lowercase();
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        ct.as_str(),
+        "image/svg+xml" | "text/html" | "application/xhtml+xml"
+    ) {
+        return false;
+    }
     if matches!(
         ct.as_str(),
         "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" | "hostedcontent"
@@ -694,6 +1116,9 @@ pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> boo
     }
     if let Some(name) = file_name {
         let lower = name.trim().to_ascii_lowercase();
+        if lower.ends_with(".svg") || lower.ends_with(".html") || lower.ends_with(".htm") {
+            return false;
+        }
         if lower.ends_with(".png")
             || lower.ends_with(".jpg")
             || lower.ends_with(".jpeg")
@@ -713,6 +1138,7 @@ pub fn decode_and_render_halfblocks(
     max_rows: u16,
     bg_rgb: (u8, u8, u8),
 ) -> Result<RenderedTerminalImage> {
+    validate_raster_image_bytes(bytes)?;
     let guessed = image::guess_format(bytes).ok();
     let format_label = format_label_for(guessed);
     let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
@@ -774,6 +1200,7 @@ pub fn decode_and_render_halfblocks(
         protocol: TerminalImageProtocol::Halfblock,
         lines,
         pixel_payload: None,
+        scroll_backing: None,
     })
 }
 
@@ -789,6 +1216,7 @@ pub fn decode_and_render_for_protocol(
         return decode_and_render_halfblocks(bytes, max_cols, max_rows, bg_rgb);
     }
 
+    validate_raster_image_bytes(bytes)?;
     let guessed = image::guess_format(bytes).ok();
     let format_label = format_label_for(guessed);
     let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
@@ -797,23 +1225,49 @@ pub fn decode_and_render_for_protocol(
         bail!("Image dimensions are 0x0");
     }
 
-    let (target_px_w, target_px_h, occ_cols, occ_rows) =
-        compute_pixel_fit(width_px, height_px, max_cols, max_rows, caps.cell_px);
+    let (target_px_w, target_px_h, occ_cols, occ_rows) = compute_pixel_fit_for_protocol(
+        width_px,
+        height_px,
+        max_cols,
+        max_rows,
+        caps.cell_px,
+        caps.protocol,
+    );
+    let max_h_bound = if max_rows >= max_cols {
+        MAX_SCROLLABLE_PIXEL_HEIGHT
+    } else {
+        MAX_PIXEL_HEIGHT
+    };
 
-    let payload = match caps.protocol {
+    let (payload, scroll_backing) = match caps.protocol {
         TerminalImageProtocol::Kitty => {
             let png_owned;
             let png_bytes: &[u8] = if matches!(guessed, Some(ImageFormat::Png))
                 && width_px <= MAX_PIXEL_WIDTH
-                && height_px <= MAX_PIXEL_HEIGHT
+                && height_px <= max_h_bound
             {
                 bytes
             } else {
-                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, MAX_PIXEL_HEIGHT);
+                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, max_h_bound);
                 png_owned = encode_png(&bounded)?;
                 &png_owned
             };
-            encode_kitty_tui_payload(png_bytes, occ_cols, occ_rows)
+            let rgba = dyn_img.to_rgba8();
+            let resized = if width_px == target_px_w && height_px == target_px_h {
+                rgba
+            } else {
+                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
+            };
+            let backing = PixelScrollBacking::Rgba {
+                width: target_px_w,
+                height: target_px_h,
+                cell_px: caps.cell_px,
+                rgba: Arc::new(resized.into_raw()),
+            };
+            (
+                encode_kitty_tui_payload(png_bytes, occ_cols, occ_rows),
+                Some(backing),
+            )
         }
         TerminalImageProtocol::ITerm2 => {
             let encoded_owned;
@@ -829,14 +1283,27 @@ pub fn decode_and_render_for_protocol(
             {
                 bytes
             } else {
-                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, MAX_PIXEL_HEIGHT);
+                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, max_h_bound);
                 encoded_owned = encode_png(&bounded)?;
                 &encoded_owned
             };
             let b64 = B64_STANDARD.encode(raw_bytes);
-            format!(
+            let payload = format!(
                 "\x1b]1337;File=inline=1;width={occ_cols};height={occ_rows};preserveAspectRatio=1;doNotMoveCursor=1:{b64}\x07"
-            )
+            );
+            let rgba = dyn_img.to_rgba8();
+            let resized = if width_px == target_px_w && height_px == target_px_h {
+                rgba
+            } else {
+                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
+            };
+            let backing = PixelScrollBacking::Rgba {
+                width: target_px_w,
+                height: target_px_h,
+                cell_px: caps.cell_px,
+                rgba: Arc::new(resized.into_raw()),
+            };
+            (payload, Some(backing))
         }
         TerminalImageProtocol::Sixel => {
             let rgba = dyn_img.to_rgba8();
@@ -850,7 +1317,25 @@ pub fn decode_and_render_for_protocol(
                 let (r, g, b) = blend_over_bg(*px, bg_rgb);
                 flat_rgba.extend_from_slice(&[r, g, b, 255]);
             }
-            encode_sixel_rgba(&flat_rgba, target_px_w, target_px_h)
+            let (palette, indexed) =
+                quantize_rgba_to_256(&flat_rgba, target_px_w as usize, target_px_h as usize);
+            let payload = encode_sixel_indexed_slice(
+                &palette,
+                &indexed,
+                target_px_w as usize,
+                0,
+                0,
+                target_px_w as usize,
+                target_px_h as usize,
+            );
+            let backing = PixelScrollBacking::SixelIndexed {
+                width: target_px_w,
+                height: target_px_h,
+                cell_px: caps.cell_px,
+                palette,
+                indexed: Arc::new(indexed),
+            };
+            (payload, Some(backing))
         }
         TerminalImageProtocol::Halfblock => unreachable!("handled above"),
     };
@@ -864,6 +1349,7 @@ pub fn decode_and_render_for_protocol(
         protocol: caps.protocol,
         lines: Vec::new(),
         pixel_payload: Some(payload),
+        scroll_backing,
     })
 }
 
@@ -904,8 +1390,25 @@ fn encode_kitty_tui_payload(png_bytes: &[u8], occ_cols: u16, occ_rows: u16) -> S
 fn compute_target_dims(width_px: u32, height_px: u32, max_cols: u16, max_rows: u16) -> (u32, u32) {
     let clamped_cols = max_cols.max(4);
     let clamped_rows = max_rows.max(2);
-    let max_px_w = clamped_cols as u32;
-    let max_px_h = (clamped_rows as u32) * 2;
+    let is_scrollable = clamped_rows >= clamped_cols;
+    let is_tall = (height_px as u64) * 4 > (width_px as u64) * 5;
+    let (eff_cols, eff_rows) = if is_scrollable {
+        if is_tall {
+            let fit_cols = if clamped_rows > 140 {
+                clamped_cols
+            } else {
+                clamped_cols.min(92)
+            };
+            (fit_cols, clamped_rows)
+        } else {
+            (clamped_cols, (clamped_rows / 4).max(4))
+        }
+    } else {
+        (clamped_cols, clamped_rows)
+    };
+
+    let max_px_w = eff_cols as u32;
+    let max_px_h = (eff_rows as u32) * 2;
 
     let scale = (max_px_w as f64 / width_px as f64)
         .min(max_px_h as f64 / height_px as f64)
@@ -922,36 +1425,71 @@ fn compute_target_dims(width_px: u32, height_px: u32, max_cols: u16, max_rows: u
     (target_w, target_h)
 }
 
-fn compute_pixel_fit(
+fn compute_pixel_fit_for_protocol(
     width_px: u32,
     height_px: u32,
     max_cols: u16,
     max_rows: u16,
     cell_px: (u16, u16),
+    protocol: TerminalImageProtocol,
 ) -> (u32, u32, u16, u16) {
     let cell_w = cell_px.0.max(1);
     let cell_h = cell_px.1.max(1);
     let clamped_cols = max_cols.max(4);
-    let clamped_rows = max_rows.max(2);
+    let clamped_rows = if protocol == TerminalImageProtocol::Sixel {
+        max_rows.max(1)
+    } else {
+        max_rows.max(2)
+    };
 
-    let box_px_w = clamped_cols as f64 * cell_w as f64;
-    let box_px_h = clamped_rows as f64 * cell_h as f64;
-    let scale = (box_px_w / width_px as f64)
-        .min(box_px_h / height_px as f64)
+    let is_scrollable = clamped_rows >= clamped_cols;
+    let is_tall = (height_px as u64) * 4 > (width_px as u64) * 5;
+    let (eff_cols, eff_rows, px_height_cap) = if is_scrollable {
+        if is_tall {
+            let fit_cols = if clamped_rows > 140 {
+                clamped_cols
+            } else {
+                clamped_cols.min(92)
+            };
+            (fit_cols, clamped_rows, MAX_SCROLLABLE_PIXEL_HEIGHT)
+        } else {
+            (
+                clamped_cols,
+                (clamped_rows / 4).max(4),
+                MAX_SCROLLABLE_PIXEL_HEIGHT,
+            )
+        }
+    } else {
+        (clamped_cols, clamped_rows, MAX_PIXEL_HEIGHT)
+    };
+
+    let max_target_w = (eff_cols as u32 * cell_w as u32).clamp(1, MAX_PIXEL_WIDTH);
+    let raw_max_h = (eff_rows as u32 * cell_h as u32).clamp(1, px_height_cap);
+    let max_target_h = if protocol == TerminalImageProtocol::Sixel {
+        let sixel_safe_h = compute_sixel_safe_pixel_height(eff_rows, cell_h);
+        if sixel_safe_h >= 6 {
+            sixel_safe_h.min(raw_max_h)
+        } else {
+            raw_max_h
+        }
+    } else {
+        raw_max_h
+    };
+
+    let scale = (max_target_w as f64 / width_px as f64)
+        .min(max_target_h as f64 / height_px as f64)
         .min(2.0);
-
-    let max_target_w = (clamped_cols as u32 * cell_w as u32)
-        .min(MAX_PIXEL_WIDTH)
-        .max(1);
-    let max_target_h = (clamped_rows as u32 * cell_h as u32)
-        .min(MAX_PIXEL_HEIGHT)
-        .max(1);
 
     let target_px_w = ((width_px as f64 * scale).round() as u32).clamp(1, max_target_w);
     let target_px_h = ((height_px as f64 * scale).round() as u32).clamp(1, max_target_h);
 
-    let occ_cols = (target_px_w.div_ceil(cell_w as u32)).clamp(1, max_cols.max(1) as u32) as u16;
-    let occ_rows = (target_px_h.div_ceil(cell_h as u32)).clamp(1, max_rows.max(1) as u32) as u16;
+    let occ_cols = (target_px_w.div_ceil(cell_w as u32)).clamp(1, eff_cols.max(1) as u32) as u16;
+    let occ_rows = if protocol == TerminalImageProtocol::Sixel {
+        let band_px_h = target_px_h.div_ceil(6) * 6;
+        (band_px_h.div_ceil(cell_h as u32)).clamp(1, eff_rows.max(1) as u32) as u16
+    } else {
+        (target_px_h.div_ceil(cell_h as u32)).clamp(1, eff_rows.max(1) as u32) as u16
+    };
 
     (target_px_w, target_px_h, occ_cols, occ_rows)
 }
@@ -965,8 +1503,24 @@ pub fn encode_sixel_rgba(flat_rgba: &[u8], width: u32, height: u32) -> String {
     }
 
     let (palette, indexed) = quantize_rgba_to_256(flat_rgba, w, h);
-    let mut out = String::with_capacity(w * h / 2 + palette.len() * 16 + 32);
-    let _ = write!(out, "\x1bP0;1;q\"1;1;{width};{height}");
+    encode_sixel_indexed_slice(&palette, &indexed, w, 0, 0, w, h)
+}
+
+fn encode_sixel_indexed_slice(
+    palette: &[(u8, u8, u8)],
+    indexed: &[u8],
+    full_w: usize,
+    x0: usize,
+    y0: usize,
+    crop_w: usize,
+    crop_h: usize,
+) -> String {
+    if crop_w == 0 || crop_h == 0 || full_w == 0 || palette.is_empty() {
+        return String::from("\x1bP0;1;q\"1;1;0;0\x1b\\");
+    }
+
+    let mut out = String::with_capacity(crop_w * crop_h / 2 + palette.len() * 16 + 32);
+    let _ = write!(out, "\x1bP0;1;q\"1;1;{crop_w};{crop_h}");
 
     for (idx, &(r, g, b)) in palette.iter().enumerate() {
         let r_pct = (r as u32 * 100 + 127) / 255;
@@ -977,22 +1531,22 @@ pub fn encode_sixel_rgba(flat_rgba: &[u8], width: u32, height: u32) -> String {
 
     let mut color_seen = [false; 256];
     let mut band_colors: Vec<u8> = Vec::with_capacity(palette.len().min(64));
-    let mut band_masks = vec![0u8; palette.len().max(1) * w];
+    let mut band_masks = vec![0u8; palette.len().max(1) * crop_w];
 
-    for band_y in (0..h).step_by(6) {
+    for band_y in (0..crop_h).step_by(6) {
         band_colors.clear();
-        let band_h = (h - band_y).min(6);
+        let band_h = (crop_h - band_y).min(6);
 
         for dy in 0..band_h {
             let bit = 1u8 << dy;
-            let row_offset = (band_y + dy) * w;
-            for x in 0..w {
+            let row_offset = (y0 + band_y + dy) * full_w + x0;
+            for x in 0..crop_w {
                 let c = indexed[row_offset + x];
                 if !color_seen[c as usize] {
                     color_seen[c as usize] = true;
                     band_colors.push(c);
                 }
-                band_masks[c as usize * w + x] |= bit;
+                band_masks[c as usize * crop_w + x] |= bit;
             }
         }
 
@@ -1002,8 +1556,8 @@ pub fn encode_sixel_rgba(flat_rgba: &[u8], width: u32, height: u32) -> String {
             }
             let _ = write!(out, "#{color_idx}");
 
-            let mask_start = color_idx as usize * w;
-            let row_slice = &band_masks[mask_start..mask_start + w];
+            let mask_start = color_idx as usize * crop_w;
+            let row_slice = &band_masks[mask_start..mask_start + crop_w];
             let end = row_slice
                 .iter()
                 .rposition(|&bits| bits != 0)
@@ -1014,11 +1568,11 @@ pub fn encode_sixel_rgba(flat_rgba: &[u8], width: u32, height: u32) -> String {
 
         for &c in &band_colors {
             color_seen[c as usize] = false;
-            let start = c as usize * w;
-            band_masks[start..start + w].fill(0);
+            let start = c as usize * crop_w;
+            band_masks[start..start + crop_w].fill(0);
         }
 
-        if band_y + 6 < h {
+        if band_y + 6 < crop_h {
             out.push('-');
         }
     }
@@ -1323,6 +1877,7 @@ fn render_ansi_stdout_with_caps(
     max_rows: u16,
     caps: TerminalGraphicsCaps,
 ) -> Result<String> {
+    validate_raster_image_bytes(bytes)?;
     match caps.protocol {
         TerminalImageProtocol::ITerm2 => {
             let guessed = image::guess_format(bytes).ok();
@@ -1803,6 +2358,7 @@ mod tests {
             protocol: TerminalImageProtocol::Halfblock,
             lines: Vec::new(),
             pixel_payload: None,
+            scroll_backing: None,
         };
         assert_eq!(
             empty.approx_heap_bytes(),
@@ -1819,6 +2375,7 @@ mod tests {
             protocol: TerminalImageProtocol::Sixel,
             lines: Vec::new(),
             pixel_payload: Some("x".repeat(512)),
+            scroll_backing: None,
         };
         assert!(with_payload.approx_heap_bytes() >= empty.approx_heap_bytes() + 512);
 
@@ -1984,6 +2541,168 @@ mod tests {
             let s = encode_sixel_rgba(&buf, w as u32, h as u32);
             assert!(s.starts_with("\x1bP0;1;q\"1;1;"));
             assert!(s.ends_with("\x1b\\"));
+        }
+    }
+
+    #[test]
+    fn test_looks_like_html_and_svg_bytes_and_decode_rejection() {
+        let html_doc = b"  \r\n<!DOCTYPE html><html><head><title>Login</title></head><body>Sign in</body></html>";
+        let html_bom = b"\xEF\xBB\xBF<html><body>403 Forbidden</body></html>";
+        let svg_raw = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect/></svg>";
+        let svg_xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- comment -->\n<svg viewBox=\"0 0 10 10\"></svg>";
+        let png = make_test_png(8, 8);
+
+        assert!(looks_like_html_bytes(html_doc));
+        assert!(looks_like_html_bytes(html_bom));
+        assert!(!looks_like_html_bytes(svg_raw));
+        assert!(!looks_like_html_bytes(svg_xml));
+        assert!(!looks_like_html_bytes(&png));
+
+        assert!(looks_like_svg_bytes(svg_raw));
+        assert!(looks_like_svg_bytes(svg_xml));
+        assert!(!looks_like_svg_bytes(html_doc));
+        assert!(!looks_like_svg_bytes(&png));
+
+        // MIME/name classifier rejects SVG and HTML even with parameters
+        assert!(!is_image_mime_or_name("image/svg+xml", None));
+        assert!(!is_image_mime_or_name("image/svg+xml; charset=utf-8", Some("icon.svg")));
+        assert!(!is_image_mime_or_name("text/html; charset=utf-8", Some("photo.png")));
+        assert!(!is_image_mime_or_name("application/octet-stream", Some("logo.svg")));
+        assert!(is_image_mime_or_name("image/png; charset=binary", None));
+
+        // decode_and_render_* return descriptive errors for HTML and SVG bytes
+        let html_err = decode_and_render_halfblocks(html_doc, 20, 10, (0, 0, 0))
+            .unwrap_err()
+            .to_string();
+        assert!(html_err.contains("HTML"), "unexpected html err: {html_err}");
+
+        let svg_err = decode_and_render_halfblocks(svg_raw, 20, 10, (0, 0, 0))
+            .unwrap_err()
+            .to_string();
+        assert!(svg_err.contains("SVG"), "unexpected svg err: {svg_err}");
+
+        for proto in [
+            TerminalImageProtocol::Kitty,
+            TerminalImageProtocol::ITerm2,
+            TerminalImageProtocol::Sixel,
+            TerminalImageProtocol::Halfblock,
+        ] {
+            let caps = TerminalGraphicsCaps {
+                protocol: proto,
+                cell_px: (8, 16),
+                cell_px_exact: true,
+            };
+            let err_h = decode_and_render_for_protocol(html_doc, 20, 10, (0, 0, 0), caps)
+                .unwrap_err()
+                .to_string();
+            assert!(err_h.contains("HTML"));
+            let err_s = decode_and_render_for_protocol(svg_xml, 20, 10, (0, 0, 0), caps)
+                .unwrap_err()
+                .to_string();
+            assert!(err_s.contains("SVG"));
+            assert!(render_ansi_stdout_with_caps(html_doc, 20, 10, caps).is_err());
+            assert!(render_ansi_stdout_with_caps(svg_raw, 20, 10, caps).is_err());
+        }
+    }
+
+    #[test]
+    fn test_erase_pixel_rect_sequence_and_sixel_safe_height() {
+        assert_eq!(compute_sixel_safe_pixel_height(8, 20), 156); // 160 -> 26 * 6
+        assert_eq!(compute_sixel_safe_pixel_height(4, 19), 72); // 76 -> 12 * 6
+        assert_eq!(compute_sixel_safe_pixel_height(6, 16), 96); // exact multiple of 6
+
+        for cell_px in [(9u16, 19u16), (10, 20), (8, 16), (11, 23)] {
+            for max_rows in 4..=25u16 {
+                for (img_w, img_h) in [(200u32, 600u32), (800, 800), (600, 200), (137, 251)] {
+                    let (_tw, th, _occ_cols, occ_rows) = compute_pixel_fit_for_protocol(
+                        img_w,
+                        img_h,
+                        40,
+                        max_rows,
+                        cell_px,
+                        TerminalImageProtocol::Sixel,
+                    );
+                    let band_px = th.div_ceil(6) * 6;
+                    assert!(
+                        band_px <= (max_rows as u32) * (cell_px.1 as u32),
+                        "Sixel 6px band overhung max_rows={max_rows} cell_px={cell_px:?}: th={th} band_px={band_px}"
+                    );
+                    assert!(occ_rows <= max_rows);
+                }
+            }
+        }
+
+        // Erase sequence starts with SGR reset, covers rect expanded by +2/+2 clamped to terminal bounds
+        let seq = erase_pixel_rect_sequence(10, 5, 8, 3, 40, 20);
+        assert!(seq.starts_with("\x1b[0m"));
+        // rows 5..=9 (y=5, height=3 -> +2 = 5 rows => 1-based rows 6..=10), col 11, width 10 spaces
+        assert!(seq.contains("\x1b[6;11H          "));
+        assert!(seq.contains("\x1b[10;11H          "));
+        assert!(!seq.contains("\x1b[11;11H"));
+
+        // Clamps cleanly to terminal right/bottom edge
+        let clamped = erase_pixel_rect_sequence(38, 19, 5, 5, 40, 20);
+        assert_eq!(clamped, "\x1b[0m\x1b[20;39H  ");
+
+        // Out-of-bounds or empty returns empty string
+        assert!(erase_pixel_rect_sequence(40, 5, 5, 5, 40, 20).is_empty());
+        assert!(erase_pixel_rect_sequence(5, 5, 0, 5, 40, 20).is_empty());
+        assert_eq!(kitty_delete_all_sequence(), "\x1b_Ga=d,d=A,q=2\x1b\\");
+    }
+
+    #[test]
+    fn test_restore_windows_console_mode_flags_sets_extended_and_clears_quick_edit() {
+        // QuickEdit set without ENABLE_EXTENDED_FLAGS -> clears QuickEdit, sets ExtendedFlags
+        let restored = restore_windows_console_mode_flags(0x0040 | 0x0018);
+        assert_eq!(restored & WIN_ENABLE_QUICK_EDIT_MODE, 0);
+        assert_ne!(restored & WIN_ENABLE_EXTENDED_FLAGS, 0);
+        assert_eq!(restored & 0x0018, 0x0018);
+
+        // Zero mode still includes ENABLE_EXTENDED_FLAGS so QuickEdit stays off
+        let from_zero = restore_windows_console_mode_flags(0);
+        assert_eq!(from_zero, WIN_ENABLE_EXTENDED_FLAGS);
+    }
+
+    #[test]
+    fn test_tall_image_viewport_pixel_payload_scrolling() {
+        let tall_img: RgbaImage = ImageBuffer::from_fn(200, 1000, |x, y| {
+            Rgba([
+                ((x * 255) / 200) as u8,
+                ((y * 255) / 1000) as u8,
+                160,
+                255,
+            ])
+        });
+        let tall_png = encode_png(&DynamicImage::ImageRgba8(tall_img)).unwrap();
+        for proto in [
+            TerminalImageProtocol::Sixel,
+            TerminalImageProtocol::Kitty,
+            TerminalImageProtocol::ITerm2,
+        ] {
+            let caps = TerminalGraphicsCaps {
+                protocol: proto,
+                cell_px: (8, 16),
+                cell_px_exact: true,
+            };
+            // max_rows >= max_cols triggers scrollable tall-image layout
+            let rendered =
+                decode_and_render_for_protocol(&tall_png, 50, 120, (10, 10, 10), caps).unwrap();
+            assert!(
+                rendered.rows > 20,
+                "expected tall rendered rows > 20 for {proto:?}, got {}",
+                rendered.rows
+            );
+
+            let (top_payload, top_c, top_r) = rendered
+                .viewport_pixel_payload(0, 0, 50, 16)
+                .expect("expected top viewport payload");
+            assert!(top_c <= 50 && top_r <= 16);
+
+            let (mid_payload, mid_c, mid_r) = rendered
+                .viewport_pixel_payload(0, 10, 50, 16)
+                .expect("expected scrolled viewport payload");
+            assert!(mid_c <= 50 && mid_r <= 16);
+            assert_ne!(top_payload, mid_payload);
         }
     }
 }
