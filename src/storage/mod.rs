@@ -324,6 +324,25 @@ impl Storage {
         )
     }
 
+    pub fn reconcile_onenote_section_pages_preserving(
+        &self,
+        section_key: &str,
+        pages: &[OnenotePageSummary],
+        is_complete_section_list: bool,
+        preserve_page_key: Option<&str>,
+        preserve_detail_key: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.lock_conn()?;
+        onenote::reconcile_onenote_section_pages_preserving(
+            &mut conn,
+            section_key,
+            pages,
+            is_complete_section_list,
+            preserve_page_key,
+            preserve_detail_key,
+        )
+    }
+
     pub fn prune_onenote_section_pages(
         &self,
         section_key: &str,

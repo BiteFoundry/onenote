@@ -382,6 +382,7 @@ pub fn list_onenote_sections(
 fn upsert_onenote_pages_in_tx(
     tx: &Transaction<'_>,
     items: &[OnenotePageSummary],
+    preserve_detail_key: Option<&str>,
 ) -> Result<Vec<String>> {
     if items.is_empty() {
         return Ok(Vec::new());
@@ -443,7 +444,7 @@ fn upsert_onenote_pages_in_tx(
             content_url = COALESCE(excluded.content_url, onenote_pages.content_url),
             web_url = COALESCE(excluded.web_url, onenote_pages.web_url),
             preview_text = CASE
-                WHEN excluded.last_modified_at IS NOT NULL
+                WHEN ?19 = 0 AND excluded.last_modified_at IS NOT NULL
                      AND (
                          onenote_pages.last_modified_at IS NULL
                          OR excluded.last_modified_at != onenote_pages.last_modified_at
@@ -453,7 +454,7 @@ fn upsert_onenote_pages_in_tx(
             END,
             has_todo = CASE
                 WHEN excluded.has_todo != 0 THEN 1
-                WHEN excluded.last_modified_at IS NOT NULL
+                WHEN ?19 = 0 AND excluded.last_modified_at IS NOT NULL
                      AND (
                          onenote_pages.last_modified_at IS NULL
                          OR excluded.last_modified_at != onenote_pages.last_modified_at
@@ -463,7 +464,14 @@ fn upsert_onenote_pages_in_tx(
                 ELSE 0
             END,
             detail_json = CASE
-                WHEN excluded.last_modified_at IS NOT NULL
+                WHEN ?19 != 0 AND excluded.last_modified_at IS NOT NULL
+                     AND json_valid(onenote_pages.detail_json)
+                THEN json_set(
+                    onenote_pages.detail_json,
+                    '$.summary.last_modified_at',
+                    excluded.last_modified_at
+                )
+                WHEN ?19 = 0 AND excluded.last_modified_at IS NOT NULL
                      AND (
                          onenote_pages.last_modified_at IS NULL
                          OR excluded.last_modified_at != onenote_pages.last_modified_at
@@ -472,7 +480,7 @@ fn upsert_onenote_pages_in_tx(
                 ELSE COALESCE(excluded.detail_json, onenote_pages.detail_json)
             END,
             body_plain = CASE
-                WHEN excluded.last_modified_at IS NOT NULL
+                WHEN ?19 = 0 AND excluded.last_modified_at IS NOT NULL
                      AND (
                          onenote_pages.last_modified_at IS NULL
                          OR excluded.last_modified_at != onenote_pages.last_modified_at
@@ -513,7 +521,8 @@ fn upsert_onenote_pages_in_tx(
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        if let Some(incoming_mod) = item.last_modified_at.as_deref() {
+        let preserve_detail = preserve_detail_key == Some(page_key.as_str());
+        if let Some(incoming_mod) = item.last_modified_at.as_deref().filter(|_| !preserve_detail) {
             if let Some((existing_mod, had_detail)) = existing_stmt
                 .query_row(params![&page_key], |r| {
                     Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i32>(1)? != 0))
@@ -545,6 +554,7 @@ fn upsert_onenote_pages_in_tx(
             item.web_url,
             preview_clean,
             bool_to_i32(item.has_todo),
+            bool_to_i32(preserve_detail),
         ])?;
 
         fts_del_stmt.execute(params![page_key])?;
@@ -558,7 +568,7 @@ pub fn upsert_onenote_pages(conn: &mut Connection, items: &[OnenotePageSummary])
         return Ok(());
     }
     let tx = conn.transaction()?;
-    let _ = upsert_onenote_pages_in_tx(&tx, items)?;
+    let _ = upsert_onenote_pages_in_tx(&tx, items, None)?;
     tx.commit()?;
     Ok(())
 }
@@ -960,10 +970,31 @@ pub fn reconcile_onenote_section_pages_returning_invalidated(
     pages: &[OnenotePageSummary],
     is_complete_section_list: bool,
 ) -> Result<Vec<String>> {
+    reconcile_onenote_section_pages_preserving(
+        conn,
+        section_key,
+        pages,
+        is_complete_section_list,
+        None,
+        None,
+    )
+}
+
+/// Same as `reconcile_onenote_section_pages_returning_invalidated`, optionally preserving
+/// `preserve_page_key` from pruning, and the last good body of `preserve_detail_key` from
+/// invalidation while a replacement body is still pending.
+pub fn reconcile_onenote_section_pages_preserving(
+    conn: &mut Connection,
+    section_key: &str,
+    pages: &[OnenotePageSummary],
+    is_complete_section_list: bool,
+    preserve_page_key: Option<&str>,
+    preserve_detail_key: Option<&str>,
+) -> Result<Vec<String>> {
     let trimmed = section_key.trim();
     if trimmed.is_empty() {
         let tx = conn.transaction()?;
-        let invalidated = upsert_onenote_pages_in_tx(&tx, pages)?;
+        let invalidated = upsert_onenote_pages_in_tx(&tx, pages, preserve_detail_key)?;
         tx.commit()?;
         return Ok(invalidated);
     }
@@ -975,10 +1006,10 @@ pub fn reconcile_onenote_section_pages_returning_invalidated(
     };
 
     let tx = conn.transaction()?;
-    let invalidated = upsert_onenote_pages_in_tx(&tx, pages)?;
+    let invalidated = upsert_onenote_pages_in_tx(&tx, pages, preserve_detail_key)?;
 
     if is_complete_section_list {
-        prune_onenote_section_pages_in_tx(&tx, &canonical_section_key, pages)?;
+        prune_onenote_section_pages_in_tx(&tx, &canonical_section_key, pages, preserve_page_key)?;
     }
 
     tx.commit()?;
@@ -989,6 +1020,7 @@ fn prune_onenote_section_pages_in_tx(
     tx: &Transaction<'_>,
     canonical_section_key: &str,
     pages: &[OnenotePageSummary],
+    preserve_page_key: Option<&str>,
 ) -> Result<()> {
     let keep_page_keys: HashSet<String> = pages.iter().map(normalized_page_key).collect();
     let stale_pages: Vec<String> = {
@@ -997,7 +1029,9 @@ fn prune_onenote_section_pages_in_tx(
         let rows = stmt.query_map(params![canonical_section_key], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
-            .filter(|pk| !keep_page_keys.contains(pk))
+            .filter(|pk| {
+                !keep_page_keys.contains(pk) && preserve_page_key != Some(pk.as_str())
+            })
             .collect()
     };
     if !stale_pages.is_empty() {
@@ -1027,7 +1061,7 @@ pub fn prune_onenote_section_pages(
         OnenoteScope::Me.make_entity_key(trimmed)
     };
     let tx = conn.transaction()?;
-    prune_onenote_section_pages_in_tx(&tx, &canonical_section_key, pages)?;
+    prune_onenote_section_pages_in_tx(&tx, &canonical_section_key, pages, None)?;
     tx.commit()?;
     Ok(())
 }
@@ -2155,6 +2189,24 @@ mod tests {
         let mut newer_mod_summary = summary;
         newer_mod_summary.title = "Updated Spec".to_string();
         newer_mod_summary.last_modified_at = Some("2026-11-15T11:00:00Z".to_string());
+
+        // Focused refresh keeps the last good body accessible through the typed cache reader.
+        storage
+            .reconcile_onenote_section_pages_preserving(
+                "me|sec-1",
+                std::slice::from_ref(&newer_mod_summary),
+                false,
+                None,
+                Some("me|p-stale"),
+            )
+            .unwrap();
+        let open = storage.get_onenote_page_detail("me|p-stale").unwrap().unwrap();
+        assert_eq!(open.summary.last_modified_at, newer_mod_summary.last_modified_at);
+        assert_eq!(open.body_plain, detail.body_plain);
+        assert_eq!(open.synced_at, detail.synced_at);
+        assert_eq!(storage.search_onenote_pages("Original body", None, 10).unwrap().len(), 1);
+
+        storage.upsert_onenote_page_detail(&detail).unwrap();
         storage.upsert_onenote_pages(&[newer_mod_summary]).unwrap();
 
         assert!(

@@ -239,7 +239,7 @@ impl Default for AppConfig {
             .and_then(|s| ImageProtocolPreference::parse_str(&s))
             .unwrap_or_default(),
             download_dir: String::new(),
-            active_poll_ms: 10_000,
+            active_poll_ms: 15_000,
             hierarchy_poll_ms: 60_000,
             token_file: std::env::var("ONENOTE_TOKEN_FILE")
                 .ok()

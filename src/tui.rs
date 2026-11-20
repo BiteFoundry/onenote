@@ -9,9 +9,10 @@ use anyhow::Result;
 #[cfg(not(windows))]
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -48,6 +49,8 @@ static KITTY_USED_GLOBAL: AtomicBool = AtomicBool::new(false);
 /// ensures ConPTY / Windows Terminal / xterm.js report mouse wheel events cleanly.
 pub(crate) const VT_ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 pub(crate) const VT_DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+pub(crate) const VT_ENABLE_FOCUS: &str = "\x1b[?1004h";
+pub(crate) const VT_DISABLE_FOCUS: &str = "\x1b[?1004l";
 
 pub(crate) fn write_vt_mouse_enable(w: &mut impl io::Write) -> io::Result<()> {
     w.write_all(VT_ENABLE_MOUSE.as_bytes())?;
@@ -56,6 +59,16 @@ pub(crate) fn write_vt_mouse_enable(w: &mut impl io::Write) -> io::Result<()> {
 
 pub(crate) fn write_vt_mouse_disable(w: &mut impl io::Write) -> io::Result<()> {
     w.write_all(VT_DISABLE_MOUSE.as_bytes())?;
+    w.flush()
+}
+
+pub(crate) fn write_vt_focus_enable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_ENABLE_FOCUS.as_bytes())?;
+    w.flush()
+}
+
+pub(crate) fn write_vt_focus_disable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_DISABLE_FOCUS.as_bytes())?;
     w.flush()
 }
 
@@ -320,12 +333,19 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableFocusChange,
             EnableBracketedPaste
         )?;
         #[cfg(windows)]
         {
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableFocusChange
+            )?;
             write_vt_mouse_enable(&mut stdout)?;
+            write_vt_focus_enable(&mut stdout)?;
         }
 
         let keyboard_enhanced = if supports_keyboard_enhancement().unwrap_or(false) {
@@ -345,6 +365,7 @@ impl TerminalGuard {
         {
             win_console::enforce_windows_mouse_capture();
             let _ = write_vt_mouse_enable(&mut stdout);
+            let _ = write_vt_focus_enable(&mut stdout);
         }
 
         let backend = CrosstermBackend::new(stdout);
@@ -380,13 +401,20 @@ impl TerminalGuard {
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
         #[cfg(windows)]
         {
+            let _ = write_vt_focus_disable(&mut stdout);
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                stdout,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -419,13 +447,20 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
         #[cfg(windows)]
         {
+            let _ = write_vt_focus_disable(&mut stdout);
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                stdout,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -865,6 +900,11 @@ fn handle_terminal_event(
                 let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
             }
         }
+        CrosstermEvent::FocusGained => {
+            app.sync_ctrl.notify_activity();
+            *last_activity_sent = Some(Instant::now());
+            app.on_terminal_focus_gained();
+        }
         _ => {}
     }
     LoopStep::Continue
@@ -912,10 +952,6 @@ fn spawn_sync_supervisor(
             if initial_focus != FocusTarget::default() {
                 conn.sync_ctrl.set_focus(initial_focus);
             }
-            if !conn.status.sync_busy {
-                conn.sync_ctrl.request(SyncCommand::RefreshAll);
-            }
-
             loop {
                 tokio::select! {
                     ev = conn.events_rx.recv() => {
@@ -1082,12 +1118,19 @@ pub async fn run_with_persona(
                 stdout,
                 EnterAlternateScreen,
                 EnableMouseCapture,
+                EnableFocusChange,
                 EnableBracketedPaste
             )?;
             #[cfg(windows)]
             {
-                execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+                execute!(
+                    stdout,
+                    EnterAlternateScreen,
+                    EnableMouseCapture,
+                    EnableFocusChange
+                )?;
                 write_vt_mouse_enable(&mut stdout)?;
+                write_vt_focus_enable(&mut stdout)?;
             }
             if guard.keyboard_enhanced {
                 let _ = execute!(
@@ -1348,6 +1391,14 @@ mod tests {
             String::from_utf8(disable_buf).unwrap(),
             "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
         );
+
+        let mut focus_en = Vec::new();
+        write_vt_focus_enable(&mut focus_en).unwrap();
+        assert_eq!(String::from_utf8(focus_en).unwrap(), "\x1b[?1004h");
+
+        let mut focus_dis = Vec::new();
+        write_vt_focus_disable(&mut focus_dis).unwrap();
+        assert_eq!(String::from_utf8(focus_dis).unwrap(), "\x1b[?1004l");
     }
 
     #[test]

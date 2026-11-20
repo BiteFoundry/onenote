@@ -1,6 +1,7 @@
 //! Optional ultra-lightweight single-instance background sync daemon (`onenote daemon`).
 
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::{self, Write},
     net::SocketAddr,
@@ -8,7 +9,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
@@ -32,7 +33,7 @@ use crate::{
     auth::AuthManager,
     config::{ensure_parent, AppConfig},
     graph::GraphClient,
-    models::{CoreEvent, POLL_RETRY_SUMMARY},
+    models::CoreEvent,
     storage::Storage,
     sync::{self, FocusTarget, SyncCommand, SyncController},
 };
@@ -179,6 +180,8 @@ struct DaemonSharedState {
     secret: String,
     started_instant: Instant,
     attached_clients: Arc<AtomicUsize>,
+    next_client_id: AtomicU64,
+    client_focuses: Arc<Mutex<HashMap<u64, FocusTarget>>>,
     sync_status: Mutex<SharedSyncStatus>,
 }
 
@@ -193,8 +196,17 @@ impl DaemonSharedState {
             secret: info.secret.clone(),
             started_instant,
             attached_clients: Arc::new(AtomicUsize::new(0)),
+            next_client_id: AtomicU64::new(1),
+            client_focuses: Arc::new(Mutex::new(HashMap::new())),
             sync_status: Mutex::new(SharedSyncStatus::default()),
         }
+    }
+
+    fn update_client_focus(&self, client_id: u64, focus: FocusTarget, sync_ctrl: &SyncController) {
+        if let Ok(mut map) = self.client_focuses.lock() {
+            map.insert(client_id, focus.clone());
+        }
+        sync_ctrl.set_focus(focus);
     }
 
     fn snapshot_status(&self) -> DaemonStatus {
@@ -243,15 +255,20 @@ impl DaemonSharedState {
 }
 
 struct AttachedClientGuard {
+    client_id: u64,
     counter: Arc<AtomicUsize>,
+    client_focuses: Arc<Mutex<HashMap<u64, FocusTarget>>>,
     sync_ctrl: SyncController,
 }
 
 impl AttachedClientGuard {
-    fn acquire(counter: &Arc<AtomicUsize>, sync_ctrl: &SyncController) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
+    fn acquire(shared: &DaemonSharedState, sync_ctrl: &SyncController) -> Self {
+        let client_id = shared.next_client_id.fetch_add(1, Ordering::Relaxed);
+        shared.attached_clients.fetch_add(1, Ordering::SeqCst);
         Self {
-            counter: Arc::clone(counter),
+            client_id,
+            counter: Arc::clone(&shared.attached_clients),
+            client_focuses: Arc::clone(&shared.client_focuses),
             sync_ctrl: sync_ctrl.clone(),
         }
     }
@@ -259,8 +276,14 @@ impl AttachedClientGuard {
 
 impl Drop for AttachedClientGuard {
     fn drop(&mut self) {
+        let fallback_focus = self.client_focuses.lock().ok().and_then(|mut map| {
+            map.remove(&self.client_id);
+            map.values().find(|f| **f != FocusTarget::default()).cloned()
+        });
         if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.sync_ctrl.set_focus(FocusTarget::default());
+        } else if let Some(focus) = fallback_focus {
+            self.sync_ctrl.set_focus(focus);
         }
     }
 }
@@ -1142,20 +1165,9 @@ async fn run_daemon_inner(
     enable_signals: bool,
 ) -> Result<()> {
     let (engine_event_tx, engine_event_rx) = mpsc::unbounded_channel::<CoreEvent>();
-    let sync_ctrl = sync::spawn_sync_engine(
-        cfg,
-        graph.clone(),
-        storage.clone(),
-        engine_event_tx.clone(),
-    );
-
+    let sync_ctrl = sync::spawn_sync_engine(cfg, graph, storage.clone(), engine_event_tx);
     if run_bootstrap {
-        let boot_graph = graph;
-        let boot_storage = storage.clone();
-        let boot_tx = engine_event_tx.clone();
-        tokio::spawn(async move {
-            run_initial_bootstrap(boot_graph, boot_storage, boot_tx).await;
-        });
+        sync_ctrl.request(SyncCommand::Bootstrap);
     }
 
     run_daemon_with_engine(
@@ -1167,93 +1179,6 @@ async fn run_daemon_inner(
         enable_signals,
     )
     .await
-}
-
-async fn run_initial_bootstrap(
-    graph: GraphClient,
-    storage: Storage,
-    event_tx: mpsc::UnboundedSender<CoreEvent>,
-) {
-    let _ = event_tx.send(CoreEvent::SyncStateChanged {
-        busy: true,
-        summary: "Initial sync...".to_string(),
-    });
-
-    match sync::bootstrap_onenote(&graph, &storage).await {
-        Ok(_) => {
-            let st_h = storage.clone();
-            if let Ok(Ok((notebooks, section_groups, sections))) =
-                tokio::task::spawn_blocking(move || {
-                    Ok::<_, anyhow::Error>((
-                        st_h.list_onenote_notebooks()?,
-                        st_h.list_onenote_section_groups()?,
-                        st_h.list_onenote_sections(None)?,
-                    ))
-                })
-                .await
-            {
-                let first_sec = sections.first().map(|s| s.section_key.clone());
-                let _ = event_tx.send(CoreEvent::OnenoteHierarchyUpdated {
-                    notebooks,
-                    section_groups,
-                    sections,
-                });
-                if let Some(sec_key) = first_sec {
-                    let st_p = storage.clone();
-                    let sec_key_clone = sec_key.clone();
-                    if let Ok(Ok(pages)) = tokio::task::spawn_blocking(move || {
-                        st_p.list_onenote_pages(&sec_key_clone)
-                    })
-                    .await
-                    {
-                        let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
-                            section_key: sec_key,
-                            pages,
-                            notify_candidate: None,
-                        });
-                    }
-                }
-            }
-            let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                busy: false,
-                summary: "Idle".to_string(),
-            });
-        }
-        Err(err) => {
-            let summary = match sync::classify_sync_error(&err) {
-                sync::SyncErrorKind::Forbidden403 => {
-                    let tok = graph
-                        .auth()
-                        .current_tokens()
-                        .await
-                        .map(|t| t.access_token);
-                    let msg = crate::auth::explain_graph_permission_error(
-                        &err.to_string(),
-                        tok.as_deref(),
-                    )
-                    .unwrap_or_else(|| err.to_string());
-                    let _ = event_tx.send(CoreEvent::SyncError(msg));
-                    "Sync failed".to_string()
-                }
-                sync::SyncErrorKind::Unauthorized401 => {
-                    let _ = event_tx.send(CoreEvent::SyncError(format!(
-                        "Authentication required: {err}"
-                    )));
-                    "Sync failed".to_string()
-                }
-                sync::SyncErrorKind::Transient => {
-                    let _ = event_tx.send(CoreEvent::SyncError(format!(
-                        "Initial sync failed: {err}"
-                    )));
-                    POLL_RETRY_SUMMARY.to_string()
-                }
-            };
-            let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                busy: false,
-                summary,
-            });
-        }
-    }
 }
 
 async fn run_daemon_with_engine(
@@ -1452,7 +1377,8 @@ async fn handle_client_connection(
             .await?;
         }
         ClientOp::Subscribe => {
-            let _guard = AttachedClientGuard::acquire(&shared.attached_clients, &sync_ctrl);
+            let client_guard = AttachedClientGuard::acquire(&shared, &sync_ctrl);
+            let client_id = client_guard.client_id;
             sync_ctrl.notify_activity();
             let mut broadcast_rx = broadcast_tx.subscribe();
             let status = shared.snapshot_status();
@@ -1519,7 +1445,7 @@ async fn handle_client_connection(
                                         }
                                     }
                                     Ok(ClientStreamCmd::SetFocus(focus)) => {
-                                        sync_ctrl.set_focus(focus);
+                                        shared.update_client_focus(client_id, focus, &sync_ctrl);
                                     }
                                     Ok(ClientStreamCmd::Ping) => {
                                         if write_json_line(&mut write_half, &ServerFrame::Pong).await.is_err() {

@@ -1,7 +1,12 @@
 //! Core HTTP transport, resilience (401 refresh-retry, 429/502/503/504 Retry-After backoff),
 //! `$batch` execution, single-flight `/me` profile resolution, and streaming downloads.
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{atomic::Ordering, Arc},
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
@@ -10,7 +15,7 @@ use reqwest::{Method, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-use super::GraphClient;
+use super::{AutomaticRequestBudgetExhausted, GraphClient};
 use crate::models::UserProfile;
 
 const MAX_BATCH_SIZE: usize = 20;
@@ -18,6 +23,17 @@ const MAX_THROTTLE_RETRIES: usize = 3;
 const MAX_RETRY_AFTER_SECS: u64 = 30;
 const STANDARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MEDIA_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+struct ActiveRequest<'a> {
+    _permit: tokio::sync::SemaphorePermit<'a>,
+    graph: &'a GraphClient,
+}
+
+impl Drop for ActiveRequest<'_> {
+    fn drop(&mut self) {
+        self.graph.in_flight_requests.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Typed HTTP error returned by `GraphClient` so callers can inspect the authoritative
 /// HTTP status code without matching substrings inside freeform error bodies.
@@ -298,7 +314,7 @@ impl GraphClient {
             .iter()
             .map(|(k, v)| (*k, (*v).to_string()))
             .collect();
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::GET,
                 &url,
@@ -323,7 +339,7 @@ impl GraphClient {
     ) -> Result<T> {
         let url = self.resolve_url(path_or_url);
         let json_val = serde_json::to_value(body)?;
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::POST,
                 &url,
@@ -387,7 +403,7 @@ impl GraphClient {
     ) -> Result<Option<T>> {
         let url = self.resolve_url(path_or_url);
         let json_val = serde_json::to_value(body)?;
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::PATCH,
                 &url,
@@ -444,7 +460,7 @@ impl GraphClient {
         content_type: Option<&str>,
     ) -> Result<T> {
         let url = self.resolve_url(path_or_url);
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::PUT,
                 &url,
@@ -482,7 +498,7 @@ impl GraphClient {
             ),
             ("Content-Length", chunk.len().to_string()),
         ];
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::PUT,
                 upload_url,
@@ -507,7 +523,7 @@ impl GraphClient {
 
     pub async fn get_bytes(&self, path_or_url: &str) -> Result<Vec<u8>> {
         let url = self.resolve_url(path_or_url);
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::GET,
                 &url,
@@ -531,7 +547,7 @@ impl GraphClient {
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
         let url = self.resolve_url(url_or_path);
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::GET,
                 &url,
@@ -570,7 +586,7 @@ impl GraphClient {
         use_bearer: bool,
     ) -> Result<u64> {
         let url = self.resolve_url(url_or_path);
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::GET,
                 &url,
@@ -615,7 +631,7 @@ impl GraphClient {
 
     pub async fn get_text(&self, path_or_url: &str) -> Result<String> {
         let url = self.resolve_url(path_or_url);
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::GET,
                 &url,
@@ -635,7 +651,7 @@ impl GraphClient {
         content_type: &str,
     ) -> Result<T> {
         let url = self.resolve_url(path_or_url);
-        let resp = self
+        let (resp, _request) = self
             .execute_with_retry(
                 Method::POST,
                 &url,
@@ -700,7 +716,7 @@ impl GraphClient {
         extra_headers: &[(&str, String)],
         use_bearer: bool,
         timeout: Duration,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<(reqwest::Response, ActiveRequest<'_>)> {
         let mut unauthorized_retried = false;
         let mut throttle_attempt = 0usize;
         let mut transport_retried = false;
@@ -732,9 +748,25 @@ impl GraphClient {
                 }
             }
 
+            let permit = self
+                .request_semaphore
+                .acquire()
+                .await
+                .context("Graph request semaphore closed")?;
+            if let Some(allowance) = &self.request_allowance {
+                let now = Instant::now().max(allowance.minimum_time);
+                if !allowance.budget.charge(now, allowance.limit) {
+                    return Err(AutomaticRequestBudgetExhausted.into());
+                }
+            }
+            self.http_requests_total.fetch_add(1, Ordering::Relaxed);
+            let active = self.in_flight_requests.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_in_flight_requests.fetch_max(active, Ordering::AcqRel);
+            let request = ActiveRequest { _permit: permit, graph: self };
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(err) => {
+                    drop(request);
                     if method == Method::GET
                         && !transport_retried
                         && (err.is_connect() || err.is_timeout())
@@ -754,6 +786,8 @@ impl GraphClient {
                 unauthorized_retried = true;
                 if let Some(failed_tok) = token_used.as_deref() {
                     if self.auth.is_refreshable().await {
+                        drop(resp);
+                        drop(request);
                         self.auth.refresh_for_failed_token(failed_tok).await?;
                         continue;
                     } else if self.auth.refresh_for_failed_token(failed_tok).await.is_ok() {
@@ -772,6 +806,8 @@ impl GraphClient {
             {
                 let delay_secs = parse_retry_after_secs(resp.headers(), throttle_attempt);
                 throttle_attempt += 1;
+                drop(resp);
+                drop(request);
                 let jitter_ms: u64 = rand::thread_rng().gen_range(0..=250);
                 tokio::time::sleep(
                     Duration::from_secs(delay_secs) + Duration::from_millis(jitter_ms),
@@ -791,7 +827,7 @@ impl GraphClient {
                 }));
             }
 
-            return Ok(resp);
+            return Ok((resp, request));
         }
     }
 }

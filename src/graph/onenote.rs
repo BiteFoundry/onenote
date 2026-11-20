@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 const MAX_JOINED_TEAMS_FOR_ONENOTE: usize = 25;
-const ONENOTE_SCOPE_CONCURRENCY: usize = 6;
+const ONENOTE_SCOPE_CONCURRENCY: usize = 4;
 const MAX_SECTION_GROUP_TRAVERSAL: usize = 256;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -344,6 +344,39 @@ fn clean_raw_onenote_id(id_or_composite: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn merge_fetched_page_summary(
+    raw_meta: GraphOnenotePage,
+    scope: &OnenoteScope,
+    cached_summary: Option<OnenotePageSummary>,
+) -> OnenotePageSummary {
+    let fallback_sec = cached_summary
+        .as_ref()
+        .map(|s| s.section_id.as_str())
+        .filter(|s| !s.is_empty());
+    let fallback_order = cached_summary.as_ref().map(|s| s.order).unwrap_or(0);
+    let mut fresh = raw_meta.into_page_summary(scope, fallback_sec, fallback_order);
+    if let Some(cached) = cached_summary {
+        let same_section = !fresh.section_id.is_empty()
+            && !cached.section_id.is_empty()
+            && fresh.section_id == cached.section_id;
+        if same_section {
+            if fresh.section_name.is_none() {
+                fresh.section_name = cached.section_name;
+            }
+            if fresh.notebook_id.is_none() {
+                fresh.notebook_id = cached.notebook_id;
+            }
+            if fresh.notebook_name.is_none() {
+                fresh.notebook_name = cached.notebook_name;
+            }
+        }
+        if fresh.web_url.is_none() {
+            fresh.web_url = cached.web_url;
+        }
+    }
+    fresh
 }
 
 fn is_pagelevel_bad_request(err: &anyhow::Error) -> bool {
@@ -1350,6 +1383,45 @@ impl GraphClient {
         Ok(pages)
     }
 
+    pub async fn get_onenote_page_content_xhtml(
+        &self,
+        scope: &OnenoteScope,
+        page_id: &str,
+    ) -> Result<String> {
+        let pid = clean_raw_onenote_id(page_id);
+        if pid.is_empty() {
+            bail!("OneNote 페이지 ID를 지정해야 합니다.");
+        }
+        let base = scope.graph_base_path();
+        let pid_enc = urlencoding::encode(&pid);
+        let content_path = format!("{base}/pages/{pid_enc}/content?includeIDs=true");
+        self.get_text(&content_path).await
+    }
+
+    pub async fn get_onenote_page_summary(
+        &self,
+        scope: &OnenoteScope,
+        page_id: &str,
+        cached_summary: Option<OnenotePageSummary>,
+    ) -> Result<OnenotePageSummary> {
+        let pid = clean_raw_onenote_id(page_id);
+        if pid.is_empty() {
+            bail!("OneNote 페이지 ID를 지정해야 합니다.");
+        }
+        let base = scope.graph_base_path();
+        let pid_enc = urlencoding::encode(&pid);
+        let meta_with_level = format!("{base}/pages/{pid_enc}?pagelevel=true");
+        let raw_meta = match self.get_json::<GraphOnenotePage>(&meta_with_level).await {
+            Ok(meta) => meta,
+            Err(err) if is_pagelevel_bad_request(&err) => {
+                let fallback_meta = format!("{base}/pages/{pid_enc}");
+                self.get_json::<GraphOnenotePage>(&fallback_meta).await?
+            }
+            Err(err) => return Err(err),
+        };
+        Ok(merge_fetched_page_summary(raw_meta, scope, cached_summary))
+    }
+
     pub async fn get_onenote_page_detail(
         &self,
         scope: &OnenoteScope,
@@ -1385,34 +1457,7 @@ impl GraphClient {
         };
 
         let summary = match meta_res {
-            Ok(raw_meta) => {
-                let fallback_sec = cached_summary
-                    .as_ref()
-                    .map(|s| s.section_id.as_str())
-                    .filter(|s| !s.is_empty());
-                let fallback_order = cached_summary.as_ref().map(|s| s.order).unwrap_or(0);
-                let mut fresh = raw_meta.into_page_summary(scope, fallback_sec, fallback_order);
-                if let Some(cached) = cached_summary {
-                    let same_section = !fresh.section_id.is_empty()
-                        && !cached.section_id.is_empty()
-                        && fresh.section_id == cached.section_id;
-                    if same_section {
-                        if fresh.section_name.is_none() {
-                            fresh.section_name = cached.section_name;
-                        }
-                        if fresh.notebook_id.is_none() {
-                            fresh.notebook_id = cached.notebook_id;
-                        }
-                        if fresh.notebook_name.is_none() {
-                            fresh.notebook_name = cached.notebook_name;
-                        }
-                    }
-                    if fresh.web_url.is_none() {
-                        fresh.web_url = cached.web_url;
-                    }
-                }
-                fresh
-            }
+            Ok(raw_meta) => merge_fetched_page_summary(raw_meta, scope, cached_summary),
             Err(err) => {
                 if is_not_found_error(&err) {
                     return Err(err);

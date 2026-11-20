@@ -5,16 +5,69 @@ pub mod media;
 pub mod onenote;
 
 use std::{
-    sync::{Arc, OnceLock},
-    time::Duration,
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
+use tokio::sync::Semaphore;
 
 use crate::{auth::AuthManager, config::AppConfig};
 
 /// Canonical prefix emitted by `GraphClient` HTTP errors; kept as a shared constant for safe parsing.
 pub const GRAPH_API_ERROR_PREFIX: &str = "Graph API error (";
+/// Maximum concurrent outbound Microsoft Graph requests per client (strictly below OneNote's 5-request limit).
+pub const MAX_CONCURRENT_GRAPH_REQUESTS: usize = 4;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AutomaticRequestBudget(Arc<Mutex<VecDeque<Instant>>>);
+
+impl AutomaticRequestBudget {
+    fn requests(&self, now: Instant) -> std::sync::MutexGuard<'_, VecDeque<Instant>> {
+        let mut requests = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        while requests.front().is_some_and(|sent| {
+            now.saturating_duration_since(*sent) >= Duration::from_secs(3600)
+        }) {
+            requests.pop_front();
+        }
+        requests
+    }
+
+    pub(crate) fn used(&self, now: Instant) -> usize {
+        self.requests(now).len()
+    }
+
+    fn charge(&self, now: Instant, limit: usize) -> bool {
+        let mut requests = self.requests(now);
+        if requests.len() >= limit {
+            return false;
+        }
+        requests.push_back(now);
+        true
+    }
+}
+
+#[derive(Clone)]
+struct RequestAllowance {
+    budget: AutomaticRequestBudget,
+    minimum_time: Instant,
+    limit: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct AutomaticRequestBudgetExhausted;
+
+impl std::fmt::Display for AutomaticRequestBudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Automatic OneNote request allowance exhausted")
+    }
+}
+
+impl std::error::Error for AutomaticRequestBudgetExhausted {}
 
 #[derive(Clone)]
 pub struct GraphClient {
@@ -24,6 +77,11 @@ pub struct GraphClient {
     my_user_id: Option<String>,
     cached_my_user_id: Arc<OnceLock<String>>,
     resolve_user_mutex: Arc<tokio::sync::Mutex<()>>,
+    request_semaphore: Arc<Semaphore>,
+    http_requests_total: Arc<AtomicU64>,
+    in_flight_requests: Arc<AtomicUsize>,
+    max_in_flight_requests: Arc<AtomicUsize>,
+    request_allowance: Option<RequestAllowance>,
 }
 
 impl GraphClient {
@@ -44,7 +102,35 @@ impl GraphClient {
             my_user_id: None,
             cached_my_user_id: Arc::new(OnceLock::new()),
             resolve_user_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            request_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GRAPH_REQUESTS)),
+            http_requests_total: Arc::new(AtomicU64::new(0)),
+            in_flight_requests: Arc::new(AtomicUsize::new(0)),
+            max_in_flight_requests: Arc::new(AtomicUsize::new(0)),
+            request_allowance: None,
         })
+    }
+
+    pub(crate) fn with_automatic_budget(
+        &self,
+        budget: &AutomaticRequestBudget,
+        now: Instant,
+        limit: usize,
+    ) -> Self {
+        let mut graph = self.clone();
+        graph.request_allowance = Some(RequestAllowance {
+            budget: budget.clone(),
+            minimum_time: now,
+            limit,
+        });
+        graph
+    }
+
+    pub fn http_request_count(&self) -> u64 {
+        self.http_requests_total.load(Ordering::Relaxed)
+    }
+
+    pub fn max_in_flight_requests(&self) -> usize {
+        self.max_in_flight_requests.load(Ordering::Relaxed)
     }
 
     pub fn with_my_user_id(mut self, user_id: impl Into<String>) -> Self {

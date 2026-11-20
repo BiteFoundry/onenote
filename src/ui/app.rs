@@ -540,6 +540,18 @@ impl AppState {
             .request(SyncCommand::HydratePage { page_key });
     }
 
+    /// Triggered when the terminal regains focus (`FocusGained`): immediately re-reads
+    /// the open page via `HydratePage` (even if section-level timestamps look unchanged),
+    /// preserving the last cached view while refreshing.
+    pub fn on_terminal_focus_gained(&mut self) {
+        if let Some(pk) = self.active_page_key.clone() {
+            self.sync_ctrl.request(SyncCommand::HydratePage { page_key: pk });
+        } else if let Some(sk) = self.active_section_key.clone() {
+            self.sync_ctrl
+                .request(SyncCommand::RefreshSectionPages { section_key: sk });
+        }
+    }
+
     /// Requests an inline thumbnail or fullscreen HD terminal image render for a OneNote resource URL.
     pub fn request_onenote_image(
         &mut self,
@@ -1111,7 +1123,19 @@ impl AppState {
                     || cached.summary.section_id != p.section_id
             });
             if is_stale {
-                self.page_details.remove(&p.page_key);
+                let retained = (self.active_page_key.as_deref() == Some(p.page_key.as_str()))
+                    .then(|| self.storage.get_onenote_page_detail(&p.page_key).ok().flatten())
+                    .flatten()
+                    .filter(|detail| {
+                        detail.summary.last_modified_at == p.last_modified_at
+                            && detail.summary.title == p.title
+                            && detail.summary.section_id == p.section_id
+                    });
+                if let Some(detail) = retained {
+                    self.page_details.insert(p.page_key.clone(), detail);
+                } else {
+                    self.page_details.remove(&p.page_key);
+                }
             }
         }
     }
@@ -1122,10 +1146,56 @@ impl AppState {
         incoming: &[OnenotePageSummary],
     ) {
         let keep_keys: HashSet<&str> = incoming.iter().map(|p| p.page_key.as_str()).collect();
-        self.page_details.retain(|pk, cached| {
-            let cached_sec_key = cached.summary.scope.make_entity_key(&cached.summary.section_id);
-            cached_sec_key != section_key || keep_keys.contains(pk.as_str())
-        });
+        let candidate_keys: Vec<String> = self
+            .page_details
+            .iter()
+            .filter_map(|(pk, cached)| {
+                let cached_sec_key = cached
+                    .summary
+                    .scope
+                    .make_entity_key(&cached.summary.section_id);
+                (cached_sec_key == section_key && !keep_keys.contains(pk.as_str()))
+                    .then(|| pk.clone())
+            })
+            .collect();
+        for pk in candidate_keys {
+            match self.storage.get_onenote_page_summary(&pk) {
+                Ok(Some(row)) => {
+                    // Page still exists in SQLite (moved to another section or preserved during a
+                    // transient probe failure): update its section metadata in place instead of evicting.
+                    if let Some(detail) = self.page_details.get_mut(&pk) {
+                        if !row.section_id.trim().is_empty() {
+                            detail.summary.section_id = row.section_id;
+                        }
+                        detail.summary.section_name = row.section_name;
+                        detail.summary.notebook_id = row.notebook_id;
+                        detail.summary.notebook_name = row.notebook_name;
+                    }
+                }
+                Ok(None) => {
+                    self.page_details.remove(&pk);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    fn reconnect_active_page_section(&mut self, moved_section_key: String) {
+        if let Some(sec) = self
+            .sections
+            .iter()
+            .find(|s| s.section_key == moved_section_key)
+        {
+            if let Some(nb_id) = sec.notebook_id.as_deref() {
+                self.active_notebook_key = Some(sec.scope.make_entity_key(nb_id));
+            }
+        }
+        self.active_section_key = Some(moved_section_key.clone());
+        self.pages = self
+            .storage
+            .list_onenote_pages(&moved_section_key)
+            .unwrap_or_default();
+        self.push_focus_to_sync();
     }
 
     fn reconcile_cached_page_details_from_storage(&mut self) {
@@ -1204,7 +1274,7 @@ impl AppState {
                 let current_pages = self.pages.clone();
                 self.evict_stale_page_details(&current_pages);
                 self.reconcile_cached_page_details_from_storage();
-                if prev_sec != self.active_section_key {
+                if prev_sec != self.active_section_key && self.pages.is_empty() {
                     if let Some(sec_key) = self.active_section_key.clone() {
                         self.request_section_pages(sec_key);
                     }
@@ -1227,16 +1297,32 @@ impl AppState {
                 self.evict_removed_section_page_details(&section_key, &pages);
                 if self.active_section_key.as_deref() == Some(section_key.as_str()) {
                     self.loading_onenote_pages = false;
+                    let prev_active_pk = self.active_page_key.clone();
                     self.pages = pages;
                     let valid = self
                         .active_page_key
                         .as_deref()
                         .is_some_and(|pk| self.pages.iter().any(|p| p.page_key == pk));
                     if !valid {
-                        self.active_page_key = self.pages.first().map(|p| p.page_key.clone());
+                        // If the open page moved to another section, reconnect to its new section
+                        // instead of dropping it.
+                        let moved_sec = prev_active_pk.as_deref().and_then(|pk| {
+                            self.storage
+                                .get_onenote_page_summary(pk)
+                                .ok()
+                                .flatten()
+                                .filter(|s| !s.section_id.trim().is_empty())
+                                .map(|s| s.scope.make_entity_key(&s.section_id))
+                                .filter(|sk| sk != &section_key)
+                        });
+                        if let Some(new_sec_key) = moved_sec {
+                            self.reconnect_active_page_section(new_sec_key);
+                        } else {
+                            self.active_page_key = self.pages.first().map(|p| p.page_key.clone());
+                        }
                     }
                     if let Some(pk) = self.active_page_key.clone() {
-                        if !self.page_details.contains_key(&pk) {
+                        if !self.page_details.contains_key(&pk) && !self.loading_onenote_detail {
                             self.request_page_detail(pk);
                         }
                         self.push_focus_to_sync();
@@ -1258,6 +1344,39 @@ impl AppState {
             CoreEvent::OnenotePageDetailUpdated(detail) => {
                 self.loading_onenote_detail = false;
                 let key = detail.summary.page_key.clone();
+                if self.active_page_key.as_deref() == Some(key.as_str())
+                    && !detail.summary.section_id.trim().is_empty()
+                {
+                    let new_sec_key = detail
+                        .summary
+                        .scope
+                        .make_entity_key(&detail.summary.section_id);
+                    if self.active_section_key.as_deref() != Some(new_sec_key.as_str()) {
+                        self.reconnect_active_page_section(new_sec_key);
+                    }
+                }
+                // Preserve unsaved form edits untouched; surface a non-destructive drift notice
+                // if the block currently open in EditBlock changed remotely.
+                if let Some(Overlay::OnenoteForm(ref mut form)) = ui.overlays.last_mut() {
+                    if let crate::ui::overlays::onenote_form::OnenoteFormMode::EditBlock {
+                        ref page_key,
+                        ref element_id,
+                        ref base_content,
+                        ..
+                    } = form.mode
+                    {
+                        if page_key == &key {
+                            let still_matches = parser::find_block_by_element_id(&detail, element_id)
+                                .is_some_and(|blk| parser::block_matches_expected(blk, base_content));
+                            if !still_matches {
+                                form.error = Some(
+                                    "Remote block changed; local draft preserved (saving will check conflicts)."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
                 self.sync_detail_summary_into_pages(&detail.summary);
                 self.page_details.insert(key, *detail);
             }
@@ -1286,6 +1405,8 @@ impl AppState {
                 self.daemon_pid = pid;
                 self.syncing = sync_busy;
                 self.sync_summary = "Daemon connected".to_string();
+                // The daemon may have populated the cache before this client subscribed.
+                self.load_cached_initial();
             }
             UiMsg::DaemonDetached => {
                 self.daemon_pid = None;
@@ -2017,5 +2138,100 @@ mod tests {
         assert!(app.drafts.get_note("edit:me|page-1:p:{b1}").is_none());
 
         srv.abort();
+    }
+
+    #[test]
+    fn test_focus_gained_moved_page_reconnect_and_live_draft_preservation() {
+        let (mut app, mut ui, mut focus_rx, mut nudge_rx) = make_test_app_with_cached_summary();
+
+        app.storage
+            .upsert_onenote_sections(&[OnenoteSection {
+                section_key: "me|sec-2".to_string(),
+                id: "sec-2".to_string(),
+                scope: OnenoteScope::Me,
+                notebook_id: Some("nb-1".to_string()),
+                notebook_name: Some("Engineering".to_string()),
+                parent_section_group_id: None,
+                parent_section_group_name: None,
+                display_name: "MovedTarget".to_string(),
+                color: None,
+                is_default: false,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: Some("2026-11-18T10:00:00Z".to_string()),
+                web_url: None,
+            }])
+            .unwrap();
+
+        let p1_summary = app.storage.get_onenote_page_summary("me|page-1").unwrap().unwrap();
+        let p1_detail = parser::parse_onenote_page_xhtml(
+            p1_summary.clone(),
+            r#"<html><head><title>Initial Spec</title></head><body><div id="div:1"><p id="p:1">Alpha paragraph</p></div></body></html>"#,
+        );
+        app.storage.upsert_onenote_page_detail(&p1_detail).unwrap();
+        app.load_cached_initial();
+        let _ = focus_rx.borrow_and_update();
+        while nudge_rx.try_recv().is_ok() {}
+
+        // 1. Terminal focus gained unconditionally requests HydratePage even when detail is cached.
+        assert!(app.page_details.contains_key("me|page-1"));
+        app.on_terminal_focus_gained();
+        assert_eq!(
+            nudge_rx.try_recv().ok(),
+            Some(SyncCommand::HydratePage {
+                page_key: "me|page-1".to_string()
+            })
+        );
+
+        // 2. Open EditBlock form, type unsaved text, then receive remote OnenotePageDetailUpdated:
+        //    unsaved form.body & base_content must stay untouched while drift error notice appears.
+        crate::ui::action::dispatch(
+            crate::ui::action::Action::OpenOnenoteEditBlock,
+            &mut app,
+            &mut ui,
+        );
+        if let Some(Overlay::OnenoteForm(ref mut form)) = ui.overlays.last_mut() {
+            form.body = "Alpha paragraph LOCAL_UNSAVED".to_string();
+        }
+        let remote_detail = parser::parse_onenote_page_xhtml(
+            p1_summary.clone(),
+            r#"<html><head><title>Initial Spec</title></head><body><div id="div:1"><p id="p:1">Remote edit while editing</p></div></body></html>"#,
+        );
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::OnenotePageDetailUpdated(Box::new(remote_detail)),
+        );
+        match ui.overlays.last() {
+            Some(Overlay::OnenoteForm(form)) => {
+                assert_eq!(form.body, "Alpha paragraph LOCAL_UNSAVED");
+                assert!(form
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("Remote block changed")));
+            }
+            other => panic!("expected OnenoteForm overlay, got {other:?}"),
+        }
+        ui.overlays.pop();
+
+        // 3. Page moved from sec-1 -> sec-2 in SQLite, then sec-1 OnenotePagesUpdated arrives without me|page-1:
+        //    AppState reconnects active_section_key to me|sec-2 and preserves me|page-1 open!
+        let mut moved_summary = p1_summary;
+        moved_summary.section_id = "sec-2".to_string();
+        moved_summary.section_name = Some("MovedTarget".to_string());
+        app.storage.upsert_onenote_pages(&[moved_summary]).unwrap();
+        let _ = focus_rx.borrow_and_update();
+
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::OnenotePagesUpdated {
+                section_key: "me|sec-1".to_string(),
+                pages: Vec::new(),
+                notify_candidate: None,
+            },
+        );
+        assert_eq!(app.active_section_key.as_deref(), Some("me|sec-2"));
+        assert_eq!(app.active_page_key.as_deref(), Some("me|page-1"));
+        assert!(app.page_details.contains_key("me|page-1"));
+        assert_eq!(focus_rx.borrow_and_update().section_key.as_deref(), Some("me|sec-2"));
     }
 }
