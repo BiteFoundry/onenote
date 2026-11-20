@@ -145,7 +145,7 @@ impl Overlay {
     }
 
     pub fn help() -> Self {
-        Overlay::Help(HelpOverlay)
+        Overlay::Help(HelpOverlay::default())
     }
 
     pub fn confirm(message: impl Into<String>, on_confirm: Option<Action>) -> Self {
@@ -186,9 +186,41 @@ impl Overlay {
             Overlay::OnenoteForm(form) => form.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
             Overlay::HtmlPreview(html) => html.handle(action, ui),
-            Overlay::Help(_) => match action {
+            Overlay::Help(help) => match action {
                 Action::CloseOverlay | Action::Activate | Action::Input('q') => {
                     OverlayOutcome::Close
+                }
+                Action::MoveUp | Action::CursorUp => {
+                    help.scroll_y = help.scroll_y.saturating_sub(2);
+                    OverlayOutcome::Handled
+                }
+                Action::MoveDown | Action::CursorDown => {
+                    help.scroll_y = help.scroll_y.saturating_add(2);
+                    OverlayOutcome::Handled
+                }
+                Action::PageUp => {
+                    help.scroll_y = help.scroll_y.saturating_sub(8);
+                    OverlayOutcome::Handled
+                }
+                Action::PageDown => {
+                    help.scroll_y = help.scroll_y.saturating_add(8);
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollTop => {
+                    help.scroll_y = 0;
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollBottom => {
+                    help.scroll_y = u16::MAX;
+                    OverlayOutcome::Handled
+                }
+                Action::MouseScroll { delta, .. } => {
+                    if *delta < 0 {
+                        help.scroll_y = help.scroll_y.saturating_sub(delta.unsigned_abs() as u16);
+                    } else {
+                        help.scroll_y = help.scroll_y.saturating_add(*delta as u16);
+                    }
+                    OverlayOutcome::Handled
                 }
                 Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
                 _ => OverlayOutcome::Handled,
@@ -242,10 +274,12 @@ impl Overlay {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct HelpOverlay;
+pub struct HelpOverlay {
+    pub scroll_y: u16,
+}
 
 impl HelpOverlay {
-    pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
         let rect = centered_rect(area, 78, 24);
         frame.render_widget(Clear, rect);
@@ -290,8 +324,12 @@ impl HelpOverlay {
             Line::from("  Ctrl+B / Ctrl+D       Toggle sidebar / Cozy-Compact density"),
             Line::from("  Ctrl+, / Ctrl+R       Settings / Refresh all · Ctrl+Q Quit"),
         ];
+        let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
+        self.scroll_y = self.scroll_y.min(max_scroll);
         frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll_y, 0)),
             inner,
         );
     }

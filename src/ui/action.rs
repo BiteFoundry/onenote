@@ -891,12 +891,23 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                 };
                 return dispatch(act, app, ui);
             }
-            if delta < 0 {
-                ui.onenote_scroll = ui.onenote_scroll.saturating_sub(delta.unsigned_abs() as usize);
-            } else {
-                ui.onenote_scroll = ui.onenote_scroll.saturating_add(delta as usize);
+            match ui.hitmap.hit(row, column) {
+                Some(HitTarget::NavRow(_)) => {
+                    move_notebook_selection(app, ui, if delta < 0 { -1 } else { 1 });
+                }
+                Some(HitTarget::OnenotePageItem(_)) => {
+                    move_page_selection(app, ui, if delta < 0 { -1 } else { 1 });
+                }
+                _ => {
+                    if delta < 0 {
+                        ui.onenote_scroll =
+                            ui.onenote_scroll.saturating_sub(delta.unsigned_abs() as usize);
+                    } else {
+                        ui.onenote_scroll = ui.onenote_scroll.saturating_add(delta as usize);
+                    }
+                    ui.onenote_follow_selection = false;
+                }
             }
-            ui.onenote_follow_selection = false;
             false
         }
         Action::RequestExternalEditor => {
