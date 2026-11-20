@@ -1420,12 +1420,16 @@ mod tests {
 
     #[test]
     fn test_startup_pushes_focus_hydrates_initial_page_and_rehydrates_on_remote_edit() {
-        let (mut app, mut ui, focus_rx, mut nudge_rx) = make_test_app_with_cached_summary();
+        let (mut app, mut ui, mut focus_rx, mut nudge_rx) = make_test_app_with_cached_summary();
 
         // 1. load_cached_initial must push initial focus and hydrate the selected summary-only page
         app.load_cached_initial();
-        assert_eq!(focus_rx.borrow().section_key.as_deref(), Some("me|sec-1"));
-        assert_eq!(focus_rx.borrow().page_key.as_deref(), Some("me|page-1"));
+        assert!(focus_rx.has_changed().unwrap());
+        {
+            let focus = focus_rx.borrow_and_update();
+            assert_eq!(focus.section_key.as_deref(), Some("me|sec-1"));
+            assert_eq!(focus.page_key.as_deref(), Some("me|page-1"));
+        }
         assert!(app.loading_onenote_detail);
         assert_eq!(
             nudge_rx.try_recv().ok(),
@@ -1467,7 +1471,8 @@ mod tests {
         assert!(!app.loading_onenote_detail);
         assert!(app.page_details.contains_key("me|page-1"));
 
-        // 3. Unchanged OnenotePagesUpdated at T1 keeps cached detail and avoids redundant HydratePage
+        // 3. Unchanged OnenotePagesUpdated at T1 keeps cached detail, avoids redundant HydratePage,
+        //    and does not re-notify the focus watch channel.
         app.handle_core_event(
             &mut ui,
             CoreEvent::OnenotePagesUpdated {
@@ -1478,6 +1483,7 @@ mod tests {
         );
         assert!(app.page_details.contains_key("me|page-1"));
         assert!(nudge_rx.try_recv().is_err());
+        assert!(!focus_rx.has_changed().unwrap());
 
         // 4. Remote edit arrives with newer last_modified_at = T2 -> evicts stale detail and queues HydratePage
         let mut summary_t2 = summary_t1;

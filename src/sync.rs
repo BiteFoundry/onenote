@@ -235,7 +235,14 @@ impl SyncController {
     }
 
     pub fn set_focus(&self, target: FocusTarget) {
-        let _ = self.focus_tx.send(target);
+        self.focus_tx.send_if_modified(|current| {
+            if *current == target {
+                false
+            } else {
+                *current = target;
+                true
+            }
+        });
     }
 
     pub fn request(&self, cmd: SyncCommand) {
@@ -1078,5 +1085,46 @@ mod tests {
             Some(POLL_RETRY_SUMMARY),
             "503 failure during RefreshAll must end in POLL_RETRY_SUMMARY"
         );
+    }
+
+    #[test]
+    fn test_set_focus_deduplicates_identical_targets_and_propagates_changes() {
+        let (focus_tx, mut focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel();
+        let ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+
+        assert!(!focus_rx.has_changed().unwrap());
+
+        // Sending the initial default value again must not mark the channel changed.
+        ctrl.set_focus(FocusTarget::default());
+        assert!(!focus_rx.has_changed().unwrap());
+
+        let target_a = FocusTarget {
+            notebook_key: Some("me|nb-1".to_string()),
+            section_key: Some("me|sec-1".to_string()),
+            page_key: Some("me|p-1a".to_string()),
+        };
+        ctrl.set_focus(target_a.clone());
+        assert!(focus_rx.has_changed().unwrap());
+        assert_eq!(*focus_rx.borrow_and_update(), target_a);
+
+        // Identical target must not re-notify receivers.
+        ctrl.set_focus(target_a.clone());
+        assert!(!focus_rx.has_changed().unwrap());
+
+        // Changing any field must propagate.
+        let target_b = FocusTarget {
+            notebook_key: Some("me|nb-1".to_string()),
+            section_key: Some("me|sec-2".to_string()),
+            page_key: Some("me|p-2a".to_string()),
+        };
+        ctrl.set_focus(target_b.clone());
+        assert!(focus_rx.has_changed().unwrap());
+        assert_eq!(*focus_rx.borrow_and_update(), target_b);
+
+        // Returning to a previous target (A -> B -> A) must propagate.
+        ctrl.set_focus(target_a.clone());
+        assert!(focus_rx.has_changed().unwrap());
+        assert_eq!(*focus_rx.borrow_and_update(), target_a);
     }
 }
