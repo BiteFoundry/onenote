@@ -93,20 +93,35 @@ pub async fn resolve_notebook(
     query: &str,
     prefer_cache: bool,
 ) -> Result<OnenoteNotebook> {
-    let cached = storage.list_onenote_notebooks()?;
-    if !cached.is_empty() {
-        match resolve_notebook_from_slice(&cached, query) {
-            Ok(found) => return Ok(found),
-            Err(err) if prefer_cache => return Err(err),
-            Err(_) => {}
+    resolve_notebook_with_refresh(graph, storage, query, prefer_cache, false).await
+}
+
+/// Resolves a OneNote notebook, optionally bypassing the local cache to refresh from Graph first.
+pub async fn resolve_notebook_with_refresh(
+    graph: &GraphClient,
+    storage: &Storage,
+    query: &str,
+    prefer_cache: bool,
+    force_refresh: bool,
+) -> Result<OnenoteNotebook> {
+    if !force_refresh || prefer_cache {
+        let cached = storage.list_onenote_notebooks()?;
+        if !cached.is_empty() {
+            match resolve_notebook_from_slice(&cached, query) {
+                Ok(found) => return Ok(found),
+                Err(err) if prefer_cache => return Err(err),
+                Err(_) => {}
+            }
+        } else if prefer_cache {
+            bail!(
+                "No cached OneNote notebooks found. Run without --offline or run `onenote sync`."
+            );
         }
-    } else if prefer_cache {
-        bail!("No cached OneNote notebooks found. Run without --offline or run `onenote sync`.");
     }
 
-    let fetched = graph.list_all_accessible_notebooks(true).await?;
-    storage.upsert_onenote_notebooks(&fetched)?;
-    resolve_notebook_from_slice(&fetched, query)
+    let fetched = graph.list_all_accessible_notebooks_scoped(true).await?;
+    storage.reconcile_onenote_notebooks_for_scopes(&fetched.notebooks, &fetched.complete_scopes)?;
+    resolve_notebook_from_slice(&fetched.notebooks, query)
 }
 
 /// Resolves a OneNote section query against an in-memory slice of `OnenoteSection`s.
@@ -192,34 +207,75 @@ pub async fn resolve_section(
     notebook_filter: Option<&str>,
     prefer_cache: bool,
 ) -> Result<OnenoteSection> {
+    resolve_section_with_refresh(
+        graph,
+        storage,
+        section_query,
+        notebook_filter,
+        prefer_cache,
+        false,
+    )
+    .await
+}
+
+/// Resolves a OneNote section, optionally refreshing notebooks and sections from Graph first.
+pub async fn resolve_section_with_refresh(
+    graph: &GraphClient,
+    storage: &Storage,
+    section_query: &str,
+    notebook_filter: Option<&str>,
+    prefer_cache: bool,
+    force_refresh: bool,
+) -> Result<OnenoteSection> {
     let nb_key_filter = if let Some(nb_q) = notebook_filter.filter(|s| !s.trim().is_empty()) {
-        let nb = resolve_notebook(graph, storage, nb_q, prefer_cache).await?;
+        let nb =
+            resolve_notebook_with_refresh(graph, storage, nb_q, prefer_cache, force_refresh)
+                .await?;
         Some(nb.notebook_key)
     } else {
         None
     };
 
-    let cached = storage.list_onenote_sections(nb_key_filter.as_deref())?;
-    if !cached.is_empty() {
-        match resolve_section_from_slice(&cached, section_query) {
-            Ok(found) => return Ok(found),
-            Err(err) if prefer_cache => return Err(err),
-            Err(_) => {}
+    if !force_refresh || prefer_cache {
+        let cached = storage.list_onenote_sections(nb_key_filter.as_deref())?;
+        if !cached.is_empty() {
+            match resolve_section_from_slice(&cached, section_query) {
+                Ok(found) => return Ok(found),
+                Err(err) if prefer_cache => return Err(err),
+                Err(_) => {}
+            }
+        } else if prefer_cache {
+            bail!(
+                "No cached OneNote sections found. Run without --offline or run `onenote sync`."
+            );
         }
-    } else if prefer_cache {
-        bail!("No cached OneNote sections found. Run without --offline or run `onenote sync`.");
     }
 
-    let mut notebooks = storage.list_onenote_notebooks()?;
-    if notebooks.is_empty() {
-        notebooks = graph.list_all_accessible_notebooks(true).await?;
-        storage.upsert_onenote_notebooks(&notebooks)?;
+    let nb_res = graph.list_all_accessible_notebooks_scoped(true).await?;
+    let sec_res = graph
+        .list_all_accessible_sections_scoped(&nb_res.notebooks, Some(&nb_res.complete_scopes))
+        .await?;
+    let reconciled_scopes: std::collections::HashSet<String> = nb_res
+        .complete_scopes
+        .intersection(&sec_res.complete_scopes)
+        .cloned()
+        .collect();
+    if !reconciled_scopes.is_empty() {
+        storage.reconcile_onenote_hierarchy_for_scopes(
+            &nb_res.notebooks,
+            &sec_res.section_groups,
+            &sec_res.sections,
+            &reconciled_scopes,
+        )?;
+    } else {
+        storage.reconcile_onenote_notebooks_for_scopes(&nb_res.notebooks, &nb_res.complete_scopes)?;
+        storage.reconcile_onenote_sections_for_scopes(
+            &sec_res.section_groups,
+            &sec_res.sections,
+            &sec_res.complete_scopes,
+        )?;
     }
-    let (groups, fetched) = graph.list_all_accessible_sections(&notebooks).await?;
-    if !groups.is_empty() {
-        storage.upsert_onenote_section_groups(&groups)?;
-    }
-    storage.upsert_onenote_sections(&fetched)?;
+
     let scoped = storage.list_onenote_sections(nb_key_filter.as_deref())?;
     resolve_section_from_slice(&scoped, section_query)
 }

@@ -100,6 +100,7 @@ pub enum Action {
         page_key: String,
         element_id: String,
         markdown: String,
+        base_content: String,
     },
     OnenoteToggleTodo(Option<usize>),
     ConfirmDeleteOnenotePage,
@@ -161,8 +162,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     // Auto-stash draft if closing a OneNote form via Esc
                     if matches!(action, Action::CloseOverlay) {
                         if let Overlay::OnenoteForm(ref form) = top {
-                            if let Some((key, title, body)) = form.draft_snapshot() {
-                                app.save_draft(key, title, body);
+                            if let Some((key, entry)) = form.draft_entry_snapshot() {
+                                app.save_draft_entry(key, entry);
                             }
                         }
                     }
@@ -576,7 +577,11 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                     sec.display_name.clone(),
                     level,
                 );
-                if let Some(draft) = app.drafts.get_note(&format!("create:{}", sec.section_key)) {
+                let draft = app
+                    .drafts
+                    .get_note(&format!("create:{}", sec.section_key))
+                    .or_else(|| app.drafts.get_note(&format!("new_page:{}", sec.section_key)));
+                if let Some(draft) = draft {
                     form.title = draft.title.clone();
                     form.body = draft.body.clone();
                 }
@@ -608,14 +613,33 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                     .min(detail.blocks.len().saturating_sub(1));
                 if let Some(blk) = detail.blocks.get(idx) {
                     if let Some(eid) = blk.element_id.clone() {
-                        let initial_md = parser::onenote_blocks_to_markdown(std::slice::from_ref(blk));
-                        let form = OnenoteFormOverlay::edit_block(
+                        let initial_md = parser::block_baseline_content(blk);
+                        let mut form = OnenoteFormOverlay::edit_block(
                             detail.summary.page_key.clone(),
                             detail.summary.title.clone(),
-                            eid,
+                            eid.clone(),
                             idx,
-                            initial_md,
+                            initial_md.clone(),
                         );
+                        let draft_key = format!("edit:{}:{eid}", detail.summary.page_key);
+                        if let Some(draft) = app.drafts.get_note(&draft_key) {
+                            form.body = draft.body.clone();
+                            if let Some(saved_base) = draft.base_content.as_deref() {
+                                if let crate::ui::overlays::onenote_form::OnenoteFormMode::EditBlock {
+                                    ref mut base_content,
+                                    ..
+                                } = form.mode
+                                {
+                                    *base_content = saved_base.to_string();
+                                }
+                                if !parser::block_matches_expected(blk, saved_base) {
+                                    form.error = Some(
+                                        "Remote block changed since this draft was saved; review before saving."
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
                         ui.overlays.push(Overlay::onenote_form(form));
                         return false;
                     }
@@ -656,8 +680,9 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
             page_key,
             element_id,
             markdown,
+            base_content,
         } => {
-            app.spawn_edit_block(page_key, element_id, markdown, ui);
+            app.spawn_edit_block(page_key, element_id, markdown, base_content, ui);
             false
         }
         Action::OnenoteToggleTodo(opt_idx) => {

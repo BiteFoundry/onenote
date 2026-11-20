@@ -35,6 +35,8 @@ const MAX_ERROR_BACKOFF_MS: u64 = 300_000;
 const BOOTSTRAP_MAX_SECTIONS: usize = 64;
 const BOOTSTRAP_SECTION_CONCURRENCY: usize = 6;
 const SECTION_PAGES_LIMIT: usize = 500;
+const INACTIVE_SECTION_STALE_SECS: i64 = 300;
+const MAX_REHYDRATE_PER_SYNC: usize = 16;
 
 fn section_pages_cursor_key(section_key: &str) -> String {
     format!("onenote:pages:{section_key}")
@@ -276,42 +278,94 @@ async fn sync_hierarchy_and_sections(
     storage: &Storage,
     force_all_sections: bool,
 ) -> Result<OnenoteBootstrapSummary> {
-    let notebooks = graph.list_all_accessible_notebooks(true).await?;
-    let (section_groups, sections) = graph.list_all_accessible_sections(&notebooks).await?;
-    storage.reconcile_onenote_hierarchy(&notebooks, &section_groups, &sections, true)?;
-
-    let mut ordered_sections: Vec<&OnenoteSection> = sections.iter().collect();
-    ordered_sections.sort_by_key(|s| {
-        if s.is_default && s.scope.is_personal() {
-            0u8
-        } else if s.scope.is_personal() {
-            1u8
-        } else {
-            2u8
-        }
-    });
-
-    let sections_to_sync: Vec<OnenoteSection> = ordered_sections
-        .into_iter()
-        .filter(|sec| {
-            if force_all_sections {
-                return true;
-            }
-            let cursor = storage
-                .get_sync_cursor(&section_pages_cursor_key(&sec.section_key))
-                .ok()
-                .flatten();
-            match cursor {
-                None => true,
-                Some(cur) => {
-                    sec.last_modified_at.is_none()
-                        || cur.delta_link.as_deref() != sec.last_modified_at.as_deref()
-                }
-            }
-        })
-        .take(BOOTSTRAP_MAX_SECTIONS)
+    let nb_res = graph.list_all_accessible_notebooks_scoped(true).await?;
+    let sec_res = graph
+        .list_all_accessible_sections_scoped(&nb_res.notebooks, Some(&nb_res.complete_scopes))
+        .await?;
+    let reconciled_scopes: std::collections::HashSet<String> = nb_res
+        .complete_scopes
+        .intersection(&sec_res.complete_scopes)
         .cloned()
         .collect();
+    if !reconciled_scopes.is_empty() {
+        storage.reconcile_onenote_hierarchy_for_scopes(
+            &nb_res.notebooks,
+            &sec_res.section_groups,
+            &sec_res.sections,
+            &reconciled_scopes,
+        )?;
+    } else {
+        storage.reconcile_onenote_notebooks_for_scopes(&nb_res.notebooks, &nb_res.complete_scopes)?;
+        storage.reconcile_onenote_sections_for_scopes(
+            &sec_res.section_groups,
+            &sec_res.sections,
+            &sec_res.complete_scopes,
+        )?;
+    }
+
+    let notebooks = nb_res.notebooks;
+    let section_groups = sec_res.section_groups;
+    let sections = sec_res.sections;
+    let now = chrono::Utc::now();
+
+    let mut ordered_sections: Vec<(&OnenoteSection, Option<SyncCursor>)> = sections
+        .iter()
+        .map(|s| {
+            let cur = storage
+                .get_sync_cursor(&section_pages_cursor_key(&s.section_key))
+                .ok()
+                .flatten();
+            (s, cur)
+        })
+        .collect();
+    ordered_sections.sort_by(|(a, cur_a), (b, cur_b)| {
+        let prio = |s: &OnenoteSection| {
+            if s.is_default && s.scope.is_personal() {
+                0u8
+            } else if s.scope.is_personal() {
+                1u8
+            } else {
+                2u8
+            }
+        };
+        let sync_ts_a = cur_a
+            .as_ref()
+            .map(|c| c.last_synced_at.as_str())
+            .unwrap_or("");
+        let sync_ts_b = cur_b
+            .as_ref()
+            .map(|c| c.last_synced_at.as_str())
+            .unwrap_or("");
+        prio(a).cmp(&prio(b)).then_with(|| sync_ts_a.cmp(sync_ts_b))
+    });
+
+    let iter = ordered_sections.into_iter().filter_map(|(sec, cursor)| {
+        if force_all_sections {
+            return Some(sec.clone());
+        }
+        let needs_sync = match cursor {
+            None => true,
+            Some(cur) => {
+                let stale_by_age = chrono::DateTime::parse_from_rfc3339(&cur.last_synced_at)
+                    .ok()
+                    .is_some_and(|dt| {
+                        now.signed_duration_since(dt.with_timezone(&chrono::Utc))
+                            .num_seconds()
+                            >= INACTIVE_SECTION_STALE_SECS
+                    });
+                sec.last_modified_at.is_none()
+                    || cur.delta_link.as_deref() != sec.last_modified_at.as_deref()
+                    || stale_by_age
+            }
+        };
+        needs_sync.then(|| sec.clone())
+    });
+
+    let sections_to_sync: Vec<OnenoteSection> = if force_all_sections {
+        iter.collect()
+    } else {
+        iter.take(BOOTSTRAP_MAX_SECTIONS).collect()
+    };
 
     let attempted_sections = sections_to_sync.len();
     let results: Vec<(OnenoteSection, Result<Vec<OnenotePageSummary>>)> =
@@ -329,20 +383,13 @@ async fn sync_hierarchy_and_sections(
     let mut sections_succeeded = 0usize;
     let mut auth_err: Option<anyhow::Error> = None;
     let mut first_err: Option<anyhow::Error> = None;
+    let mut invalidated_pages: Vec<String> = Vec::new();
+    let mut succeeded_sections: Vec<(OnenoteSection, Vec<OnenotePageSummary>)> = Vec::new();
 
     for (sec, pages_res) in results {
         match pages_res {
             Ok(pages) => {
-                let is_complete = pages.len() < SECTION_PAGES_LIMIT;
-                storage.reconcile_onenote_section_pages(&sec.section_key, &pages, is_complete)?;
-                pages_synced += pages.len();
-                sections_succeeded += 1;
-                let _ = storage.upsert_sync_cursor(&SyncCursor {
-                    scope_key: section_pages_cursor_key(&sec.section_key),
-                    delta_link: sec.last_modified_at.clone(),
-                    history_next_link: None,
-                    last_synced_at: chrono::Utc::now().to_rfc3339(),
-                });
+                succeeded_sections.push((sec, pages));
             }
             Err(err) => {
                 if classify_sync_error(&err) == SyncErrorKind::Unauthorized401 && auth_err.is_none()
@@ -352,6 +399,56 @@ async fn sync_hierarchy_and_sections(
                     first_err = Some(err);
                 }
             }
+        }
+    }
+
+    // Pass 1: Upsert all fetched pages across succeeded sections first so pages moved
+    // between sections update their `section_key` in place without losing cached `detail_json`.
+    for (sec, pages) in &succeeded_sections {
+        let invalidated = storage.reconcile_onenote_section_pages_returning_invalidated(
+            &sec.section_key,
+            pages,
+            false,
+        )?;
+        for pk in invalidated {
+            if invalidated_pages.len() < MAX_REHYDRATE_PER_SYNC
+                && !invalidated_pages.contains(&pk)
+            {
+                invalidated_pages.push(pk);
+            }
+        }
+        pages_synced += pages.len();
+        sections_succeeded += 1;
+    }
+
+    // Pass 2: Prune deleted pages only for sections whose full page list was fetched.
+    for (sec, pages) in &succeeded_sections {
+        if pages.len() < SECTION_PAGES_LIMIT {
+            storage.prune_onenote_section_pages(&sec.section_key, pages)?;
+        }
+        let _ = storage.upsert_sync_cursor(&SyncCursor {
+            scope_key: section_pages_cursor_key(&sec.section_key),
+            delta_link: sec.last_modified_at.clone(),
+            history_next_link: None,
+            last_synced_at: chrono::Utc::now().to_rfc3339(),
+        });
+    }
+
+    if !invalidated_pages.is_empty() {
+        let rehydrate_results: Vec<Option<crate::models::OnenotePageDetail>> =
+            stream::iter(invalidated_pages.into_iter().map(|pk| async move {
+                let hint = storage.get_onenote_page_summary(&pk).ok().flatten();
+                let (scope, raw_id) = split_onenote_entity_key(&pk);
+                graph
+                    .get_onenote_page_detail(&scope, &raw_id, hint)
+                    .await
+                    .ok()
+            }))
+            .buffer_unordered(BOOTSTRAP_SECTION_CONCURRENCY.min(4))
+            .collect()
+            .await;
+        for detail in rehydrate_results.into_iter().flatten() {
+            let _ = storage.upsert_onenote_page_detail(&detail);
         }
     }
 
@@ -662,6 +759,9 @@ async fn run_hydrate_page(
             true
         }
         Err(err) => {
+            if crate::graph::onenote::is_not_found_error(&err) {
+                let _ = storage.delete_onenote_page(page_key);
+            }
             let _ = event_tx.send(CoreEvent::SyncError(format!(
                 "Failed to load OneNote page: {err}"
             )));
@@ -1126,5 +1226,151 @@ mod tests {
         ctrl.set_focus(target_a.clone());
         assert!(focus_rx.has_changed().unwrap());
         assert_eq!(*focus_rx.borrow_and_update(), target_a);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_sync_refreshes_stale_inactive_section_even_when_section_mtime_unchanged() {
+        use axum::{
+            extract::{Path as AxumPath, State},
+            routing::get,
+            Json, Router,
+        };
+        use serde_json::json;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Mutex,
+        };
+
+        use crate::auth::{AuthManager, StoredTokens};
+
+        #[derive(Clone)]
+        struct StaleMockState {
+            sec2_hits: Arc<AtomicUsize>,
+            sec2_pages: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        let state = StaleMockState {
+            sec2_hits: Arc::new(AtomicUsize::new(0)),
+            sec2_pages: Arc::new(Mutex::new(vec![json!({
+                "id": "p-2a",
+                "title": "Inactive v1",
+                "level": 0,
+                "order": 0,
+                "lastModifiedDateTime": "2026-11-18T10:00:00Z",
+                "parentSection": { "id": "sec-2", "displayName": "Inactive" }
+            })])),
+        };
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(|| async { Json(json!({ "value": [] })) }),
+            )
+            .route(
+                "/v1.0/me/onenote/notebooks",
+                get(|| async {
+                    Json(json!({
+                        "value": [{
+                            "id": "nb-1",
+                            "displayName": "NB",
+                            "isDefault": true,
+                            "isShared": false
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sectionGroups",
+                get(|| async { Json(json!({ "value": [] })) }),
+            )
+            .route(
+                "/v1.0/me/onenote/sections",
+                get(|| async {
+                    Json(json!({
+                        "value": [{
+                            "id": "sec-2",
+                            "displayName": "Inactive",
+                            "isDefault": false,
+                            "lastModifiedDateTime": "2026-11-18T10:02:00Z",
+                            "parentNotebook": { "id": "nb-1", "displayName": "NB" }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sections/{sec_id}/pages",
+                get(
+                    |State(st): State<StaleMockState>, AxumPath(_sec_id): AxumPath<String>| async move {
+                        st.sec2_hits.fetch_add(1, AtomicOrdering::SeqCst);
+                        let items = st.sec2_pages.lock().unwrap().clone();
+                        Json(json!({ "value": items }))
+                    },
+                ),
+            )
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tokens = StoredTokens {
+            access_token: "sync-test-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("user-1".to_string()),
+            user_display_name: Some("Tester".to_string()),
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        bootstrap_onenote(&graph, &storage).await.unwrap();
+        assert_eq!(state.sec2_hits.load(AtomicOrdering::SeqCst), 1);
+
+        // Remote adds a page in sec-2 WITHOUT changing sec-2.lastModifiedDateTime
+        state.sec2_pages.lock().unwrap().push(json!({
+            "id": "p-2b",
+            "title": "New Remote Page In Inactive Section",
+            "level": 0,
+            "order": 1,
+            "lastModifiedDateTime": "2026-11-18T11:00:00Z",
+            "parentSection": { "id": "sec-2", "displayName": "Inactive" }
+        }));
+
+        // Immediately after bootstrap, incremental sync skips (cursor age < INACTIVE_SECTION_STALE_SECS)
+        sync_hierarchy_and_sections(&graph, &storage, false)
+            .await
+            .unwrap();
+        assert_eq!(state.sec2_hits.load(AtomicOrdering::SeqCst), 1);
+
+        // Age the cursor past INACTIVE_SECTION_STALE_SECS -> incremental sync refreshes sec-2!
+        let old_ts = (chrono::Utc::now() - chrono::Duration::seconds(INACTIVE_SECTION_STALE_SECS + 30))
+            .to_rfc3339();
+        storage
+            .upsert_sync_cursor(&SyncCursor {
+                scope_key: section_pages_cursor_key("me|sec-2"),
+                delta_link: Some("2026-11-18T10:02:00Z".to_string()),
+                history_next_link: None,
+                last_synced_at: old_ts,
+            })
+            .unwrap();
+
+        sync_hierarchy_and_sections(&graph, &storage, false)
+            .await
+            .unwrap();
+        assert_eq!(state.sec2_hits.load(AtomicOrdering::SeqCst), 2);
+        let pages = storage.list_onenote_pages("me|sec-2").unwrap();
+        assert_eq!(pages.len(), 2);
+        assert!(pages.iter().any(|p| p.id == "p-2b"));
+
+        srv.abort();
     }
 }

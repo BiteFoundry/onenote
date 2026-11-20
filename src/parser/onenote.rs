@@ -25,17 +25,13 @@ pub fn parse_onenote_page_xhtml(
     let normalized_xhtml = normalize_xhtml_for_html5ever(raw_xhtml);
     let doc = Html::parse_document(&normalized_xhtml);
 
-    // Populate title from <head><title> if summary.title is blank or placeholder.
+    // Populate title from <head><title> whenever present so stale cached summaries stay aligned.
     if let Ok(title_sel) = Selector::parse("head > title, title") {
         if let Some(title_el) = doc.select(&title_sel).next() {
             let extracted_title = collapse_html_whitespace(&collect_raw_text(title_el))
                 .trim()
                 .to_string();
-            if !extracted_title.is_empty()
-                && (summary.title.trim().is_empty()
-                    || summary.title.trim() == "(Untitled)"
-                    || summary.title.trim() == "(제목 없음)")
-            {
+            if !extracted_title.is_empty() {
                 summary.title = extracted_title;
             }
         }
@@ -77,18 +73,13 @@ pub fn parse_onenote_page_xhtml(
         .iter()
         .any(|b| b.tag.as_ref().is_some_and(OnenoteTagKind::is_todo));
 
-    let needs_preview = summary
-        .preview_text
-        .as_deref()
-        .map(|s| s.trim().is_empty())
-        .unwrap_or(true);
-    if needs_preview {
-        let compact: String = body_plain.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !compact.is_empty() {
-            let preview: String = compact.chars().take(140).collect();
-            summary.preview_text = Some(preview);
-        }
-    }
+    let compact: String = body_plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    summary.preview_text = if compact.is_empty() {
+        None
+    } else {
+        let preview: String = compact.chars().take(140).collect();
+        Some(preview)
+    };
 
     OnenotePageDetail {
         summary,
@@ -2612,6 +2603,56 @@ pub fn build_append_markdown_payload(
     } else {
         build_multipart_payload("Commands", "application/json", &json_bytes, inline_images)
     }
+}
+
+/// Finds a parsed block on a page by its Graph `element_id` (ignoring any leading `#`).
+pub fn find_block_by_element_id<'a>(
+    detail: &'a OnenotePageDetail,
+    element_id: &str,
+) -> Option<&'a OnenoteBlock> {
+    let clean = element_id.trim().trim_start_matches('#');
+    if clean.is_empty() {
+        return None;
+    }
+    detail.blocks.iter().find(|b| {
+        b.element_id
+            .as_deref()
+            .is_some_and(|eid| eid.trim().trim_start_matches('#') == clean)
+    })
+}
+
+fn normalize_compare_text(input: &str) -> String {
+    input.replace("\r\n", "\n").trim().to_string()
+}
+
+/// Canonical baseline string for comparing a block before surgical replacement.
+pub fn block_baseline_content(block: &OnenoteBlock) -> String {
+    onenote_blocks_to_markdown(std::slice::from_ref(block))
+}
+
+/// Checks whether a live `OnenoteBlock` still matches an edit-start baseline string
+/// (accepts Markdown, plain text, or raw outer XHTML captured from a previous read).
+pub fn block_matches_expected(block: &OnenoteBlock, expected: &str) -> bool {
+    let exp = normalize_compare_text(expected);
+    let md = normalize_compare_text(&onenote_blocks_to_markdown(std::slice::from_ref(block)));
+    if md == exp {
+        return true;
+    }
+    let plain = normalize_compare_text(&onenote_blocks_to_plain(std::slice::from_ref(block)));
+    if plain == exp {
+        return true;
+    }
+    if let Some(raw) = block.raw_html.as_deref() {
+        if normalize_compare_text(raw) == exp {
+            return true;
+        }
+    }
+    false
+}
+
+/// Compares two parsed snapshots of the same block to determine whether its content or tag changed.
+pub fn blocks_have_same_content(a: &OnenoteBlock, b: &OnenoteBlock) -> bool {
+    a.tag == b.tag && a.kind == b.kind
 }
 
 /// Builds a surgical `replace` `OnenotePatchCommand` for a single `target_element_id`.

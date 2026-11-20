@@ -374,6 +374,31 @@ fn is_unauthorized_error(err: &anyhow::Error) -> bool {
         || detail.contains("invalidauthenticationtoken")
 }
 
+/// Returns `true` ONLY when Microsoft Graph returned an authoritative HTTP 404 or 410 status.
+/// Non-404/410 statuses (e.g. 500/503 whose body mentions "404" or "not found") return `false`
+/// so transient backend failures never evict cached local pages.
+pub fn is_not_found_error(err: &anyhow::Error) -> bool {
+    matches!(
+        crate::graph::client::graph_http_status(err),
+        Some(404 | 410)
+    )
+}
+
+/// Scope-aware notebook fetch result tracking which scopes were completely fetched without error.
+#[derive(Debug, Clone)]
+pub struct ScopedNotebooksResult {
+    pub notebooks: Vec<OnenoteNotebook>,
+    pub complete_scopes: HashSet<String>,
+}
+
+/// Scope-aware section fetch result tracking which scopes were completely fetched without error.
+#[derive(Debug, Clone)]
+pub struct ScopedSectionsResult {
+    pub section_groups: Vec<OnenoteSectionGroup>,
+    pub sections: Vec<OnenoteSection>,
+    pub complete_scopes: HashSet<String>,
+}
+
 fn backfill_section_hierarchy(
     notebooks: &[OnenoteNotebook],
     all_groups: &mut [OnenoteSectionGroup],
@@ -609,19 +634,37 @@ impl GraphClient {
         &self,
         include_teams: bool,
     ) -> Result<Vec<OnenoteNotebook>> {
+        Ok(self
+            .list_all_accessible_notebooks_scoped(include_teams)
+            .await?
+            .notebooks)
+    }
+
+    pub async fn list_all_accessible_notebooks_scoped(
+        &self,
+        include_teams: bool,
+    ) -> Result<ScopedNotebooksResult> {
         let me_res = self.list_onenote_notebooks(&OnenoteScope::Me).await;
         if !include_teams {
-            return me_res;
+            let notebooks = me_res?;
+            let mut complete_scopes = HashSet::new();
+            complete_scopes.insert(OnenoteScope::Me.scope_key());
+            return Ok(ScopedNotebooksResult {
+                notebooks,
+                complete_scopes,
+            });
         }
 
         let mut merged: Vec<OnenoteNotebook> = Vec::new();
         let mut index_by_id: HashMap<String, usize> = HashMap::new();
+        let mut complete_scopes: HashSet<String> = HashSet::new();
         let mut any_succeeded = false;
         let mut me_err = None;
 
         match me_res {
             Ok(personal) => {
                 any_succeeded = true;
+                complete_scopes.insert(OnenoteScope::Me.scope_key());
                 for nb in personal {
                     if let Some(&pos) = index_by_id.get(&nb.id) {
                         merge_duplicate_notebook(&mut merged[pos], nb);
@@ -650,10 +693,14 @@ impl GraphClient {
                     .collect();
 
                 for chunk in scopes.chunks(ONENOTE_SCOPE_CONCURRENCY) {
-                    let futs = chunk.iter().map(|s| self.list_onenote_notebooks(s));
+                    let futs = chunk.iter().map(|s| async move {
+                        let scope_key = s.scope_key();
+                        (scope_key, self.list_onenote_notebooks(s).await)
+                    });
                     let results = join_all(futs).await;
-                    for res in results {
+                    for (scope_key, res) in results {
                         if let Ok(group_nbs) = res {
+                            complete_scopes.insert(scope_key);
                             if !group_nbs.is_empty() {
                                 any_succeeded = true;
                             }
@@ -677,7 +724,10 @@ impl GraphClient {
             }
         }
 
-        Ok(merged)
+        Ok(ScopedNotebooksResult {
+            notebooks: merged,
+            complete_scopes,
+        })
     }
 
     pub async fn create_onenote_notebook(
@@ -958,12 +1008,24 @@ impl GraphClient {
         &self,
         notebooks: &[OnenoteNotebook],
     ) -> Result<(Vec<OnenoteSectionGroup>, Vec<OnenoteSection>)> {
+        let res = self
+            .list_all_accessible_sections_scoped(notebooks, None)
+            .await?;
+        Ok((res.section_groups, res.sections))
+    }
+
+    pub async fn list_all_accessible_sections_scoped(
+        &self,
+        notebooks: &[OnenoteNotebook],
+        extra_complete_scopes: Option<&HashSet<String>>,
+    ) -> Result<ScopedSectionsResult> {
         let mut unique_scopes: Vec<OnenoteScope> = Vec::new();
         let mut scope_pos_by_key: HashMap<String, usize> = HashMap::new();
         let mut notebooks_by_scope: HashMap<String, Vec<OnenoteNotebook>> = HashMap::new();
 
-        if notebooks.is_empty() {
+        if notebooks.is_empty() && extra_complete_scopes.is_none_or(HashSet::is_empty) {
             unique_scopes.push(OnenoteScope::Me);
+            scope_pos_by_key.insert(OnenoteScope::Me.scope_key(), 0);
         } else {
             for nb in notebooks {
                 let sk = nb.scope.scope_key();
@@ -1002,12 +1064,23 @@ impl GraphClient {
                     unique_scopes.push(nb.scope.clone());
                 }
             }
+            if let Some(extra) = extra_complete_scopes {
+                for sk in extra {
+                    if !scope_pos_by_key.contains_key(sk) {
+                        if let Some(scope) = OnenoteScope::from_scope_key(sk, None) {
+                            scope_pos_by_key.insert(sk.clone(), unique_scopes.len());
+                            unique_scopes.push(scope);
+                        }
+                    }
+                }
+            }
         }
 
         let mut all_groups: Vec<OnenoteSectionGroup> = Vec::new();
         let mut seen_groups: HashMap<String, usize> = HashMap::new();
         let mut all_sections: Vec<OnenoteSection> = Vec::new();
         let mut seen_sections: HashMap<String, usize> = HashMap::new();
+        let mut complete_scopes: HashSet<String> = HashSet::new();
         let mut any_scope_succeeded = false;
         let mut me_err: Option<anyhow::Error> = None;
         let mut first_err: Option<anyhow::Error> = None;
@@ -1031,6 +1104,7 @@ impl GraphClient {
                 let mut scope_groups: Vec<OnenoteSectionGroup> = Vec::new();
                 let mut scope_sections: Vec<OnenoteSection> = Vec::new();
                 let mut scope_succeeded = false;
+                let mut scope_complete = false;
                 let mut scope_err: Option<anyhow::Error> = None;
 
                 let top_groups_from_scope = match groups_res {
@@ -1044,6 +1118,7 @@ impl GraphClient {
                 match secs_res {
                     Ok(secs) => {
                         scope_succeeded = true;
+                        scope_complete = true;
                         scope_sections.extend(secs);
                         if top_groups_from_scope.is_none() && !scope_nbs.is_empty() {
                             let mut visited_sg_ids = HashSet::new();
@@ -1089,9 +1164,10 @@ impl GraphClient {
                         if !is_unauthorized_error(&err) {
                             let mut visited_sg_ids: HashSet<String> = HashSet::new();
                             let mut fallback_ok = false;
+                            let mut all_nbs_ok = !scope_nbs.is_empty();
 
                             for nb in &scope_nbs {
-                                if let Ok((nb_groups, nb_secs)) = self
+                                match self
                                     .collect_notebook_section_groups_and_sections(
                                         &scope,
                                         &nb.id,
@@ -1099,9 +1175,14 @@ impl GraphClient {
                                     )
                                     .await
                                 {
-                                    fallback_ok = true;
-                                    scope_groups.extend(nb_groups);
-                                    scope_sections.extend(nb_secs);
+                                    Ok((nb_groups, nb_secs)) => {
+                                        fallback_ok = true;
+                                        scope_groups.extend(nb_groups);
+                                        scope_sections.extend(nb_secs);
+                                    }
+                                    Err(_) => {
+                                        all_nbs_ok = false;
+                                    }
                                 }
                             }
 
@@ -1129,6 +1210,7 @@ impl GraphClient {
 
                             if fallback_ok {
                                 scope_succeeded = true;
+                                scope_complete = all_nbs_ok;
                             } else {
                                 scope_err = Some(err);
                             }
@@ -1140,6 +1222,9 @@ impl GraphClient {
 
                 if scope_succeeded {
                     any_scope_succeeded = true;
+                    if scope_complete {
+                        complete_scopes.insert(scope.scope_key());
+                    }
                 } else if let Some(err) = scope_err {
                     if scope.is_personal() && me_err.is_none() {
                         me_err = Some(err);
@@ -1176,7 +1261,11 @@ impl GraphClient {
 
         backfill_section_hierarchy(notebooks, &mut all_groups, &mut all_sections);
 
-        Ok((all_groups, all_sections))
+        Ok(ScopedSectionsResult {
+            section_groups: all_groups,
+            sections: all_sections,
+            complete_scopes,
+        })
     }
 
     pub async fn create_onenote_section(
@@ -1274,25 +1363,70 @@ impl GraphClient {
         let base = scope.graph_base_path();
         let pid_enc = urlencoding::encode(&pid);
 
-        let summary = match cached_summary {
-            Some(s) => s,
-            None => {
-                let meta_with_level = format!("{base}/pages/{pid_enc}?pagelevel=true");
-                let raw_meta: GraphOnenotePage = match self.get_json(&meta_with_level).await {
-                    Ok(meta) => meta,
-                    Err(err) if is_pagelevel_bad_request(&err) => {
-                        let fallback_meta = format!("{base}/pages/{pid_enc}");
-                        self.get_json(&fallback_meta).await?
+        let meta_fut = async {
+            let meta_with_level = format!("{base}/pages/{pid_enc}?pagelevel=true");
+            match self.get_json::<GraphOnenotePage>(&meta_with_level).await {
+                Ok(meta) => Ok(meta),
+                Err(err) if is_pagelevel_bad_request(&err) => {
+                    let fallback_meta = format!("{base}/pages/{pid_enc}");
+                    self.get_json::<GraphOnenotePage>(&fallback_meta).await
+                }
+                Err(err) => Err(err),
+            }
+        };
+        let content_path = format!("{base}/pages/{pid_enc}/content?includeIDs=true");
+        let content_fut = self.get_text(&content_path);
+
+        let (meta_res, content_res) = tokio::join!(meta_fut, content_fut);
+
+        let raw_xhtml = match content_res {
+            Ok(xhtml) => xhtml,
+            Err(err) => return Err(err),
+        };
+
+        let summary = match meta_res {
+            Ok(raw_meta) => {
+                let fallback_sec = cached_summary
+                    .as_ref()
+                    .map(|s| s.section_id.as_str())
+                    .filter(|s| !s.is_empty());
+                let fallback_order = cached_summary.as_ref().map(|s| s.order).unwrap_or(0);
+                let mut fresh = raw_meta.into_page_summary(scope, fallback_sec, fallback_order);
+                if let Some(cached) = cached_summary {
+                    let same_section = !fresh.section_id.is_empty()
+                        && !cached.section_id.is_empty()
+                        && fresh.section_id == cached.section_id;
+                    if same_section {
+                        if fresh.section_name.is_none() {
+                            fresh.section_name = cached.section_name;
+                        }
+                        if fresh.notebook_id.is_none() {
+                            fresh.notebook_id = cached.notebook_id;
+                        }
+                        if fresh.notebook_name.is_none() {
+                            fresh.notebook_name = cached.notebook_name;
+                        }
                     }
-                    Err(err) => return Err(err),
-                };
-                raw_meta.into_page_summary(scope, None, 0)
+                    if fresh.web_url.is_none() {
+                        fresh.web_url = cached.web_url;
+                    }
+                }
+                fresh
+            }
+            Err(err) => {
+                if is_not_found_error(&err) {
+                    return Err(err);
+                }
+                match cached_summary {
+                    Some(mut cached) => {
+                        cached.preview_text = None;
+                        cached
+                    }
+                    None => return Err(err),
+                }
             }
         };
 
-        let raw_xhtml = self
-            .get_text(&format!("{base}/pages/{pid_enc}/content?includeIDs=true"))
-            .await?;
         let mut detail = crate::parser::onenote::parse_onenote_page_xhtml(summary, &raw_xhtml);
         detail.synced_at = Some(chrono::Utc::now().to_rfc3339());
         Ok(detail)
@@ -1328,9 +1462,8 @@ impl GraphClient {
             summary.section_id = sec_id;
         }
         if let Some(l) = outgoing.level.filter(|&l| l > 0) {
-            summary.level = l;
-            if !summary.id.is_empty() {
-                let _ = self
+            if !summary.id.is_empty()
+                && self
                     .patch_json(
                         &format!(
                             "{}/pages/{}",
@@ -1339,7 +1472,10 @@ impl GraphClient {
                         ),
                         &serde_json::json!({ "level": l }),
                     )
-                    .await;
+                    .await
+                    .is_ok()
+            {
+                summary.level = l;
             }
         }
         Ok(summary)
@@ -2133,6 +2269,53 @@ mod tests {
             err.to_string().contains("500"),
             "expected 500 error propagation, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_is_not_found_error_requires_authoritative_http_404_or_410() {
+        use crate::graph::client::{graph_http_status, GraphApiError};
+        use reqwest::StatusCode;
+
+        let err_404 = anyhow::Error::new(GraphApiError {
+            status: StatusCode::NOT_FOUND,
+            method: "GET".to_string(),
+            url: "https://graph.microsoft.com/v1.0/me/onenote/pages/p-1".to_string(),
+            detail: "404 Not Found [ResourceNotFound] Page not found".to_string(),
+        });
+        assert_eq!(graph_http_status(&err_404), Some(404));
+        assert!(is_not_found_error(&err_404));
+
+        let err_410 = anyhow::Error::new(GraphApiError {
+            status: StatusCode::GONE,
+            method: "GET".to_string(),
+            url: "https://graph.microsoft.com/v1.0/me/onenote/pages/p-1".to_string(),
+            detail: "410 Gone".to_string(),
+        });
+        assert_eq!(graph_http_status(&err_410), Some(410));
+        assert!(is_not_found_error(&err_410));
+
+        // Non-404/410 status whose backend message mentions "404" / "ResourceNotFound" / "not found"
+        let err_503_with_404_text = anyhow::Error::new(GraphApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            method: "GET".to_string(),
+            url: "https://graph.microsoft.com/v1.0/me/onenote/pages/p-1".to_string(),
+            detail: "503 Service Unavailable [ResourceNotFound] upstream backend 404 item not found"
+                .to_string(),
+        });
+        assert_eq!(graph_http_status(&err_503_with_404_text), Some(503));
+        assert!(!is_not_found_error(&err_503_with_404_text));
+
+        // String-only formatted Graph 500 mentioning 404 must also NOT match
+        let err_500_str = anyhow::anyhow!(
+            "Graph API error (GET https://graph.microsoft.com/v1.0/me/onenote/pages/p-1): 500 Internal Server Error backend 404 not found"
+        );
+        assert_eq!(graph_http_status(&err_500_str), Some(500));
+        assert!(!is_not_found_error(&err_500_str));
+
+        // Plain non-Graph error mentioning 404 / not found must NOT match
+        let plain_err = anyhow::anyhow!("proxy error: 404 not found");
+        assert_eq!(graph_http_status(&plain_err), None);
+        assert!(!is_not_found_error(&plain_err));
     }
 
     #[tokio::test]

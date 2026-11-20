@@ -121,6 +121,13 @@ pub enum UiMsg {
         task_id: u64,
         detail: Box<OnenotePageDetail>,
         message: String,
+        cleared_draft_key: Option<String>,
+    },
+    EditConflict {
+        task_id: u64,
+        detail: Box<OnenotePageDetail>,
+        draft_to_preserve: Option<(String, NoteDraftEntry)>,
+        message: String,
     },
     PageDeleted {
         task_id: u64,
@@ -722,7 +729,18 @@ impl AppState {
     }
 
     pub fn save_draft(&mut self, key: impl Into<String>, title: String, body: String) {
-        self.drafts.set_note(key, NoteDraftEntry { title, body });
+        self.save_draft_entry(
+            key,
+            NoteDraftEntry {
+                title,
+                body,
+                base_content: None,
+            },
+        );
+    }
+
+    pub fn save_draft_entry(&mut self, key: impl Into<String>, entry: NoteDraftEntry) {
+        self.drafts.set_note(key, entry);
         let _ = self.drafts.save();
     }
 
@@ -859,10 +877,12 @@ impl AppState {
             .await
             {
                 Ok(detail) => {
+                    let pk = detail.summary.page_key.clone();
                     let _ = tx.send(UiMsg::PageMutated {
                         task_id,
                         detail: Box::new(detail),
                         message: "Appended content to OneNote page".to_string(),
+                        cleared_draft_key: Some(format!("append:{pk}")),
                     });
                 }
                 Err(err) => {
@@ -880,28 +900,48 @@ impl AppState {
         page_key: String,
         element_id: String,
         markdown: String,
+        base_content: String,
         ui: &mut UiState,
     ) {
         let task_id = ui.tasks.start("Updating block");
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
+        let draft_key = format!("edit:{page_key}:{element_id}");
         tokio::spawn(async move {
-            match crate::cli::update_onenote_page_helper(
+            match crate::cli::update_onenote_page_guarded(
                 &storage,
                 &graph,
                 &page_key,
                 None,
                 Some(&markdown),
                 Some(&element_id),
+                Some(&base_content),
+                false,
             )
             .await
             {
-                Ok(detail) => {
+                Ok(crate::cli::GuardedUpdateResult::Updated(detail)) => {
                     let _ = tx.send(UiMsg::PageMutated {
                         task_id,
                         detail: Box::new(detail),
                         message: "Updated OneNote block".to_string(),
+                        cleared_draft_key: Some(draft_key),
+                    });
+                }
+                Ok(crate::cli::GuardedUpdateResult::Conflict { latest, message }) => {
+                    let _ = tx.send(UiMsg::EditConflict {
+                        task_id,
+                        detail: Box::new(latest),
+                        draft_to_preserve: Some((
+                            draft_key,
+                            NoteDraftEntry {
+                                title: String::new(),
+                                body: markdown,
+                                base_content: Some(base_content),
+                            },
+                        )),
+                        message: format!("{message} Local draft preserved."),
                     });
                 }
                 Err(err) => {
@@ -923,41 +963,52 @@ impl AppState {
             ui.warn("Select a to-do block first");
             return;
         };
-        let Some((cmd, next_done)) = parser::build_toggle_todo_patch(block) else {
+        if parser::build_toggle_todo_patch(block).is_none() {
             ui.warn("Selected block is not a OneNote to-do checkbox");
             return;
+        }
+        let Some(element_id) = block.element_id.clone() else {
+            ui.warn("Selected block does not have an editable Graph element ID");
+            return;
         };
+        let base_content = parser::block_baseline_content(block);
         let page_key = detail.summary.page_key.clone();
-        let scope = detail.summary.scope.clone();
-        let page_id = detail.summary.id.clone();
-        let summary_hint = detail.summary.clone();
         let task_id = ui.tasks.start("Toggling to-do");
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            match graph.patch_onenote_page_commands(&scope, &page_id, &[cmd]).await {
-                Ok(()) => {
-                    match graph
-                        .get_onenote_page_detail(&scope, &page_id, Some(summary_hint))
-                        .await
-                    {
-                        Ok(updated) => {
-                            let _ = storage.upsert_onenote_page_detail(&updated);
-                            let state = if next_done { "completed" } else { "reopened" };
-                            let _ = tx.send(UiMsg::PageMutated {
-                                task_id,
-                                detail: Box::new(updated),
-                                message: format!("Marked to-do {state}"),
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(UiMsg::TaskFailed {
-                                task_id,
-                                error: format!("Failed to reload page ({page_key}): {err}"),
-                            });
-                        }
-                    }
+            match crate::cli::toggle_onenote_todo_guarded(
+                &storage,
+                &graph,
+                &page_key,
+                Some(&element_id),
+                None,
+                Some(&base_content),
+                false,
+            )
+            .await
+            {
+                Ok(crate::cli::GuardedTodoResult::Updated {
+                    detail: updated,
+                    completed,
+                    ..
+                }) => {
+                    let state = if completed { "completed" } else { "reopened" };
+                    let _ = tx.send(UiMsg::PageMutated {
+                        task_id,
+                        detail: Box::new(updated),
+                        message: format!("Marked to-do {state}"),
+                        cleared_draft_key: None,
+                    });
+                }
+                Ok(crate::cli::GuardedTodoResult::Conflict { latest, message }) => {
+                    let _ = tx.send(UiMsg::EditConflict {
+                        task_id,
+                        detail: Box::new(latest),
+                        draft_to_preserve: None,
+                        message,
+                    });
                 }
                 Err(err) => {
                     let _ = tx.send(UiMsg::TaskFailed {
@@ -1057,9 +1108,68 @@ impl AppState {
             let is_stale = self.page_details.get(&p.page_key).is_some_and(|cached| {
                 cached.summary.last_modified_at != p.last_modified_at
                     || cached.summary.title != p.title
+                    || cached.summary.section_id != p.section_id
             });
             if is_stale {
                 self.page_details.remove(&p.page_key);
+            }
+        }
+    }
+
+    fn evict_removed_section_page_details(
+        &mut self,
+        section_key: &str,
+        incoming: &[OnenotePageSummary],
+    ) {
+        let keep_keys: HashSet<&str> = incoming.iter().map(|p| p.page_key.as_str()).collect();
+        self.page_details.retain(|pk, cached| {
+            let cached_sec_key = cached.summary.scope.make_entity_key(&cached.summary.section_id);
+            cached_sec_key != section_key || keep_keys.contains(pk.as_str())
+        });
+    }
+
+    fn reconcile_cached_page_details_from_storage(&mut self) {
+        let cached_keys: Vec<String> = self.page_details.keys().cloned().collect();
+        for pk in cached_keys {
+            let Some(cached) = self.page_details.get(&pk) else {
+                continue;
+            };
+            let should_evict = match self.storage.get_onenote_page_summary(&pk) {
+                Ok(Some(row)) => {
+                    row.last_modified_at != cached.summary.last_modified_at
+                        || row.title != cached.summary.title
+                        || row.section_id != cached.summary.section_id
+                        || self
+                            .storage
+                            .get_onenote_page_detail(&pk)
+                            .ok()
+                            .flatten()
+                            .is_none()
+                }
+                Ok(None) => true,
+                Err(_) => false,
+            };
+            if should_evict {
+                self.page_details.remove(&pk);
+            }
+        }
+    }
+
+    fn sync_detail_summary_into_pages(&mut self, summary: &OnenotePageSummary) {
+        if let Some(existing) = self
+            .pages
+            .iter_mut()
+            .find(|p| p.page_key == summary.page_key)
+        {
+            existing.title = summary.title.clone();
+            existing.last_modified_at = summary.last_modified_at.clone();
+            existing.preview_text = summary.preview_text.clone();
+            existing.has_todo = summary.has_todo;
+            if !summary.section_id.trim().is_empty() {
+                existing.section_id = summary.section_id.clone();
+            }
+            if summary.section_name.is_some() {
+                existing.section_name = summary.section_name.clone();
             }
         }
     }
@@ -1093,6 +1203,7 @@ impl AppState {
                 self.ensure_active_section_and_pages_cached();
                 let current_pages = self.pages.clone();
                 self.evict_stale_page_details(&current_pages);
+                self.reconcile_cached_page_details_from_storage();
                 if prev_sec != self.active_section_key {
                     if let Some(sec_key) = self.active_section_key.clone() {
                         self.request_section_pages(sec_key);
@@ -1113,6 +1224,7 @@ impl AppState {
                 notify_candidate,
             } => {
                 self.evict_stale_page_details(&pages);
+                self.evict_removed_section_page_details(&section_key, &pages);
                 if self.active_section_key.as_deref() == Some(section_key.as_str()) {
                     self.loading_onenote_pages = false;
                     self.pages = pages;
@@ -1146,6 +1258,7 @@ impl AppState {
             CoreEvent::OnenotePageDetailUpdated(detail) => {
                 self.loading_onenote_detail = false;
                 let key = detail.summary.page_key.clone();
+                self.sync_detail_summary_into_pages(&detail.summary);
                 self.page_details.insert(key, *detail);
             }
             CoreEvent::SyncStateChanged { busy, summary } => {
@@ -1217,6 +1330,7 @@ impl AppState {
                 let title = page.title.clone();
                 let pk = page.page_key.clone();
                 self.clear_draft(&format!("create:{section_key}"));
+                self.clear_draft(&format!("new_page:{section_key}"));
                 if self.active_section_key.as_deref() == Some(section_key.as_str()) {
                     self.pages.insert(0, page);
                     self.select_page(pk, ui);
@@ -1227,12 +1341,32 @@ impl AppState {
                 task_id,
                 detail,
                 message,
+                cleared_draft_key,
             } => {
                 ui.tasks.finish(task_id);
                 let pk = detail.summary.page_key.clone();
+                if let Some(key) = cleared_draft_key {
+                    self.clear_draft(&key);
+                }
                 self.clear_draft(&format!("append:{pk}"));
+                self.sync_detail_summary_into_pages(&detail.summary);
                 self.page_details.insert(pk, *detail);
                 ui.success(message);
+            }
+            UiMsg::EditConflict {
+                task_id,
+                detail,
+                draft_to_preserve,
+                message,
+            } => {
+                ui.tasks.finish(task_id);
+                let pk = detail.summary.page_key.clone();
+                if let Some((draft_key, entry)) = draft_to_preserve {
+                    self.save_draft_entry(draft_key, entry);
+                }
+                self.sync_detail_summary_into_pages(&detail.summary);
+                self.page_details.insert(pk, *detail);
+                ui.warn(message);
             }
             UiMsg::PageDeleted { task_id, page_key } => {
                 ui.tasks.finish(task_id);
@@ -1244,6 +1378,7 @@ impl AppState {
                         self.request_page_detail(pk);
                     }
                 }
+                self.push_focus_to_sync();
                 ui.success("Deleted OneNote page");
             }
             UiMsg::ResourceDownloaded {
@@ -1510,5 +1645,377 @@ mod tests {
         assert!(app.syncing);
         assert_eq!(app.sync_summary, "Syncing OneNote...");
         assert_eq!(nudge_rx.try_recv().ok(), Some(SyncCommand::RefreshAll));
+    }
+
+    #[test]
+    fn test_draft_reopen_canonical_keys_conflict_preservation_and_inactive_section_eviction() {
+        let (mut app, mut ui, mut focus_rx, _nudge_rx) = make_test_app_with_cached_summary();
+
+        // Add an inactive section + page so we can verify inactive section eviction and move handling
+        app.storage
+            .upsert_onenote_sections(&[OnenoteSection {
+                section_key: "me|sec-2".to_string(),
+                id: "sec-2".to_string(),
+                scope: OnenoteScope::Me,
+                notebook_id: Some("nb-1".to_string()),
+                notebook_name: Some("Engineering".to_string()),
+                parent_section_group_id: None,
+                parent_section_group_name: None,
+                display_name: "InactiveSec".to_string(),
+                color: None,
+                is_default: false,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: Some("2026-11-18T10:00:00Z".to_string()),
+                web_url: None,
+            }])
+            .unwrap();
+        let p2_summary = OnenotePageSummary {
+            page_key: "me|page-2".to_string(),
+            id: "page-2".to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec-2".to_string(),
+            section_name: Some("InactiveSec".to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Engineering".to_string()),
+            title: "Inactive Page v1".to_string(),
+            level: 0,
+            order: 0,
+            created_at: None,
+            last_modified_at: Some("2026-11-18T10:00:00Z".to_string()),
+            content_url: None,
+            web_url: None,
+            preview_text: Some("Old inactive body".to_string()),
+            has_todo: false,
+        };
+        let p2_detail = crate::parser::parse_onenote_page_xhtml(
+            p2_summary.clone(),
+            r#"<html><head><title>Inactive Page v1</title></head><body><div id="div:2"><p id="p:2">Old inactive body</p></div></body></html>"#,
+        );
+        app.storage.upsert_onenote_page_detail(&p2_detail).unwrap();
+
+        let p1_summary = app.storage.get_onenote_page_summary("me|page-1").unwrap().unwrap();
+        let p1_detail = crate::parser::parse_onenote_page_xhtml(
+            p1_summary,
+            r#"<html><head><title>Initial Spec</title></head><body><div id="div:1"><p id="p:1">Alpha paragraph</p></div></body></html>"#,
+        );
+        app.storage.upsert_onenote_page_detail(&p1_detail).unwrap();
+
+        app.load_cached_initial();
+        let _ = focus_rx.borrow_and_update();
+        app.page_details.insert("me|page-2".to_string(), p2_detail);
+        assert!(app.page_details.contains_key("me|page-2"));
+
+        // 1. CreatePage draft stashed via canonical key ("create:me|sec-1") restores on reopen
+        let mut create_form = crate::ui::overlays::onenote_form::OnenoteFormOverlay::create_page(
+            "me|sec-1".to_string(),
+            "Specs".to_string(),
+            0,
+        );
+        create_form.title = "Draft Page Title".to_string();
+        create_form.body = "Unsent draft body".to_string();
+        let (ckey, centry) = create_form.draft_entry_snapshot().unwrap();
+        assert_eq!(ckey, "create:me|sec-1");
+        app.drafts.set_note(ckey, centry);
+
+        crate::ui::action::dispatch(
+            crate::ui::action::Action::OpenOnenoteCreatePage { level: 0 },
+            &mut app,
+            &mut ui,
+        );
+        match ui.overlays.pop() {
+            Some(Overlay::OnenoteForm(form)) => {
+                assert_eq!(form.title, "Draft Page Title");
+                assert_eq!(form.body, "Unsent draft body");
+            }
+            other => panic!("expected create form overlay, got {other:?}"),
+        }
+
+        // 2. EditBlock draft saved via Esc or conflict restores on reopen & flags remote drift
+        crate::ui::action::dispatch(
+            crate::ui::action::Action::OpenOnenoteEditBlock,
+            &mut app,
+            &mut ui,
+        );
+        if let Some(Overlay::OnenoteForm(ref mut form)) = ui.overlays.last_mut() {
+            form.body = "Local unsent edit".to_string();
+        }
+        // Simulate Esc close -> stashes edit draft with base_content = "Alpha paragraph"
+        crate::ui::action::dispatch(crate::ui::action::Action::CloseOverlay, &mut app, &mut ui);
+        let stashed = app.drafts.get_note("edit:me|page-1:p:1").unwrap();
+        assert_eq!(stashed.body, "Local unsent edit");
+        assert_eq!(stashed.base_content.as_deref(), Some("Alpha paragraph"));
+
+        // Simulate remote edit arriving via EditConflict -> preserves local draft & updates detail
+        let mut remote_detail = p1_detail.clone();
+        remote_detail.summary.title = "Remote Renamed Spec".to_string();
+        remote_detail.summary.last_modified_at = Some("2026-11-18T12:00:00Z".to_string());
+        remote_detail = crate::parser::parse_onenote_page_xhtml(
+            remote_detail.summary.clone(),
+            r#"<html><head><title>Remote Renamed Spec</title></head><body><div id="div:1"><p id="p:1">Remote edit by Alice</p></div></body></html>"#,
+        );
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::EditConflict {
+                task_id: 1,
+                detail: Box::new(remote_detail),
+                draft_to_preserve: Some((
+                    "edit:me|page-1:p:1".to_string(),
+                    NoteDraftEntry {
+                        title: String::new(),
+                        body: "Local unsent edit".to_string(),
+                        base_content: Some("Alpha paragraph".to_string()),
+                    },
+                )),
+                message: "Conflict: block changed remotely.".to_string(),
+            },
+        );
+        assert_eq!(app.pages[0].title, "Remote Renamed Spec");
+        assert!(app.drafts.get_note("edit:me|page-1:p:1").is_some());
+
+        // Reopen EditBlock -> restores local draft AND shows remote drift warning
+        crate::ui::action::dispatch(
+            crate::ui::action::Action::OpenOnenoteEditBlock,
+            &mut app,
+            &mut ui,
+        );
+        match ui.overlays.pop() {
+            Some(Overlay::OnenoteForm(form)) => {
+                assert_eq!(form.body, "Local unsent edit");
+                assert!(form
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("Remote block changed")));
+            }
+            other => panic!("expected edit block overlay, got {other:?}"),
+        }
+
+        // 3. Inactive section page modified in SQLite -> OnenoteHierarchyUpdated evicts RAM page_details
+        let mut p2_newer = p2_summary;
+        p2_newer.last_modified_at = Some("2026-11-18T13:00:00Z".to_string());
+        p2_newer.title = "Inactive Page v2".to_string();
+        app.storage.upsert_onenote_pages(&[p2_newer]).unwrap();
+        let nbs = app.storage.list_onenote_notebooks().unwrap();
+        let secs = app.storage.list_onenote_sections(None).unwrap();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::OnenoteHierarchyUpdated {
+                notebooks: nbs,
+                section_groups: Vec::new(),
+                sections: secs,
+            },
+        );
+        assert!(
+            !app.page_details.contains_key("me|page-2"),
+            "inactive section stale detail must be evicted on hierarchy update"
+        );
+
+        // 4. PageDeleted pushes updated focus to sync engine
+        let _ = focus_rx.borrow_and_update();
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::PageDeleted {
+                task_id: 2,
+                page_key: "me|page-1".to_string(),
+            },
+        );
+        assert!(focus_rx.has_changed().unwrap());
+        assert_eq!(focus_rx.borrow_and_update().page_key, None);
+    }
+
+    #[tokio::test]
+    async fn test_tui_spawn_edit_block_and_toggle_todo_preflight_conflict_and_success() {
+        use axum::{
+            body::Bytes,
+            extract::State,
+            http::StatusCode,
+            routing::get,
+            Json, Router,
+        };
+        use serde_json::json;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+
+        #[derive(Clone)]
+        struct TuiMockState {
+            xhtml: Arc<Mutex<String>>,
+            patch_hits: Arc<AtomicUsize>,
+        }
+
+        let state = TuiMockState {
+            xhtml: Arc::new(Mutex::new(
+                r#"<!DOCTYPE html><html><head><title>Initial Spec</title></head><body><div id="div:{root}"><p id="p:{b1}">REMOTE EDIT BY ALICE</p><p id="p:{todo1}" data-tag="to-do">Ship sync audit</p></div></body></html>"#
+                    .to_string(),
+            )),
+            patch_hits: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let app_router = Router::new()
+            .route(
+                "/v1.0/me/onenote/pages/page-1",
+                get(|| async {
+                    Json(json!({
+                        "id": "page-1",
+                        "title": "Initial Spec",
+                        "level": 0,
+                        "order": 0,
+                        "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                        "parentSection": { "id": "sec-1", "displayName": "Specs" }
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/pages/page-1/content",
+                get(|State(st): State<TuiMockState>| async move {
+                    let body = st.xhtml.lock().unwrap().clone();
+                    (StatusCode::OK, [("content-type", "text/html")], body)
+                })
+                .patch(|State(st): State<TuiMockState>, body: Bytes| async move {
+                    st.patch_hits.fetch_add(1, Ordering::SeqCst);
+                    let cmds: Vec<serde_json::Value> =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    let mut html = st.xhtml.lock().unwrap();
+                    for cmd in cmds {
+                        let target = cmd["target"].as_str().unwrap_or("");
+                        let content = cmd["content"].as_str().unwrap_or("");
+                        if target == "p:{b1}" {
+                            if let Some(start) = html.find(r#"<p id="p:{b1}""#) {
+                                if let Some(rel_end) = html[start..].find("</p>") {
+                                    let repl = content.replacen("<p>", r#"<p id="p:{b1}">"#, 1);
+                                    html.replace_range(start..start + rel_end + 4, &repl);
+                                }
+                            }
+                        } else if target == "p:{todo1}" {
+                            if let Some(start) = html.find(r#"<p id="p:{todo1}""#) {
+                                if let Some(rel_end) = html[start..].find("</p>") {
+                                    html.replace_range(start..start + rel_end + 4, content);
+                                }
+                            }
+                        }
+                    }
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app_router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tokens = crate::auth::StoredTokens {
+            access_token: "tui-test-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("user-1".to_string()),
+            user_display_name: Some("Tester".to_string()),
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        // Seed TUI with stale local snapshot (before Alice edited p:{b1})
+        let stale_summary = OnenotePageSummary {
+            page_key: "me|page-1".to_string(),
+            id: "page-1".to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec-1".to_string(),
+            section_name: Some("Specs".to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Engineering".to_string()),
+            title: "Initial Spec".to_string(),
+            level: 0,
+            order: 0,
+            created_at: None,
+            last_modified_at: Some("2026-11-18T10:00:00Z".to_string()),
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: true,
+        };
+        let stale_detail = parser::parse_onenote_page_xhtml(
+            stale_summary.clone(),
+            r#"<!DOCTYPE html><html><head><title>Initial Spec</title></head><body><div id="div:{root}"><p id="p:{b1}">Old local text</p><p id="p:{todo1}" data-tag="to-do">Ship sync audit</p></div></body></html>"#,
+        );
+        app.storage.upsert_onenote_page_detail(&stale_detail).unwrap();
+        app.pages = vec![stale_summary];
+        app.active_page_key = Some("me|page-1".to_string());
+        app.page_details.insert("me|page-1".to_string(), stale_detail);
+
+        // 1. Stale edit on p:{b1} -> EditConflict, 0 PATCH, remote preserved, draft preserved
+        app.spawn_edit_block(
+            "me|page-1".to_string(),
+            "p:{b1}".to_string(),
+            "Local stale edit".to_string(),
+            "Old local text".to_string(),
+            &mut ui,
+        );
+        let msg1 = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg1, UiMsg::EditConflict { .. }));
+        app.handle_ui_msg(&mut ui, msg1);
+        assert_eq!(state.patch_hits.load(Ordering::SeqCst), 0);
+        assert!(state.xhtml.lock().unwrap().contains("REMOTE EDIT BY ALICE"));
+        assert_eq!(
+            app.drafts
+                .get_note("edit:me|page-1:p:{b1}")
+                .map(|d| d.body.as_str()),
+            Some("Local stale edit")
+        );
+
+        // 2. Different-paragraph to-do toggle (block index 1 = p:{todo1}) -> succeeds, BOTH edits kept
+        app.spawn_toggle_todo(1, &mut ui);
+        let msg2 = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg2, UiMsg::PageMutated { .. }));
+        app.handle_ui_msg(&mut ui, msg2);
+        assert_eq!(state.patch_hits.load(Ordering::SeqCst), 1);
+        let after_todo = state.xhtml.lock().unwrap().clone();
+        assert!(after_todo.contains("REMOTE EDIT BY ALICE"));
+        assert!(after_todo.contains("to-do:completed"));
+
+        // 3. Matching/new baseline edit on p:{b1} -> succeeds and clears edit draft
+        app.spawn_edit_block(
+            "me|page-1".to_string(),
+            "p:{b1}".to_string(),
+            "Merged edit on top of Alice".to_string(),
+            "REMOTE EDIT BY ALICE".to_string(),
+            &mut ui,
+        );
+        let msg3 = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg3, UiMsg::PageMutated { .. }));
+        app.handle_ui_msg(&mut ui, msg3);
+        assert_eq!(state.patch_hits.load(Ordering::SeqCst), 2);
+        assert!(state
+            .xhtml
+            .lock()
+            .unwrap()
+            .contains("Merged edit on top of Alice"));
+        assert!(app.drafts.get_note("edit:me|page-1:p:{b1}").is_none());
+
+        srv.abort();
     }
 }

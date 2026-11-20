@@ -1251,24 +1251,8 @@ pub async fn run_with_persona(
     }
 
     if let Some(ui::overlays::Overlay::OnenoteForm(form)) = ui.overlays.last() {
-        let draft_key = match &form.mode {
-            ui::overlays::onenote_form::OnenoteFormMode::CreatePage { section_key, .. } => {
-                Some(format!("new_page:{section_key}"))
-            }
-            ui::overlays::onenote_form::OnenoteFormMode::AppendMarkdown { page_key, .. } => {
-                Some(format!("append:{page_key}"))
-            }
-            ui::overlays::onenote_form::OnenoteFormMode::EditBlock {
-                page_key,
-                element_id,
-                ..
-            } => Some(format!("edit:{page_key}:{element_id}")),
-            _ => None,
-        };
-        if let Some(key) = draft_key {
-            if !form.title.trim().is_empty() || !form.body.trim().is_empty() {
-                app.save_draft(key, form.title.clone(), form.body.clone());
-            }
+        if let Some((key, entry)) = form.draft_entry_snapshot() {
+            app.save_draft_entry(key, entry);
         }
     }
     app.html_server.shutdown();

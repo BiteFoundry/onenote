@@ -247,7 +247,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "update_block",
-            "description": "Surgically update a specific block (`block_id`) or replace page title/body on a OneNote page.",
+            "description": "Surgically update a specific block (`block_id`) or replace page title/body on a OneNote page. Pass `expected_content` from a prior `get_page` read to guard against overwriting concurrent remote edits.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -255,7 +255,9 @@ pub fn tool_definitions() -> Vec<Value> {
                     "page": { "type": "string" },
                     "block_id": { "type": "string", "description": "Graph element ID from get_page (e.g. `p:{...}`)" },
                     "title": { "type": "string" },
-                    "markdown": { "type": "string" }
+                    "markdown": { "type": "string" },
+                    "expected_content": { "type": "string", "description": "Baseline block/page content from prior read; aborts with conflict if remote changed" },
+                    "force": { "type": "boolean", "description": "Override conflict check when true" }
                 }
             }
         }),
@@ -268,7 +270,9 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "page": { "type": "string" },
                     "block_id": { "type": "string" },
-                    "todo_index": { "type": "integer", "minimum": 0 }
+                    "todo_index": { "type": "integer", "minimum": 0 },
+                    "expected_content": { "type": "string", "description": "Baseline to-do block content from prior read; aborts with conflict if remote changed" },
+                    "force": { "type": "boolean", "description": "Override conflict check when true" }
                 }
             }
         }),
@@ -424,9 +428,30 @@ async fn dispatch_tool(
                 .get("markdown")
                 .or_else(|| args.get("body"))
                 .and_then(Value::as_str);
-            let updated =
-                cli::update_onenote_page_helper(storage, graph, page, title, markdown, block_id)
-                    .await?;
+            let expected_content = args
+                .get("expected_content")
+                .or_else(|| args.get("base_content"))
+                .and_then(Value::as_str);
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let updated = cli::update_onenote_page_helper_with_guard(
+                storage,
+                graph,
+                page,
+                title,
+                markdown,
+                block_id,
+                expected_content,
+                force,
+            )
+            .await?;
+            cli::nudge_live_daemon(
+                config,
+                graph,
+                crate::sync::SyncCommand::HydratePage {
+                    page_key: updated.summary.page_key.clone(),
+                },
+            )
+            .await;
             Ok(json!({ "ok": true, "page": updated }))
         }
         "toggle_todo" | "onenote_toggle_todo" => {
@@ -437,8 +462,29 @@ async fn dispatch_tool(
                 .or_else(|| args.get("index"))
                 .and_then(Value::as_u64)
                 .map(|v| v as usize);
-            let (updated, target_id, completed) =
-                cli::toggle_onenote_todo_helper(storage, graph, page, block_id, todo_index).await?;
+            let expected_content = args
+                .get("expected_content")
+                .or_else(|| args.get("base_content"))
+                .and_then(Value::as_str);
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let (updated, target_id, completed) = cli::toggle_onenote_todo_helper_with_guard(
+                storage,
+                graph,
+                page,
+                block_id,
+                todo_index,
+                expected_content,
+                force,
+            )
+            .await?;
+            cli::nudge_live_daemon(
+                config,
+                graph,
+                crate::sync::SyncCommand::HydratePage {
+                    page_key: updated.summary.page_key.clone(),
+                },
+            )
+            .await;
             Ok(json!({
                 "ok": true,
                 "page_key": updated.summary.page_key,
@@ -453,7 +499,16 @@ async fn dispatch_tool(
             if !confirm {
                 bail!("Refusing to delete OneNote page without `confirm: true`.");
             }
+            let section_key = resolver::resolve_page_cached(storage, page, None)
+                .map(|s| s.scope.make_entity_key(&s.section_id));
             let deleted = cli::delete_onenote_page_helper(storage, graph, page).await?;
+            let nudge_cmd = match section_key {
+                Some(sec_key) => crate::sync::SyncCommand::RefreshSectionPages {
+                    section_key: sec_key,
+                },
+                None => crate::sync::SyncCommand::RefreshAll,
+            };
+            cli::nudge_live_daemon(config, graph, nudge_cmd).await;
             Ok(json!({ "ok": true, "deleted": deleted }))
         }
         "search_pages" | "onenote_search_pages" => {

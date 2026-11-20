@@ -214,16 +214,19 @@ pub enum Command {
         page: Option<String>,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         body: Option<String>,
         #[arg(long)]
         file: Option<PathBuf>,
         #[arg(long = "block-id")]
         block_id: Option<String>,
+        /// Expected baseline content of the target block/page from your prior read; aborts with conflict if remote changed
+        #[arg(long = "expected-content", visible_alias = "base-content", allow_hyphen_values = true)]
+        expected_content: Option<String>,
         /// Check for a newer `onenote` release on GitHub without installing (self-update mode)
         #[arg(long)]
         check: bool,
-        /// Force reinstall of the latest release (self-update mode)
+        /// Override conflict check on page/block update, or force reinstall in self-update mode
         #[arg(long)]
         force: bool,
         /// Override GitHub `owner/repo` for self-update
@@ -251,6 +254,12 @@ pub enum Command {
         block_id: Option<String>,
         #[arg(long)]
         index: Option<usize>,
+        /// Expected baseline content of the target to-do block from your prior read; aborts with conflict if remote changed
+        #[arg(long = "expected-content", visible_alias = "base-content", allow_hyphen_values = true)]
+        expected_content: Option<String>,
+        /// Override conflict check if the target to-do block changed remotely
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         json: bool,
     },
@@ -510,6 +519,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             body,
             file,
             block_id,
+            expected_content,
             check,
             force,
             repo,
@@ -523,6 +533,8 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
                     body.as_deref(),
                     file.as_deref(),
                     block_id.as_deref(),
+                    expected_content.as_deref(),
+                    force,
                     json,
                 )
                 .await
@@ -540,8 +552,21 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             page,
             block_id,
             index,
+            expected_content,
+            force,
             json,
-        }) => cmd_check(cfg, &page, block_id.as_deref(), index, json).await,
+        }) => {
+            cmd_check(
+                cfg,
+                &page,
+                block_id.as_deref(),
+                index,
+                expected_content.as_deref(),
+                force,
+                json,
+            )
+            .await
+        }
         Some(Command::Delete { page, yes, json }) => cmd_delete(cfg, &page, yes, json).await,
         Some(Command::Search {
             query,
@@ -668,7 +693,7 @@ fn record_sync_cursor(storage: &Storage, scope_key: impl Into<String>, delta_lin
     });
 }
 
-async fn nudge_live_daemon(cfg: &AppConfig, graph: &GraphClient, cmd: sync::SyncCommand) {
+pub(crate) async fn nudge_live_daemon(cfg: &AppConfig, graph: &GraphClient, cmd: sync::SyncCommand) {
     if daemon::is_daemon_alive_fast(cfg, graph.my_user_id()) {
         let _ = daemon::nudge_daemon(cfg, Some(cmd), None).await;
     }
@@ -753,13 +778,15 @@ pub async fn load_onenote_notebooks_with_cache(
         }
     }
 
-    let fetched = graph.list_all_accessible_notebooks(include_teams).await?;
-    storage.upsert_onenote_notebooks(&fetched)?;
+    let nb_res = graph
+        .list_all_accessible_notebooks_scoped(include_teams)
+        .await?;
+    storage.reconcile_onenote_notebooks_for_scopes(&nb_res.notebooks, &nb_res.complete_scopes)?;
     record_sync_cursor(storage, CURSOR_NOTEBOOKS_PERSONAL, None);
     if include_teams {
         record_sync_cursor(storage, CURSOR_NOTEBOOKS_ALL, None);
     }
-    Ok(fetched)
+    Ok(nb_res.notebooks)
 }
 
 pub async fn load_onenote_sections(
@@ -781,7 +808,7 @@ pub async fn load_onenote_sections_with_cache(
     cached: bool,
 ) -> Result<(Option<OnenoteNotebook>, Vec<OnenoteSection>)> {
     let nb = if let Some(q) = notebook_query.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(resolver::resolve_notebook(graph, storage, q, offline).await?)
+        Some(resolver::resolve_notebook_with_refresh(graph, storage, q, offline, refresh).await?)
     } else {
         None
     };
@@ -809,30 +836,57 @@ pub async fn load_onenote_sections_with_cache(
         }
     }
 
-    let fetched = if let Some(ref target_nb) = nb {
-        graph
+    if let Some(ref target_nb) = nb {
+        let fetched = graph
             .list_onenote_sections(&target_nb.scope, Some(&target_nb.id))
-            .await?
+            .await?;
+        storage.reconcile_onenote_notebook_sections(&target_nb.notebook_key, &fetched, true)?;
     } else {
         let mut notebooks = storage.list_onenote_notebooks()?;
+        let mut nb_complete_scopes: Option<std::collections::HashSet<String>> = None;
         if notebooks.is_empty()
             || refresh
             || (!cached
                 && !is_cursor_fresh(storage, CURSOR_NOTEBOOKS_ALL, ttl)
                 && !is_cursor_fresh(storage, CURSOR_HIERARCHY, ttl))
         {
-            notebooks = graph.list_all_accessible_notebooks(true).await?;
-            storage.upsert_onenote_notebooks(&notebooks)?;
+            let nb_res = graph.list_all_accessible_notebooks_scoped(true).await?;
+            notebooks = nb_res.notebooks;
+            nb_complete_scopes = Some(nb_res.complete_scopes);
             record_sync_cursor(storage, CURSOR_NOTEBOOKS_PERSONAL, None);
             record_sync_cursor(storage, CURSOR_NOTEBOOKS_ALL, None);
         }
-        let (groups, sections) = graph.list_all_accessible_sections(&notebooks).await?;
-        if !groups.is_empty() {
-            storage.upsert_onenote_section_groups(&groups)?;
+        let sec_res = graph
+            .list_all_accessible_sections_scoped(&notebooks, nb_complete_scopes.as_ref())
+            .await?;
+        if let Some(nb_scopes) = nb_complete_scopes {
+            let reconciled_scopes: std::collections::HashSet<String> = nb_scopes
+                .intersection(&sec_res.complete_scopes)
+                .cloned()
+                .collect();
+            if !reconciled_scopes.is_empty() {
+                storage.reconcile_onenote_hierarchy_for_scopes(
+                    &notebooks,
+                    &sec_res.section_groups,
+                    &sec_res.sections,
+                    &reconciled_scopes,
+                )?;
+            } else {
+                storage.reconcile_onenote_notebooks_for_scopes(&notebooks, &nb_scopes)?;
+                storage.reconcile_onenote_sections_for_scopes(
+                    &sec_res.section_groups,
+                    &sec_res.sections,
+                    &sec_res.complete_scopes,
+                )?;
+            }
+        } else {
+            storage.reconcile_onenote_sections_for_scopes(
+                &sec_res.section_groups,
+                &sec_res.sections,
+                &sec_res.complete_scopes,
+            )?;
         }
-        sections
-    };
-    storage.upsert_onenote_sections(&fetched)?;
+    }
     record_sync_cursor(storage, scope_key, None);
     Ok((nb, storage.list_onenote_sections(nb_key.as_deref())?))
 }
@@ -843,23 +897,35 @@ pub async fn resolve_onenote_section_query(
     section_query: &str,
     offline: bool,
 ) -> Result<OnenoteSection> {
+    resolve_onenote_section_query_with_refresh(storage, graph, section_query, offline, false).await
+}
+
+pub async fn resolve_onenote_section_query_with_refresh(
+    storage: &Storage,
+    graph: &GraphClient,
+    section_query: &str,
+    offline: bool,
+    force_refresh: bool,
+) -> Result<OnenoteSection> {
     let trimmed = section_query.trim();
     if trimmed.is_empty() {
         bail!("OneNote section name or ID is empty.");
     }
     if let Some((nb_part, sec_part)) = trimmed.split_once('/') {
         if !nb_part.trim().is_empty() && !sec_part.trim().is_empty() && !trimmed.contains('|') {
-            return resolver::resolve_section(
+            return resolver::resolve_section_with_refresh(
                 graph,
                 storage,
                 sec_part.trim(),
                 Some(nb_part.trim()),
                 offline,
+                force_refresh,
             )
             .await;
         }
     }
-    resolver::resolve_section(graph, storage, trimmed, None, offline).await
+    resolver::resolve_section_with_refresh(graph, storage, trimmed, None, offline, force_refresh)
+        .await
 }
 
 pub async fn list_onenote_pages_helper(
@@ -883,7 +949,14 @@ pub async fn list_onenote_pages_with_cache(
     offline: bool,
     cached: bool,
 ) -> Result<(OnenoteSection, Vec<OnenotePageSummary>)> {
-    let sec = resolve_onenote_section_query(storage, graph, section_query, offline).await?;
+    let mut sec = resolve_onenote_section_query_with_refresh(
+        storage,
+        graph,
+        section_query,
+        offline,
+        refresh,
+    )
+    .await?;
     if offline {
         return Ok((
             sec.clone(),
@@ -895,7 +968,7 @@ pub async fn list_onenote_pages_with_cache(
         ));
     }
 
-    let cursor_key = format!("onenote:pages:{}", sec.section_key);
+    let mut cursor_key = format!("onenote:pages:{}", sec.section_key);
     if !refresh {
         let cached_pages = storage.list_onenote_pages(&sec.section_key)?;
         let ttl = graph.config().cli_cache_ttl_secs;
@@ -904,8 +977,28 @@ pub async fn list_onenote_pages_with_cache(
         }
     }
 
-    let fetched = graph.list_onenote_pages(&sec.scope, &sec.id, limit).await?;
-    storage.upsert_onenote_pages(&fetched)?;
+    let fetched = match graph.list_onenote_pages(&sec.scope, &sec.id, limit).await {
+        Ok(pages) => pages,
+        Err(err) if !refresh && crate::graph::onenote::is_not_found_error(&err) => {
+            let refreshed_sec = resolve_onenote_section_query_with_refresh(
+                storage,
+                graph,
+                section_query,
+                false,
+                true,
+            )
+            .await?;
+            if refreshed_sec.section_key == sec.section_key {
+                return Err(err);
+            }
+            sec = refreshed_sec;
+            cursor_key = format!("onenote:pages:{}", sec.section_key);
+            graph.list_onenote_pages(&sec.scope, &sec.id, limit).await?
+        }
+        Err(err) => return Err(err),
+    };
+    let is_complete = fetched.len() < limit;
+    storage.reconcile_onenote_section_pages(&sec.section_key, &fetched, is_complete)?;
     record_sync_cursor(storage, cursor_key, sec.last_modified_at.clone());
     Ok((sec, fetched.into_iter().take(limit).collect()))
 }
@@ -950,10 +1043,23 @@ pub async fn load_onenote_page_detail_with_cache(
         Some(s) => (s.scope.clone(), s.id.clone()),
         None => split_onenote_entity_key(q),
     };
+    let resolved_page_key = cached_summary
+        .as_ref()
+        .map(|s| s.page_key.clone())
+        .unwrap_or_else(|| scope.make_entity_key(&raw_id));
 
-    let detail = graph
+    let detail = match graph
         .get_onenote_page_detail(&scope, &raw_id, cached_summary)
-        .await?;
+        .await
+    {
+        Ok(d) => d,
+        Err(err) => {
+            if crate::graph::onenote::is_not_found_error(&err) {
+                let _ = storage.delete_onenote_page(&resolved_page_key);
+            }
+            return Err(err);
+        }
+    };
     storage.upsert_onenote_page_detail(&detail)?;
     Ok(detail)
 }
@@ -1031,6 +1137,46 @@ pub async fn append_onenote_page_helper(
     Ok(updated)
 }
 
+/// Result of a conflict-guarded OneNote page or block write.
+#[derive(Debug, Clone)]
+pub enum GuardedUpdateResult {
+    Updated(OnenotePageDetail),
+    Conflict {
+        latest: OnenotePageDetail,
+        message: String,
+    },
+}
+
+/// Result of a conflict-guarded OneNote to-do checkbox toggle.
+#[derive(Debug, Clone)]
+pub enum GuardedTodoResult {
+    Updated {
+        detail: OnenotePageDetail,
+        block_id: String,
+        completed: bool,
+    },
+    Conflict {
+        latest: OnenotePageDetail,
+        message: String,
+    },
+}
+
+fn load_cached_detail_for_query(storage: &Storage, page_query: &str) -> Option<OnenotePageDetail> {
+    let q = page_query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    if let Ok(Some(d)) = storage.get_onenote_page_detail(q) {
+        return Some(d);
+    }
+    resolver::resolve_page_cached(storage, q, None)
+        .and_then(|s| storage.get_onenote_page_detail(&s.page_key).ok().flatten())
+}
+
+fn normalize_text_for_compare(input: &str) -> String {
+    input.replace("\r\n", "\n").trim().to_string()
+}
+
 pub async fn update_onenote_page_helper(
     storage: &Storage,
     graph: &GraphClient,
@@ -1039,16 +1185,167 @@ pub async fn update_onenote_page_helper(
     body_markdown: Option<&str>,
     block_id: Option<&str>,
 ) -> Result<OnenotePageDetail> {
+    update_onenote_page_helper_with_guard(
+        storage,
+        graph,
+        page_query,
+        title,
+        body_markdown,
+        block_id,
+        None,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_onenote_page_helper_with_guard(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    title: Option<&str>,
+    body_markdown: Option<&str>,
+    block_id: Option<&str>,
+    expected_content: Option<&str>,
+    force: bool,
+) -> Result<OnenotePageDetail> {
+    match update_onenote_page_guarded(
+        storage,
+        graph,
+        page_query,
+        title,
+        body_markdown,
+        block_id,
+        expected_content,
+        force,
+    )
+    .await?
+    {
+        GuardedUpdateResult::Updated(detail) => Ok(detail),
+        GuardedUpdateResult::Conflict { message, .. } => bail!("{message}"),
+    }
+}
+
+/// Preflight read-compare conflict guard for OneNote page/block updates.
+/// Note: Microsoft Graph v1.0 OneNote `PATCH /onenote/pages/{id}/content` does not provide
+/// a verified atomic server precondition (`If-Match` / `412`), so this performs a live preflight
+/// read and target-block content comparison before sending `PATCH`.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_onenote_page_guarded(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    title: Option<&str>,
+    body_markdown: Option<&str>,
+    block_id: Option<&str>,
+    expected_content: Option<&str>,
+    force: bool,
+) -> Result<GuardedUpdateResult> {
+    let cached_before = load_cached_detail_for_query(storage, page_query);
     let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
     let mut commands = Vec::new();
+    let trimmed_bid = block_id.map(str::trim).filter(|s| !s.is_empty());
+    let trimmed_title = title.map(str::trim).filter(|s| !s.is_empty());
 
-    if let Some(bid) = block_id.map(str::trim).filter(|s| !s.is_empty()) {
+    if !force {
+        if let Some(bid) = trimmed_bid {
+            let live_block = parser::find_block_by_element_id(&detail, bid);
+            if let Some(exp) = expected_content {
+                match live_block {
+                    None => {
+                        return Ok(GuardedUpdateResult::Conflict {
+                            message: format!(
+                                "Conflict: target block '{bid}' no longer exists on remote page '{}'. Remote content preserved.",
+                                detail.summary.title
+                            ),
+                            latest: detail,
+                        });
+                    }
+                    Some(blk) if !parser::block_matches_expected(blk, exp) => {
+                        return Ok(GuardedUpdateResult::Conflict {
+                            message: format!(
+                                "Conflict: target block '{bid}' changed remotely since your baseline read on '{}'. Remote content preserved; re-read or pass --force to overwrite.",
+                                detail.summary.title
+                            ),
+                            latest: detail,
+                        });
+                    }
+                    Some(_) => {}
+                }
+            } else if let Some(cached_blk) = cached_before
+                .as_ref()
+                .and_then(|c| parser::find_block_by_element_id(c, bid))
+            {
+                let unchanged = live_block
+                    .is_some_and(|live_blk| parser::blocks_have_same_content(cached_blk, live_blk));
+                if !unchanged {
+                    return Ok(GuardedUpdateResult::Conflict {
+                        message: format!(
+                            "Conflict: target block '{bid}' changed remotely since your last read on '{}'. Remote content preserved; re-read or pass --force to overwrite.",
+                            detail.summary.title
+                        ),
+                        latest: detail,
+                    });
+                }
+            }
+        } else if body_markdown.is_some() {
+            if let Some(exp) = expected_content {
+                let exp_norm = normalize_text_for_compare(exp);
+                let matches = normalize_text_for_compare(&detail.body_markdown) == exp_norm
+                    || normalize_text_for_compare(&detail.body_plain) == exp_norm
+                    || normalize_text_for_compare(&detail.raw_xhtml) == exp_norm;
+                if !matches {
+                    return Ok(GuardedUpdateResult::Conflict {
+                        message: format!(
+                            "Conflict: page body changed remotely since your baseline read on '{}'. Remote content preserved; re-read or pass --force to overwrite.",
+                            detail.summary.title
+                        ),
+                        latest: detail,
+                    });
+                }
+            } else if let Some(ref cached) = cached_before {
+                if normalize_text_for_compare(&cached.body_markdown)
+                    != normalize_text_for_compare(&detail.body_markdown)
+                {
+                    return Ok(GuardedUpdateResult::Conflict {
+                        message: format!(
+                            "Conflict: page body changed remotely since your last read on '{}'. Remote content preserved; re-read or pass --force to overwrite.",
+                            detail.summary.title
+                        ),
+                        latest: detail,
+                    });
+                }
+            }
+        } else if trimmed_title.is_some() {
+            if let Some(exp) = expected_content {
+                if detail.summary.title.trim() != exp.trim() {
+                    return Ok(GuardedUpdateResult::Conflict {
+                        message: format!(
+                            "Conflict: page title changed remotely since your baseline read ('{}'). Remote content preserved; re-read or pass --force to overwrite.",
+                            detail.summary.title
+                        ),
+                        latest: detail,
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(bid) = trimmed_bid {
         let md = body_markdown
             .ok_or_else(|| anyhow::anyhow!("--body (or markdown) is required when updating a block."))?;
+        if let Some(new_title) = trimmed_title {
+            commands.push(crate::models::OnenotePatchCommand {
+                target: "title".to_string(),
+                action: "replace".to_string(),
+                position: None,
+                content: new_title.to_string(),
+            });
+        }
         commands.push(parser::build_replace_block_patch(bid, md));
     } else if let Some(md) = body_markdown {
-        commands.extend(parser::build_replace_page_body_commands(&detail, title, md));
-    } else if let Some(new_title) = title.map(str::trim).filter(|s| !s.is_empty()) {
+        commands.extend(parser::build_replace_page_body_commands(&detail, trimmed_title, md));
+    } else if let Some(new_title) = trimmed_title {
         commands.push(crate::models::OnenotePatchCommand {
             target: "title".to_string(),
             action: "replace".to_string(),
@@ -1072,7 +1369,7 @@ pub async fn update_onenote_page_helper(
         )
         .await?;
     storage.upsert_onenote_page_detail(&updated)?;
-    Ok(updated)
+    Ok(GuardedUpdateResult::Updated(updated))
 }
 
 pub async fn toggle_onenote_todo_helper(
@@ -1082,35 +1379,120 @@ pub async fn toggle_onenote_todo_helper(
     block_id: Option<&str>,
     todo_index: Option<usize>,
 ) -> Result<(OnenotePageDetail, String, bool)> {
+    toggle_onenote_todo_helper_with_guard(
+        storage,
+        graph,
+        page_query,
+        block_id,
+        todo_index,
+        None,
+        false,
+    )
+    .await
+}
+
+pub async fn toggle_onenote_todo_helper_with_guard(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    block_id: Option<&str>,
+    todo_index: Option<usize>,
+    expected_content: Option<&str>,
+    force: bool,
+) -> Result<(OnenotePageDetail, String, bool)> {
+    match toggle_onenote_todo_guarded(
+        storage,
+        graph,
+        page_query,
+        block_id,
+        todo_index,
+        expected_content,
+        force,
+    )
+    .await?
+    {
+        GuardedTodoResult::Updated {
+            detail,
+            block_id,
+            completed,
+        } => Ok((detail, block_id, completed)),
+        GuardedTodoResult::Conflict { message, .. } => bail!("{message}"),
+    }
+}
+
+pub async fn toggle_onenote_todo_guarded(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    block_id: Option<&str>,
+    todo_index: Option<usize>,
+    expected_content: Option<&str>,
+    force: bool,
+) -> Result<GuardedTodoResult> {
+    let cached_before = load_cached_detail_for_query(storage, page_query);
     let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
-    let target_block: &OnenoteBlock = if let Some(bid) = block_id.map(str::trim).filter(|s| !s.is_empty()) {
-        let clean = bid.trim_start_matches('#');
-        detail
-            .blocks
-            .iter()
-            .find(|b| {
-                b.element_id
-                    .as_deref()
-                    .is_some_and(|eid| eid.trim_start_matches('#') == clean)
-            })
-            .with_context(|| format!("Block '{bid}' not found on page."))?
-    } else {
-        let idx = todo_index.unwrap_or(0);
-        let todos: Vec<&OnenoteBlock> = detail
-            .blocks
-            .iter()
-            .filter(|b| b.tag.as_ref().is_some_and(OnenoteTagKind::is_todo))
-            .collect();
-        if todos.is_empty() {
-            bail!("This page has no OneNote to-do checkbox blocks to toggle.");
+    let target_block: &OnenoteBlock =
+        if let Some(bid) = block_id.map(str::trim).filter(|s| !s.is_empty()) {
+            match parser::find_block_by_element_id(&detail, bid) {
+                Some(blk) => blk,
+                None if expected_content.is_some() && !force => {
+                    return Ok(GuardedTodoResult::Conflict {
+                        message: format!(
+                            "Conflict: to-do block '{bid}' no longer exists on remote page '{}'. Remote content preserved.",
+                            detail.summary.title
+                        ),
+                        latest: detail,
+                    });
+                }
+                None => bail!("Block '{bid}' not found on page."),
+            }
+        } else {
+            let idx = todo_index.unwrap_or(0);
+            let todos: Vec<&OnenoteBlock> = detail
+                .blocks
+                .iter()
+                .filter(|b| b.tag.as_ref().is_some_and(OnenoteTagKind::is_todo))
+                .collect();
+            if todos.is_empty() {
+                bail!("This page has no OneNote to-do checkbox blocks to toggle.");
+            }
+            todos.get(idx).copied().with_context(|| {
+                format!(
+                    "To-do checkbox index {idx} out of range (total {}).",
+                    todos.len()
+                )
+            })?
+        };
+
+    if !force {
+        if let Some(exp) = expected_content {
+            if !parser::block_matches_expected(target_block, exp) {
+                let bid = target_block.element_id.as_deref().unwrap_or("to-do");
+                return Ok(GuardedTodoResult::Conflict {
+                    message: format!(
+                        "Conflict: to-do block '{bid}' changed remotely since your last read on '{}'. Remote content preserved; re-read or pass --force to overwrite.",
+                        detail.summary.title
+                    ),
+                    latest: detail,
+                });
+            }
+        } else if let Some(eid) = target_block.element_id.as_deref() {
+            if let Some(cached_blk) = cached_before
+                .as_ref()
+                .and_then(|c| parser::find_block_by_element_id(c, eid))
+            {
+                if !parser::blocks_have_same_content(cached_blk, target_block) {
+                    return Ok(GuardedTodoResult::Conflict {
+                        message: format!(
+                            "Conflict: to-do block '{eid}' changed remotely since your last read on '{}'. Remote content preserved; re-read or pass --force to overwrite.",
+                            detail.summary.title
+                        ),
+                        latest: detail,
+                    });
+                }
+            }
         }
-        todos.get(idx).copied().with_context(|| {
-            format!(
-                "To-do checkbox index {idx} out of range (total {}).",
-                todos.len()
-            )
-        })?
-    };
+    }
 
     let (cmd, completed) = parser::build_toggle_todo_patch(target_block)
         .context("Selected block is not a OneNote to-do item or lacks an element_id.")?;
@@ -1126,7 +1508,11 @@ pub async fn toggle_onenote_todo_helper(
         )
         .await?;
     storage.upsert_onenote_page_detail(&updated)?;
-    Ok((updated, target_id, completed))
+    Ok(GuardedTodoResult::Updated {
+        detail: updated,
+        block_id: target_id,
+        completed,
+    })
 }
 
 pub async fn delete_onenote_page_helper(
@@ -1727,6 +2113,19 @@ async fn cmd_append(
         },
     )
     .await;
+    if !updated.summary.section_id.trim().is_empty() {
+        nudge_live_daemon(
+            cfg,
+            &graph,
+            sync::SyncCommand::RefreshSectionPages {
+                section_key: updated
+                    .summary
+                    .scope
+                    .make_entity_key(&updated.summary.section_id),
+            },
+        )
+        .await;
+    }
     if json_out {
         println!(
             "{}",
@@ -1738,6 +2137,7 @@ async fn cmd_append(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_update_page(
     cfg: &AppConfig,
     page: &str,
@@ -1745,6 +2145,8 @@ async fn cmd_update_page(
     body: Option<&str>,
     file: Option<&Path>,
     block_id: Option<&str>,
+    expected_content: Option<&str>,
+    force: bool,
     json_out: bool,
 ) -> Result<()> {
     let loaded_body = match (body, file) {
@@ -1756,13 +2158,15 @@ async fn cmd_update_page(
         (None, None) => None,
     };
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let updated = update_onenote_page_helper(
+    let updated = update_onenote_page_helper_with_guard(
         &storage,
         &graph,
         page,
         title,
         loaded_body.as_deref(),
         block_id,
+        expected_content,
+        force,
     )
     .await?;
     nudge_live_daemon(
@@ -1773,6 +2177,19 @@ async fn cmd_update_page(
         },
     )
     .await;
+    if !updated.summary.section_id.trim().is_empty() {
+        nudge_live_daemon(
+            cfg,
+            &graph,
+            sync::SyncCommand::RefreshSectionPages {
+                section_key: updated
+                    .summary
+                    .scope
+                    .make_entity_key(&updated.summary.section_id),
+            },
+        )
+        .await;
+    }
     if json_out {
         println!(
             "{}",
@@ -1789,11 +2206,21 @@ async fn cmd_check(
     page: &str,
     block_id: Option<&str>,
     index: Option<usize>,
+    expected_content: Option<&str>,
+    force: bool,
     json_out: bool,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let (updated, target_id, completed) =
-        toggle_onenote_todo_helper(&storage, &graph, page, block_id, index).await?;
+    let (updated, target_id, completed) = toggle_onenote_todo_helper_with_guard(
+        &storage,
+        &graph,
+        page,
+        block_id,
+        index,
+        expected_content,
+        force,
+    )
+    .await?;
     nudge_live_daemon(
         cfg,
         &graph,
@@ -1802,6 +2229,19 @@ async fn cmd_check(
         },
     )
     .await;
+    if !updated.summary.section_id.trim().is_empty() {
+        nudge_live_daemon(
+            cfg,
+            &graph,
+            sync::SyncCommand::RefreshSectionPages {
+                section_key: updated
+                    .summary
+                    .scope
+                    .make_entity_key(&updated.summary.section_id),
+            },
+        )
+        .await;
+    }
     if json_out {
         println!(
             "{}",

@@ -243,6 +243,57 @@ impl Storage {
         )
     }
 
+    pub fn reconcile_onenote_hierarchy_for_scopes(
+        &self,
+        notebooks: &[OnenoteNotebook],
+        section_groups: &[OnenoteSectionGroup],
+        sections: &[OnenoteSection],
+        complete_scopes: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::reconcile_onenote_hierarchy_for_scopes(
+            &mut conn,
+            notebooks,
+            section_groups,
+            sections,
+            complete_scopes,
+        )
+    }
+
+    pub fn reconcile_onenote_notebooks_for_scopes(
+        &self,
+        notebooks: &[OnenoteNotebook],
+        complete_scopes: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::reconcile_onenote_notebooks_for_scopes(&mut conn, notebooks, complete_scopes)
+    }
+
+    pub fn reconcile_onenote_sections_for_scopes(
+        &self,
+        section_groups: &[OnenoteSectionGroup],
+        sections: &[OnenoteSection],
+        complete_scopes: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::reconcile_onenote_sections_for_scopes(
+            &mut conn,
+            section_groups,
+            sections,
+            complete_scopes,
+        )
+    }
+
+    pub fn reconcile_onenote_notebook_sections(
+        &self,
+        notebook_key: &str,
+        sections: &[OnenoteSection],
+        is_complete: bool,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::reconcile_onenote_notebook_sections(&mut conn, notebook_key, sections, is_complete)
+    }
+
     pub fn reconcile_onenote_section_pages(
         &self,
         section_key: &str,
@@ -256,6 +307,30 @@ impl Storage {
             pages,
             is_complete_section_list,
         )
+    }
+
+    pub fn reconcile_onenote_section_pages_returning_invalidated(
+        &self,
+        section_key: &str,
+        pages: &[OnenotePageSummary],
+        is_complete_section_list: bool,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.lock_conn()?;
+        onenote::reconcile_onenote_section_pages_returning_invalidated(
+            &mut conn,
+            section_key,
+            pages,
+            is_complete_section_list,
+        )
+    }
+
+    pub fn prune_onenote_section_pages(
+        &self,
+        section_key: &str,
+        pages: &[OnenotePageSummary],
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::prune_onenote_section_pages(&mut conn, section_key, pages)
     }
 
     pub fn list_onenote_pages(&self, section_key: &str) -> Result<Vec<OnenotePageSummary>> {

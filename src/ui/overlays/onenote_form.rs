@@ -48,6 +48,7 @@ pub enum OnenoteFormMode {
         page_title: String,
         element_id: String,
         block_index: usize,
+        base_content: String,
     },
 }
 
@@ -139,6 +140,7 @@ impl OnenoteFormOverlay {
                 page_title,
                 element_id,
                 block_index,
+                base_content: initial_markdown.clone(),
             },
             title: String::new(),
             body: initial_markdown,
@@ -147,6 +149,23 @@ impl OnenoteFormOverlay {
             field: 0,
             button_idx: 0,
             error: None,
+        }
+    }
+
+    pub fn canonical_draft_key(&self) -> Option<String> {
+        match &self.mode {
+            OnenoteFormMode::CreatePage { section_key, .. } => {
+                Some(format!("create:{section_key}"))
+            }
+            OnenoteFormMode::AppendMarkdown { page_key, .. } => {
+                Some(format!("append:{page_key}"))
+            }
+            OnenoteFormMode::EditBlock {
+                page_key,
+                element_id,
+                ..
+            } => Some(format!("edit:{page_key}:{element_id}")),
+            _ => None,
         }
     }
 
@@ -215,23 +234,54 @@ impl OnenoteFormOverlay {
 
     /// Returns `(draft_key, title, body)` when the form holds unsent draft content worth persisting.
     pub fn draft_snapshot(&self) -> Option<(String, String, String)> {
+        self.draft_entry_snapshot()
+            .map(|(k, entry)| (k, entry.title, entry.body))
+    }
+
+    /// Returns `(draft_key, NoteDraftEntry)` using canonical keys across Esc-stash, quit, and conflict recovery.
+    pub fn draft_entry_snapshot(&self) -> Option<(String, crate::config::NoteDraftEntry)> {
+        let key = self.canonical_draft_key()?;
         match &self.mode {
-            OnenoteFormMode::CreatePage { section_key, .. } => {
+            OnenoteFormMode::CreatePage { .. } => {
                 if self.title.trim().is_empty() && self.body.trim().is_empty() {
                     None
                 } else {
                     Some((
-                        format!("create:{section_key}"),
-                        self.title.clone(),
-                        self.body.clone(),
+                        key,
+                        crate::config::NoteDraftEntry {
+                            title: self.title.clone(),
+                            body: self.body.clone(),
+                            base_content: None,
+                        },
                     ))
                 }
             }
-            OnenoteFormMode::AppendMarkdown { page_key, .. } => {
+            OnenoteFormMode::AppendMarkdown { .. } => {
                 if self.body.trim().is_empty() {
                     None
                 } else {
-                    Some((format!("append:{page_key}"), String::new(), self.body.clone()))
+                    Some((
+                        key,
+                        crate::config::NoteDraftEntry {
+                            title: String::new(),
+                            body: self.body.clone(),
+                            base_content: None,
+                        },
+                    ))
+                }
+            }
+            OnenoteFormMode::EditBlock { base_content, .. } => {
+                if self.body.trim().is_empty() || self.body == *base_content {
+                    None
+                } else {
+                    Some((
+                        key,
+                        crate::config::NoteDraftEntry {
+                            title: String::new(),
+                            body: self.body.clone(),
+                            base_content: Some(base_content.clone()),
+                        },
+                    ))
                 }
             }
             _ => None,
@@ -352,6 +402,7 @@ impl OnenoteFormOverlay {
             OnenoteFormMode::EditBlock {
                 page_key,
                 element_id,
+                base_content,
                 ..
             } => {
                 if self.body.trim().is_empty() {
@@ -363,6 +414,7 @@ impl OnenoteFormOverlay {
                     page_key: page_key.clone(),
                     element_id: element_id.clone(),
                     markdown: self.body.clone(),
+                    base_content: base_content.clone(),
                 })
             }
         }
@@ -854,6 +906,7 @@ mod tests {
                 page_key: "me|page-1".to_string(),
                 element_id: "p:{123}{40}".to_string(),
                 markdown: "- [ ] Updated task".to_string(),
+                base_content: "- [ ] Previous task".to_string(),
             })
         );
     }

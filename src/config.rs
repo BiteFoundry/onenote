@@ -562,6 +562,8 @@ fn replace_existing_with_backup(
 pub struct NoteDraftEntry {
     pub title: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_content: Option<String>,
 }
 
 impl NoteDraftEntry {
@@ -915,6 +917,7 @@ mod tests {
             NoteDraftEntry {
                 title: "Sprint Notes".to_string(),
                 body: "# Agenda\n- [ ] Ship v0.1.0".to_string(),
+                base_content: None,
             },
         );
         store.set_text("quick", "Note");

@@ -60,6 +60,13 @@ impl ApiError {
         }
     }
 
+    fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: msg.into(),
+        }
+    }
+
     fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -81,7 +88,9 @@ impl IntoResponse for ApiError {
 fn onenote_api_error(err: anyhow::Error) -> ApiError {
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("not found") || lower.contains("404") {
+    if lower.contains("conflict:") || lower.contains("conflict") {
+        ApiError::conflict(msg)
+    } else if lower.contains("not found") || lower.contains("404") {
         ApiError::not_found(msg)
     } else if lower.contains("empty")
         || lower.contains("ambiguous")
@@ -173,6 +182,10 @@ pub struct PatchPageBody {
     pub markdown: Option<String>,
     #[serde(default)]
     pub block_id: Option<String>,
+    #[serde(default, alias = "base_content")]
+    pub expected_content: Option<String>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +202,10 @@ pub struct ToggleTodoBody {
     pub block_id: Option<String>,
     #[serde(default)]
     pub index: Option<usize>,
+    #[serde(default, alias = "base_content")]
+    pub expected_content: Option<String>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -480,16 +497,39 @@ async fn patch_page(
     AxumPath(page_key): AxumPath<String>,
     Json(body): Json<PatchPageBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let updated = cli::update_onenote_page_helper(
+    let updated = cli::update_onenote_page_helper_with_guard(
         &state.storage,
         &state.graph,
         &page_key,
         body.title.as_deref(),
         body.markdown.as_deref(),
         body.block_id.as_deref(),
+        body.expected_content.as_deref(),
+        body.force,
     )
     .await
     .map_err(onenote_api_error)?;
+    cli::nudge_live_daemon(
+        &state.config,
+        &state.graph,
+        crate::sync::SyncCommand::HydratePage {
+            page_key: updated.summary.page_key.clone(),
+        },
+    )
+    .await;
+    if !updated.summary.section_id.trim().is_empty() {
+        cli::nudge_live_daemon(
+            &state.config,
+            &state.graph,
+            crate::sync::SyncCommand::RefreshSectionPages {
+                section_key: updated
+                    .summary
+                    .scope
+                    .make_entity_key(&updated.summary.section_id),
+            },
+        )
+        .await;
+    }
     Ok(Json(json!({ "ok": true, "page": updated })))
 }
 
@@ -497,9 +537,18 @@ async fn delete_page(
     State(state): State<Arc<AppState>>,
     AxumPath(page_key): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
+    let section_key = resolver::resolve_page_cached(&state.storage, &page_key, None)
+        .map(|s| s.scope.make_entity_key(&s.section_id));
     let deleted = cli::delete_onenote_page_helper(&state.storage, &state.graph, &page_key)
         .await
         .map_err(onenote_api_error)?;
+    let nudge_cmd = match section_key {
+        Some(sec_key) => crate::sync::SyncCommand::RefreshSectionPages {
+            section_key: sec_key,
+        },
+        None => crate::sync::SyncCommand::RefreshAll,
+    };
+    cli::nudge_live_daemon(&state.config, &state.graph, nudge_cmd).await;
     Ok(Json(json!({ "ok": true, "deleted": deleted })))
 }
 
@@ -519,6 +568,14 @@ async fn append_page(
     )
     .await
     .map_err(onenote_api_error)?;
+    cli::nudge_live_daemon(
+        &state.config,
+        &state.graph,
+        crate::sync::SyncCommand::HydratePage {
+            page_key: updated.summary.page_key.clone(),
+        },
+    )
+    .await;
     Ok(Json(json!({ "ok": true, "page": updated })))
 }
 
@@ -527,15 +584,25 @@ async fn toggle_todo(
     AxumPath(page_key): AxumPath<String>,
     Json(body): Json<ToggleTodoBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let (updated, block_id, completed) = cli::toggle_onenote_todo_helper(
+    let (updated, block_id, completed) = cli::toggle_onenote_todo_helper_with_guard(
         &state.storage,
         &state.graph,
         &page_key,
         body.block_id.as_deref(),
         body.index,
+        body.expected_content.as_deref(),
+        body.force,
     )
     .await
     .map_err(onenote_api_error)?;
+    cli::nudge_live_daemon(
+        &state.config,
+        &state.graph,
+        crate::sync::SyncCommand::HydratePage {
+            page_key: updated.summary.page_key.clone(),
+        },
+    )
+    .await;
     Ok(Json(json!({
         "ok": true,
         "page_key": updated.summary.page_key,

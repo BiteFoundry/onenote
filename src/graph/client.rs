@@ -19,6 +19,53 @@ const MAX_RETRY_AFTER_SECS: u64 = 30;
 const STANDARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MEDIA_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Typed HTTP error returned by `GraphClient` so callers can inspect the authoritative
+/// HTTP status code without matching substrings inside freeform error bodies.
+#[derive(Debug, Clone)]
+pub struct GraphApiError {
+    pub status: StatusCode,
+    pub method: String,
+    pub url: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for GraphApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}{} {}): {}",
+            crate::graph::GRAPH_API_ERROR_PREFIX,
+            self.method,
+            self.url,
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for GraphApiError {}
+
+/// Extracts the authoritative HTTP status code from a `GraphClient` error.
+/// Prefers the typed `GraphApiError` in the error chain, and falls back strictly to the
+/// leading 3-digit status code token emitted by `format_graph_error` after `GRAPH_API_ERROR_PREFIX ... "): "`.
+/// Never scans freeform response body text.
+pub fn graph_http_status(err: &anyhow::Error) -> Option<u16> {
+    if let Some(typed) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<GraphApiError>())
+    {
+        return Some(typed.status.as_u16());
+    }
+    let full = err.to_string();
+    let rest = full.strip_prefix(crate::graph::GRAPH_API_ERROR_PREFIX)?;
+    let (_, detail) = rest.split_once("): ")?;
+    let token = detail.split_whitespace().next()?;
+    if token.len() == 3 && token.bytes().all(|b| b.is_ascii_digit()) {
+        token.parse::<u16>().ok()
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchSubRequest {
     pub id: String,
@@ -736,7 +783,12 @@ impl GraphClient {
             if !status.is_success() {
                 let err_body = resp.text().await.unwrap_or_default();
                 let detail = format_graph_error(status, &err_body);
-                bail!("{}{method} {url}): {detail}", crate::graph::GRAPH_API_ERROR_PREFIX);
+                return Err(anyhow::Error::new(GraphApiError {
+                    status,
+                    method: method.to_string(),
+                    url: url.to_string(),
+                    detail,
+                }));
             }
 
             return Ok(resp);
