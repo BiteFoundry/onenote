@@ -191,6 +191,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             false
         }
         Action::RefreshAll => {
+            app.syncing = true;
+            app.sync_summary = "Syncing OneNote...".to_string();
+            app.push_focus_to_sync();
             app.sync_ctrl.request(SyncCommand::RefreshAll);
             ui.info("Refreshing OneNote notebooks, sections, and pages...");
             false

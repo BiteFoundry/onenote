@@ -514,6 +514,9 @@ fn spawn_sync_supervisor(
             if initial_focus != FocusTarget::default() {
                 conn.sync_ctrl.set_focus(initial_focus);
             }
+            if !conn.status.sync_busy {
+                conn.sync_ctrl.request(SyncCommand::RefreshAll);
+            }
 
             loop {
                 tokio::select! {

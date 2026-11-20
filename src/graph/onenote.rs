@@ -1,6 +1,6 @@
 //! Microsoft Graph v1.0 OneNote operations across `/me/onenote`, `/groups/{id}/onenote`, and `/sites/{id}/onenote`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{bail, Result};
 use futures::future::join_all;
@@ -18,6 +18,7 @@ use crate::models::{
 
 const MAX_JOINED_TEAMS_FOR_ONENOTE: usize = 25;
 const ONENOTE_SCOPE_CONCURRENCY: usize = 6;
+const MAX_SECTION_GROUP_TRAVERSAL: usize = 256;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct GraphOnenoteLink {
@@ -346,8 +347,128 @@ fn clean_raw_onenote_id(id_or_composite: &str) -> String {
 }
 
 fn is_pagelevel_bad_request(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("400") || msg.contains("pagelevel")
+    let full = err.to_string();
+    let detail = full
+        .split_once("): ")
+        .map(|(_, d)| d)
+        .unwrap_or(full.as_str())
+        .to_ascii_lowercase();
+    if !detail.contains("400") || detail.contains("10008") {
+        return false;
+    }
+    detail.contains("pagelevel")
+        || detail.contains("20152")
+        || detail.contains("unsupported query parameter")
+        || detail.contains("query parameter is not supported")
+}
+
+fn is_unauthorized_error(err: &anyhow::Error) -> bool {
+    let full = err.to_string();
+    let detail = full
+        .split_once("): ")
+        .map(|(_, d)| d)
+        .unwrap_or(full.as_str())
+        .to_ascii_lowercase();
+    detail.contains("401")
+        || detail.contains("unauthorized")
+        || detail.contains("invalidauthenticationtoken")
+}
+
+fn backfill_section_hierarchy(
+    notebooks: &[OnenoteNotebook],
+    all_groups: &mut [OnenoteSectionGroup],
+    all_sections: &mut [OnenoteSection],
+) {
+    let mut nb_name_by_scoped_id: HashMap<(String, String), String> = HashMap::new();
+    let mut nb_name_by_id: HashMap<String, String> = HashMap::new();
+    for nb in notebooks {
+        nb_name_by_scoped_id.insert(
+            (nb.scope.scope_key(), nb.id.clone()),
+            nb.display_name.clone(),
+        );
+        nb_name_by_id
+            .entry(nb.id.clone())
+            .or_insert_with(|| nb.display_name.clone());
+    }
+
+    let mut sg_info: HashMap<(String, String), (Option<String>, Option<String>, String)> =
+        HashMap::new();
+    for sg in all_groups.iter() {
+        sg_info.insert(
+            (sg.scope.scope_key(), sg.id.clone()),
+            (
+                sg.notebook_id.clone(),
+                sg.parent_section_group_id.clone(),
+                sg.display_name.clone(),
+            ),
+        );
+    }
+
+    let resolve_sg_notebook_id = |scope_key: &str,
+                                  start_sg_id: &str,
+                                  info: &HashMap<
+        (String, String),
+        (Option<String>, Option<String>, String),
+    >|
+     -> Option<String> {
+        let mut current = start_sg_id.to_string();
+        let mut visited = HashSet::new();
+        for _ in 0..32 {
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            let Some((nb_id, parent_sg_id, _)) = info.get(&(scope_key.to_string(), current)) else {
+                break;
+            };
+            if let Some(nb) = nb_id {
+                return Some(nb.clone());
+            }
+            match parent_sg_id {
+                Some(parent) => current = parent.clone(),
+                None => break,
+            }
+        }
+        None
+    };
+
+    for sg in all_groups.iter_mut() {
+        if sg.notebook_id.is_none() {
+            if let Some(ref parent_sg_id) = sg.parent_section_group_id {
+                if let Some(nb_id) =
+                    resolve_sg_notebook_id(&sg.scope.scope_key(), parent_sg_id, &sg_info)
+                {
+                    sg.notebook_id = Some(nb_id.clone());
+                    if let Some(entry) = sg_info.get_mut(&(sg.scope.scope_key(), sg.id.clone())) {
+                        entry.0 = Some(nb_id);
+                    }
+                }
+            }
+        }
+    }
+
+    for sec in all_sections.iter_mut() {
+        let sk = sec.scope.scope_key();
+        if sec.notebook_id.is_none() {
+            if let Some(ref sg_id) = sec.parent_section_group_id {
+                sec.notebook_id = resolve_sg_notebook_id(&sk, sg_id, &sg_info);
+            }
+        }
+        if sec.notebook_name.is_none() {
+            if let Some(ref nb_id) = sec.notebook_id {
+                sec.notebook_name = nb_name_by_scoped_id
+                    .get(&(sk.clone(), nb_id.clone()))
+                    .or_else(|| nb_name_by_id.get(nb_id))
+                    .cloned();
+            }
+        }
+        if sec.parent_section_group_name.is_none() {
+            if let Some(ref sg_id) = sec.parent_section_group_id {
+                sec.parent_section_group_name = sg_info
+                    .get(&(sk, sg_id.clone()))
+                    .map(|(_, _, name)| name.clone());
+            }
+        }
+    }
 }
 
 fn notebook_richness(nb: &OnenoteNotebook) -> usize {
@@ -470,6 +591,20 @@ impl GraphClient {
         Ok(notebooks)
     }
 
+    async fn should_query_joined_teams(&self) -> bool {
+        let Some(tok) = self.auth.current_tokens().await else {
+            return true;
+        };
+        if crate::auth::is_consumer_msa_token(&tok) {
+            return false;
+        }
+        let diag = crate::auth::diagnose_access_token_scopes(&tok.access_token);
+        if diag.has_scope_claims && !diag.can_read_groups {
+            return false;
+        }
+        true
+    }
+
     pub async fn list_all_accessible_notebooks(
         &self,
         include_teams: bool,
@@ -501,30 +636,34 @@ impl GraphClient {
             }
         }
 
-        if let Ok(teams) = self
-            .list_joined_teams_lite(MAX_JOINED_TEAMS_FOR_ONENOTE)
-            .await
-        {
-            let scopes: Vec<OnenoteScope> = teams
-                .into_iter()
-                .map(|(group_id, group_name)| OnenoteScope::Group {
-                    group_id,
-                    group_name: Some(group_name),
-                })
-                .collect();
+        if self.should_query_joined_teams().await {
+            if let Ok(teams) = self
+                .list_joined_teams_lite(MAX_JOINED_TEAMS_FOR_ONENOTE)
+                .await
+            {
+                let scopes: Vec<OnenoteScope> = teams
+                    .into_iter()
+                    .map(|(group_id, group_name)| OnenoteScope::Group {
+                        group_id,
+                        group_name: Some(group_name),
+                    })
+                    .collect();
 
-            for chunk in scopes.chunks(ONENOTE_SCOPE_CONCURRENCY) {
-                let futs = chunk.iter().map(|s| self.list_onenote_notebooks(s));
-                let results = join_all(futs).await;
-                for res in results {
-                    if let Ok(group_nbs) = res {
-                        any_succeeded = true;
-                        for nb in group_nbs {
-                            if let Some(&pos) = index_by_id.get(&nb.id) {
-                                merge_duplicate_notebook(&mut merged[pos], nb);
-                            } else {
-                                index_by_id.insert(nb.id.clone(), merged.len());
-                                merged.push(nb);
+                for chunk in scopes.chunks(ONENOTE_SCOPE_CONCURRENCY) {
+                    let futs = chunk.iter().map(|s| self.list_onenote_notebooks(s));
+                    let results = join_all(futs).await;
+                    for res in results {
+                        if let Ok(group_nbs) = res {
+                            if !group_nbs.is_empty() {
+                                any_succeeded = true;
+                            }
+                            for nb in group_nbs {
+                                if let Some(&pos) = index_by_id.get(&nb.id) {
+                                    merge_duplicate_notebook(&mut merged[pos], nb);
+                                } else {
+                                    index_by_id.insert(nb.id.clone(), merged.len());
+                                    merged.push(nb);
+                                }
                             }
                         }
                     }
@@ -532,7 +671,7 @@ impl GraphClient {
             }
         }
 
-        if !any_succeeded {
+        if (!any_succeeded || merged.is_empty()) && me_err.is_some() {
             if let Some(err) = me_err {
                 return Err(err);
             }
@@ -588,7 +727,7 @@ impl GraphClient {
         Ok(groups)
     }
 
-    pub async fn list_onenote_sections(
+    async fn list_onenote_sections_direct(
         &self,
         scope: &OnenoteScope,
         notebook_id: Option<&str>,
@@ -619,18 +758,219 @@ impl GraphClient {
         Ok(sections)
     }
 
+    async fn list_section_group_sections(
+        &self,
+        scope: &OnenoteScope,
+        section_group_id: &str,
+        fallback_notebook_id: Option<&str>,
+    ) -> Result<Vec<OnenoteSection>> {
+        let sg_clean = clean_raw_onenote_id(section_group_id);
+        if sg_clean.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base = scope.graph_base_path();
+        let mut next_url = Some(format!(
+            "{base}/sectionGroups/{}/sections?$top=100",
+            urlencoding::encode(&sg_clean)
+        ));
+
+        let mut sections = Vec::new();
+        while let Some(url) = next_url {
+            let page: GraphListPage<GraphOnenoteSection> = self.get_json(&url).await?;
+            for raw in page.value {
+                if !raw.id.trim().is_empty() {
+                    let mut sec = raw.into_section(scope, fallback_notebook_id);
+                    if sec.parent_section_group_id.is_none() {
+                        sec.parent_section_group_id = Some(sg_clean.clone());
+                    }
+                    sections.push(sec);
+                }
+            }
+            next_url = page.next_link;
+        }
+
+        Ok(sections)
+    }
+
+    async fn list_child_section_groups(
+        &self,
+        scope: &OnenoteScope,
+        section_group_id: &str,
+        fallback_notebook_id: Option<&str>,
+    ) -> Result<Vec<OnenoteSectionGroup>> {
+        let sg_clean = clean_raw_onenote_id(section_group_id);
+        if sg_clean.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base = scope.graph_base_path();
+        let mut next_url = Some(format!(
+            "{base}/sectionGroups/{}/sectionGroups?$top=100",
+            urlencoding::encode(&sg_clean)
+        ));
+
+        let mut groups = Vec::new();
+        while let Some(url) = next_url {
+            let page: GraphListPage<GraphOnenoteSectionGroup> = self.get_json(&url).await?;
+            for raw in page.value {
+                if !raw.id.trim().is_empty() {
+                    let mut sg = raw.into_section_group(scope, fallback_notebook_id);
+                    if sg.parent_section_group_id.is_none() {
+                        sg.parent_section_group_id = Some(sg_clean.clone());
+                    }
+                    groups.push(sg);
+                }
+            }
+            next_url = page.next_link;
+        }
+
+        Ok(groups)
+    }
+
+    async fn traverse_section_groups(
+        &self,
+        scope: &OnenoteScope,
+        initial_groups: Vec<OnenoteSectionGroup>,
+        fallback_notebook_id: Option<&str>,
+        visited_sg_ids: &mut HashSet<String>,
+    ) -> (Vec<OnenoteSectionGroup>, Vec<OnenoteSection>) {
+        let mut queue: VecDeque<OnenoteSectionGroup> = VecDeque::new();
+        let mut collected_groups: Vec<OnenoteSectionGroup> = Vec::new();
+        let mut collected_sections: Vec<OnenoteSection> = Vec::new();
+        let mut seen_sections: HashSet<String> = HashSet::new();
+
+        for g in initial_groups {
+            if visited_sg_ids.len() >= MAX_SECTION_GROUP_TRAVERSAL {
+                break;
+            }
+            if visited_sg_ids.insert(g.id.clone()) {
+                collected_groups.push(g.clone());
+                queue.push_back(g);
+            }
+        }
+
+        while let Some(sg) = queue.pop_front() {
+            let eff_nb_id = sg.notebook_id.as_deref().or(fallback_notebook_id);
+            let (secs_res, child_groups_res) = tokio::join!(
+                self.list_section_group_sections(scope, &sg.id, eff_nb_id),
+                self.list_child_section_groups(scope, &sg.id, eff_nb_id)
+            );
+
+            if let Ok(secs) = secs_res {
+                for mut sec in secs {
+                    if sec.parent_section_group_name.is_none() {
+                        sec.parent_section_group_name = Some(sg.display_name.clone());
+                    }
+                    if seen_sections.insert(sec.section_key.clone()) {
+                        collected_sections.push(sec);
+                    }
+                }
+            }
+
+            if let Ok(children) = child_groups_res {
+                for child in children {
+                    if visited_sg_ids.len() >= MAX_SECTION_GROUP_TRAVERSAL {
+                        break;
+                    }
+                    if visited_sg_ids.insert(child.id.clone()) {
+                        collected_groups.push(child.clone());
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+
+        (collected_groups, collected_sections)
+    }
+
+    async fn collect_notebook_section_groups_and_sections(
+        &self,
+        scope: &OnenoteScope,
+        nb_id: &str,
+        visited_sg_ids: &mut HashSet<String>,
+    ) -> Result<(Vec<OnenoteSectionGroup>, Vec<OnenoteSection>)> {
+        let (direct_secs_res, direct_groups_res) = tokio::join!(
+            self.list_onenote_sections_direct(scope, Some(nb_id)),
+            self.list_onenote_section_groups(scope, Some(nb_id))
+        );
+
+        let mut sections: Vec<OnenoteSection> = Vec::new();
+        let mut seen_sections: HashSet<String> = HashSet::new();
+        let mut direct_err = None;
+
+        match direct_secs_res {
+            Ok(direct_secs) => {
+                for sec in direct_secs {
+                    if seen_sections.insert(sec.section_key.clone()) {
+                        sections.push(sec);
+                    }
+                }
+            }
+            Err(err) => {
+                direct_err = Some(err);
+            }
+        }
+
+        let (groups, grouped_secs) = match direct_groups_res {
+            Ok(top_groups) => {
+                self.traverse_section_groups(scope, top_groups, Some(nb_id), visited_sg_ids)
+                    .await
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+
+        for sec in grouped_secs {
+            if seen_sections.insert(sec.section_key.clone()) {
+                sections.push(sec);
+            }
+        }
+
+        if let Some(err) = direct_err {
+            if sections.is_empty() {
+                return Err(err);
+            }
+        }
+
+        Ok((groups, sections))
+    }
+
+    pub async fn list_onenote_sections(
+        &self,
+        scope: &OnenoteScope,
+        notebook_id: Option<&str>,
+    ) -> Result<Vec<OnenoteSection>> {
+        let nb_clean = notebook_id
+            .map(clean_raw_onenote_id)
+            .filter(|s| !s.is_empty());
+        match nb_clean.as_deref() {
+            Some(nb_id) => {
+                let mut visited = HashSet::new();
+                let (mut groups, mut sections) = self
+                    .collect_notebook_section_groups_and_sections(scope, nb_id, &mut visited)
+                    .await?;
+                backfill_section_hierarchy(&[], &mut groups, &mut sections);
+                Ok(sections)
+            }
+            None => self.list_onenote_sections_direct(scope, None).await,
+        }
+    }
+
     pub async fn list_all_accessible_sections(
         &self,
         notebooks: &[OnenoteNotebook],
     ) -> Result<(Vec<OnenoteSectionGroup>, Vec<OnenoteSection>)> {
         let mut unique_scopes: Vec<OnenoteScope> = Vec::new();
         let mut scope_pos_by_key: HashMap<String, usize> = HashMap::new();
+        let mut notebooks_by_scope: HashMap<String, Vec<OnenoteNotebook>> = HashMap::new();
 
         if notebooks.is_empty() {
             unique_scopes.push(OnenoteScope::Me);
         } else {
             for nb in notebooks {
                 let sk = nb.scope.scope_key();
+                notebooks_by_scope
+                    .entry(sk.clone())
+                    .or_default()
+                    .push(nb.clone());
                 if let Some(&pos) = scope_pos_by_key.get(&sk) {
                     let replace = matches!(
                         (&unique_scopes[pos], &nb.scope),
@@ -664,75 +1004,177 @@ impl GraphClient {
             }
         }
 
-        let mut nb_name_by_scoped_id: HashMap<(String, String), String> = HashMap::new();
-        let mut nb_name_by_id: HashMap<String, String> = HashMap::new();
-        for nb in notebooks {
-            nb_name_by_scoped_id.insert(
-                (nb.scope.scope_key(), nb.id.clone()),
-                nb.display_name.clone(),
-            );
-            nb_name_by_id
-                .entry(nb.id.clone())
-                .or_insert_with(|| nb.display_name.clone());
-        }
-
         let mut all_groups: Vec<OnenoteSectionGroup> = Vec::new();
         let mut seen_groups: HashMap<String, usize> = HashMap::new();
         let mut all_sections: Vec<OnenoteSection> = Vec::new();
         let mut seen_sections: HashMap<String, usize> = HashMap::new();
+        let mut any_scope_succeeded = false;
+        let mut me_err: Option<anyhow::Error> = None;
+        let mut first_err: Option<anyhow::Error> = None;
 
         for chunk in unique_scopes.chunks(ONENOTE_SCOPE_CONCURRENCY) {
-            let futs = chunk.iter().map(|scope| async move {
-                let (groups_res, secs_res) = tokio::join!(
-                    self.list_onenote_section_groups(scope, None),
-                    self.list_onenote_sections(scope, None)
-                );
-                (groups_res, secs_res)
+            let futs = chunk.iter().map(|scope| {
+                let scope_nbs = notebooks_by_scope
+                    .get(&scope.scope_key())
+                    .cloned()
+                    .unwrap_or_default();
+                async move {
+                    let (groups_res, secs_res) = tokio::join!(
+                        self.list_onenote_section_groups(scope, None),
+                        self.list_onenote_sections_direct(scope, None)
+                    );
+                    (scope.clone(), scope_nbs, groups_res, secs_res)
+                }
             });
             let results = join_all(futs).await;
-            for (groups_res, secs_res) in results {
-                if let Ok(groups) = groups_res {
-                    for g in groups {
-                        if !seen_groups.contains_key(&g.section_group_key) {
-                            seen_groups.insert(g.section_group_key.clone(), all_groups.len());
-                            all_groups.push(g);
+            for (scope, scope_nbs, groups_res, secs_res) in results {
+                let mut scope_groups: Vec<OnenoteSectionGroup> = Vec::new();
+                let mut scope_sections: Vec<OnenoteSection> = Vec::new();
+                let mut scope_succeeded = false;
+                let mut scope_err: Option<anyhow::Error> = None;
+
+                let top_groups_from_scope = match groups_res {
+                    Ok(groups) => {
+                        scope_groups.extend(groups.clone());
+                        Some(groups)
+                    }
+                    Err(_) => None,
+                };
+
+                match secs_res {
+                    Ok(secs) => {
+                        scope_succeeded = true;
+                        scope_sections.extend(secs);
+                        if top_groups_from_scope.is_none() && !scope_nbs.is_empty() {
+                            let mut visited_sg_ids = HashSet::new();
+                            for nb in &scope_nbs {
+                                if let Ok(nb_sgs) =
+                                    self.list_onenote_section_groups(&scope, Some(&nb.id)).await
+                                {
+                                    let mut queue: VecDeque<OnenoteSectionGroup> = VecDeque::new();
+                                    for sg in nb_sgs {
+                                        if visited_sg_ids.len() >= MAX_SECTION_GROUP_TRAVERSAL {
+                                            break;
+                                        }
+                                        if visited_sg_ids.insert(sg.id.clone()) {
+                                            scope_groups.push(sg.clone());
+                                            queue.push_back(sg);
+                                        }
+                                    }
+                                    while let Some(sg) = queue.pop_front() {
+                                        let eff_nb =
+                                            sg.notebook_id.as_deref().or(Some(nb.id.as_str()));
+                                        if let Ok(children) = self
+                                            .list_child_section_groups(&scope, &sg.id, eff_nb)
+                                            .await
+                                        {
+                                            for child in children {
+                                                if visited_sg_ids.len()
+                                                    >= MAX_SECTION_GROUP_TRAVERSAL
+                                                {
+                                                    break;
+                                                }
+                                                if visited_sg_ids.insert(child.id.clone()) {
+                                                    scope_groups.push(child.clone());
+                                                    queue.push_back(child);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if !is_unauthorized_error(&err) {
+                            let mut visited_sg_ids: HashSet<String> = HashSet::new();
+                            let mut fallback_ok = false;
+
+                            for nb in &scope_nbs {
+                                if let Ok((nb_groups, nb_secs)) = self
+                                    .collect_notebook_section_groups_and_sections(
+                                        &scope,
+                                        &nb.id,
+                                        &mut visited_sg_ids,
+                                    )
+                                    .await
+                                {
+                                    fallback_ok = true;
+                                    scope_groups.extend(nb_groups);
+                                    scope_sections.extend(nb_secs);
+                                }
+                            }
+
+                            if let Some(top_groups) = top_groups_from_scope {
+                                let remaining: Vec<OnenoteSectionGroup> = top_groups
+                                    .into_iter()
+                                    .filter(|g| !visited_sg_ids.contains(&g.id))
+                                    .collect();
+                                if !remaining.is_empty() {
+                                    let (extra_groups, extra_secs) = self
+                                        .traverse_section_groups(
+                                            &scope,
+                                            remaining,
+                                            None,
+                                            &mut visited_sg_ids,
+                                        )
+                                        .await;
+                                    if !extra_secs.is_empty() {
+                                        fallback_ok = true;
+                                    }
+                                    scope_groups.extend(extra_groups);
+                                    scope_sections.extend(extra_secs);
+                                }
+                            }
+
+                            if fallback_ok {
+                                scope_succeeded = true;
+                            } else {
+                                scope_err = Some(err);
+                            }
+                        } else {
+                            scope_err = Some(err);
                         }
                     }
                 }
-                if let Ok(secs) = secs_res {
-                    for s in secs {
-                        if !seen_sections.contains_key(&s.section_key) {
-                            seen_sections.insert(s.section_key.clone(), all_sections.len());
-                            all_sections.push(s);
-                        }
+
+                if scope_succeeded {
+                    any_scope_succeeded = true;
+                } else if let Some(err) = scope_err {
+                    if scope.is_personal() && me_err.is_none() {
+                        me_err = Some(err);
+                    } else if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+
+                for g in scope_groups {
+                    if !seen_groups.contains_key(&g.section_group_key) {
+                        seen_groups.insert(g.section_group_key.clone(), all_groups.len());
+                        all_groups.push(g);
+                    }
+                }
+                for s in scope_sections {
+                    if !seen_sections.contains_key(&s.section_key) {
+                        seen_sections.insert(s.section_key.clone(), all_sections.len());
+                        all_sections.push(s);
                     }
                 }
             }
         }
 
-        let sg_name_by_scoped_id: HashMap<(String, String), String> = all_groups
-            .iter()
-            .map(|sg| ((sg.scope.scope_key(), sg.id.clone()), sg.display_name.clone()))
-            .collect();
-
-        for sec in &mut all_sections {
-            if sec.notebook_name.is_none() {
-                if let Some(ref nb_id) = sec.notebook_id {
-                    let sk = sec.scope.scope_key();
-                    sec.notebook_name = nb_name_by_scoped_id
-                        .get(&(sk, nb_id.clone()))
-                        .or_else(|| nb_name_by_id.get(nb_id))
-                        .cloned();
-                }
+        if all_sections.is_empty() {
+            if let Some(err) = me_err {
+                return Err(err);
             }
-            if sec.parent_section_group_name.is_none() {
-                if let Some(ref sg_id) = sec.parent_section_group_id {
-                    let sk = sec.scope.scope_key();
-                    sec.parent_section_group_name =
-                        sg_name_by_scoped_id.get(&(sk, sg_id.clone())).cloned();
+            if !any_scope_succeeded {
+                if let Some(err) = first_err {
+                    return Err(err);
                 }
             }
         }
+
+        backfill_section_hierarchy(notebooks, &mut all_groups, &mut all_sections);
 
         Ok((all_groups, all_sections))
     }
@@ -1388,6 +1830,440 @@ mod tests {
         assert_eq!(
             *state_check.deleted_pages.lock().unwrap(),
             vec!["pg-1".to_string()]
+        );
+    }
+
+    fn make_test_jwt(payload: &serde_json::Value) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+        format!("{header}.{body}.sig")
+    }
+
+    fn test_graph_client_with_token(
+        base_url: String,
+        access_token: String,
+        tenant_id: String,
+    ) -> GraphClient {
+        let cfg = AppConfig {
+            graph_base_url: base_url,
+            tenant_id: tenant_id.clone(),
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            StoredTokens {
+                access_token,
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".to_string(),
+                tenant_id,
+                user_id: Some("me-1".to_string()),
+                user_display_name: Some("Tester".to_string()),
+                user_email: Some("tester@example.com".to_string()),
+                auth_mode: "access_token".to_string(),
+            },
+        );
+        GraphClient::new(cfg, auth).unwrap().with_my_user_id("me-1")
+    }
+
+    #[tokio::test]
+    async fn test_list_sections_propagates_500_and_falls_back_on_10008() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // --- Part A: HTTP 400 Error 10008 fallback + recursive sectionGroups + transitive backfill ---
+        let page_10008_hits = Arc::new(AtomicUsize::new(0));
+        let page_10008_clone = page_10008_hits.clone();
+
+        let app_10008 = Router::new()
+            .route(
+                "/v1.0/me/onenote/sections",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "10008",
+                                "message": "One or more of the document libraries on the user or group's OneDrive contains more than 5,000 OneNote items."
+                            }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sectionGroups",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "10008",
+                                "message": "One or more of the document libraries contains more than 5,000 OneNote items."
+                            }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/notebooks/{nb_id}/sections",
+                get(|AxumPath(nb_id): AxumPath<String>| async move {
+                    assert_eq!(nb_id, "nb-big");
+                    Json(serde_json::json!({
+                        "value": [
+                            {
+                                "id": "sec-direct",
+                                "displayName": "직접 섹션",
+                                "isDefault": true
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/notebooks/{nb_id}/sectionGroups",
+                get(|AxumPath(nb_id): AxumPath<String>| async move {
+                    assert_eq!(nb_id, "nb-big");
+                    Json(serde_json::json!({
+                        "value": [
+                            {
+                                "id": "sg-1",
+                                "displayName": "상위 그룹",
+                                "parentNotebook": { "id": "nb-big" }
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sectionGroups/{sg_id}/sections",
+                get(|AxumPath(sg_id): AxumPath<String>| async move {
+                    if sg_id == "sg-1" {
+                        Json(serde_json::json!({
+                            "value": [
+                                {
+                                    "id": "sec-in-sg1",
+                                    "displayName": "그룹1 섹션",
+                                    "parentSectionGroup": { "id": "sg-1" }
+                                }
+                            ]
+                        }))
+                    } else if sg_id == "sg-2" {
+                        // Graph omits parentNotebook AND parentSectionGroup displayName here
+                        Json(serde_json::json!({
+                            "value": [
+                                {
+                                    "id": "sec-in-sg2",
+                                    "displayName": "중첩 그룹 섹션"
+                                }
+                            ]
+                        }))
+                    } else {
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sectionGroups/{sg_id}/sectionGroups",
+                get(|AxumPath(sg_id): AxumPath<String>| async move {
+                    if sg_id == "sg-1" {
+                        // Nested section group omitting parentNotebook
+                        Json(serde_json::json!({
+                            "value": [
+                                {
+                                    "id": "sg-2",
+                                    "displayName": "하위 그룹",
+                                    "parentSectionGroup": { "id": "sg-1" }
+                                }
+                            ]
+                        }))
+                    } else {
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sections/sec-10008/pages",
+                get(move || {
+                    let hits = page_10008_clone.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "10008",
+                                    "message": "One or more of the document libraries contains more than 5,000 OneNote items."
+                                }
+                            })),
+                        )
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app_10008).await;
+        });
+
+        let client = test_graph_client(format!("http://{addr}/v1.0"));
+        let nb = OnenoteNotebook {
+            notebook_key: "me|nb-big".into(),
+            id: "nb-big".into(),
+            scope: OnenoteScope::Me,
+            display_name: "대용량 필기장".into(),
+            color: None,
+            is_default: true,
+            is_shared: false,
+            user_role: None,
+            created_at: None,
+            last_modified_at: None,
+            created_by: None,
+            web_url: None,
+        };
+
+        let (groups, secs) = client
+            .list_all_accessible_sections(std::slice::from_ref(&nb))
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(secs.len(), 3);
+        let ids: Vec<&str> = secs.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"sec-direct"));
+        assert!(ids.contains(&"sec-in-sg1"));
+        assert!(ids.contains(&"sec-in-sg2"));
+        for sec in &secs {
+            assert_eq!(sec.notebook_id.as_deref(), Some("nb-big"), "sec={}", sec.id);
+            assert_eq!(
+                sec.notebook_name.as_deref(),
+                Some("대용량 필기장"),
+                "sec={}",
+                sec.id
+            );
+        }
+        let nested = secs.iter().find(|s| s.id == "sec-in-sg2").unwrap();
+        assert_eq!(nested.parent_section_group_id.as_deref(), Some("sg-2"));
+        assert_eq!(nested.parent_section_group_name.as_deref(), Some("하위 그룹"));
+
+        // Direct per-notebook list_onenote_sections(Some(nb_id)) must also include grouped sections
+        let nb_secs = client
+            .list_onenote_sections(&OnenoteScope::Me, Some("nb-big"))
+            .await
+            .unwrap();
+        assert_eq!(nb_secs.len(), 3);
+
+        // is_pagelevel_bad_request must NOT retry on Error 10008 even though URL contains pagelevel=true
+        let err_10008 = client
+            .list_onenote_pages(&OnenoteScope::Me, "sec-10008", 20)
+            .await
+            .unwrap_err();
+        assert!(err_10008.to_string().contains("10008"));
+        assert_eq!(
+            page_10008_hits.load(Ordering::SeqCst),
+            1,
+            "10008 error must not be retried as a pagelevel error"
+        );
+        assert!(!is_pagelevel_bad_request(&err_10008));
+        assert!(is_pagelevel_bad_request(&anyhow::anyhow!(
+            "Graph API error (GET http://x/pages?pagelevel=true): 400 Bad Request [20152] pagelevel not supported"
+        )));
+        assert!(!is_pagelevel_bad_request(&anyhow::anyhow!(
+            "Graph API error (GET http://x/pages?pagelevel=true): 400 Bad Request [BadRequest] invalid section"
+        )));
+
+        // --- Part B: HTTP 500 across all section endpoints must propagate Err(...) ---
+        let app_500 = Router::new()
+            .route(
+                "/v1.0/me/onenote/sections",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": { "code": "InternalServerError", "message": "boom" }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sectionGroups",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": { "code": "InternalServerError", "message": "boom" }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/notebooks/{nb_id}/sections",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": { "code": "InternalServerError", "message": "boom" }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/notebooks/{nb_id}/sectionGroups",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": { "code": "InternalServerError", "message": "boom" }
+                        })),
+                    )
+                }),
+            );
+
+        let listener_500 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_500 = listener_500.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener_500, app_500).await;
+        });
+
+        let client_500 = test_graph_client(format!("http://{addr_500}/v1.0"));
+        let err = client_500
+            .list_all_accessible_sections(&[nb])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "expected 500 error propagation, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_msa_and_scopeless_tokens_skip_joined_teams() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let joined_teams_hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = joined_teams_hits.clone();
+        let fail_me = Arc::new(AtomicBool::new(false));
+        let fail_me_clone = fail_me.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/notebooks",
+                get(move || {
+                    let fail = fail_me_clone.clone();
+                    async move {
+                        if fail.load(Ordering::SeqCst) {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": { "code": "InternalServerError", "message": "me failed" }
+                                })),
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "value": [
+                                        {
+                                            "id": "nb-1",
+                                            "displayName": "Personal",
+                                            "isDefault": true
+                                        }
+                                    ]
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(move || {
+                    let hits = hits_clone.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "value": [
+                                { "id": "team-empty", "displayName": "Empty Team" }
+                            ]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/groups/{gid}/onenote/notebooks",
+                get(|| async { Json(serde_json::json!({ "value": [] })) }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}/v1.0");
+
+        // 1. Consumer MSA JWT (tid = 9188040d-6c67-4c5b-b112-36a304b66dad) skips /me/joinedTeams
+        let msa_jwt = make_test_jwt(&serde_json::json!({
+            "tid": "9188040d-6c67-4c5b-b112-36a304b66dad",
+            "scp": "User.Read Notes.ReadWrite Team.ReadBasic.All"
+        }));
+        let client_msa_jwt =
+            test_graph_client_with_token(base_url.clone(), msa_jwt, "common".into());
+        let nbs = client_msa_jwt
+            .list_all_accessible_notebooks(true)
+            .await
+            .unwrap();
+        assert_eq!(nbs.len(), 1);
+        assert_eq!(joined_teams_hits.load(Ordering::SeqCst), 0);
+
+        // 2. Consumer tenant_id = "consumers" with opaque token skips /me/joinedTeams
+        let client_consumers = test_graph_client_with_token(
+            base_url.clone(),
+            "EwB4A8l6BAAU-opaque".into(),
+            "consumers".into(),
+        );
+        let nbs = client_consumers
+            .list_all_accessible_notebooks(true)
+            .await
+            .unwrap();
+        assert_eq!(nbs.len(), 1);
+        assert_eq!(joined_teams_hits.load(Ordering::SeqCst), 0);
+
+        // 3. Org JWT without group/team read scopes skips /me/joinedTeams
+        let scopeless_jwt = make_test_jwt(&serde_json::json!({
+            "tid": "org-tenant-123",
+            "scp": "User.Read Notes.ReadWrite"
+        }));
+        let client_no_group_scope =
+            test_graph_client_with_token(base_url.clone(), scopeless_jwt, "org-tenant-123".into());
+        let nbs = client_no_group_scope
+            .list_all_accessible_notebooks(true)
+            .await
+            .unwrap();
+        assert_eq!(nbs.len(), 1);
+        assert_eq!(joined_teams_hits.load(Ordering::SeqCst), 0);
+
+        // 4. Org JWT with Team.ReadBasic.All queries /me/joinedTeams, AND if /me fails while group returns [],
+        // me_err is propagated instead of returning Ok([])
+        let org_with_team_jwt = make_test_jwt(&serde_json::json!({
+            "tid": "org-tenant-123",
+            "scp": "User.Read Notes.ReadWrite Team.ReadBasic.All"
+        }));
+        let client_org =
+            test_graph_client_with_token(base_url, org_with_team_jwt, "org-tenant-123".into());
+        let nbs = client_org
+            .list_all_accessible_notebooks(true)
+            .await
+            .unwrap();
+        assert_eq!(nbs.len(), 1);
+        assert_eq!(joined_teams_hits.load(Ordering::SeqCst), 1);
+
+        fail_me.store(true, Ordering::SeqCst);
+        let err = client_org
+            .list_all_accessible_notebooks(true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "empty group notebooks must not mask /me/onenote/notebooks failure: {err}"
         );
     }
 }

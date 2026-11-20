@@ -338,6 +338,17 @@ impl AppState {
                 .map(|n| n.notebook_key.clone());
         }
         self.ensure_active_section_and_pages_cached();
+        if self.active_notebook_key.is_some()
+            || self.active_section_key.is_some()
+            || self.active_page_key.is_some()
+        {
+            self.push_focus_to_sync();
+        }
+        if let Some(pk) = self.active_page_key.clone() {
+            if !self.page_details.contains_key(&pk) {
+                self.request_page_detail(pk);
+            }
+        }
     }
 
     pub fn active_onenote_notebook(&self) -> Option<&OnenoteNotebook> {
@@ -885,6 +896,18 @@ impl AppState {
         });
     }
 
+    fn evict_stale_page_details(&mut self, incoming: &[OnenotePageSummary]) {
+        for p in incoming {
+            let is_stale = self.page_details.get(&p.page_key).is_some_and(|cached| {
+                cached.summary.last_modified_at != p.last_modified_at
+                    || cached.summary.title != p.title
+            });
+            if is_stale {
+                self.page_details.remove(&p.page_key);
+            }
+        }
+    }
+
     pub fn handle_core_event(&mut self, ui: &mut UiState, ev: CoreEvent) {
         match ev {
             CoreEvent::ProfileLoaded(profile) => {
@@ -899,7 +922,11 @@ impl AppState {
                 self.section_groups = section_groups;
                 self.sections = sections;
                 let prev_sec = self.active_section_key.clone();
-                if self.active_notebook_key.is_none() {
+                let nb_valid = self
+                    .active_notebook_key
+                    .as_deref()
+                    .is_some_and(|k| self.notebooks.iter().any(|n| n.notebook_key == k));
+                if !nb_valid {
                     self.active_notebook_key = self
                         .notebooks
                         .iter()
@@ -908,11 +935,20 @@ impl AppState {
                         .map(|n| n.notebook_key.clone());
                 }
                 self.ensure_active_section_and_pages_cached();
+                let current_pages = self.pages.clone();
+                self.evict_stale_page_details(&current_pages);
                 if prev_sec != self.active_section_key {
                     if let Some(sec_key) = self.active_section_key.clone() {
                         self.request_section_pages(sec_key);
                     }
+                }
+                if self.active_notebook_key.is_some() || self.active_section_key.is_some() {
                     self.push_focus_to_sync();
+                }
+                if let Some(pk) = self.active_page_key.clone() {
+                    if !self.page_details.contains_key(&pk) && !self.loading_onenote_detail {
+                        self.request_page_detail(pk);
+                    }
                 }
             }
             CoreEvent::OnenotePagesUpdated {
@@ -920,6 +956,7 @@ impl AppState {
                 pages,
                 notify_candidate,
             } => {
+                self.evict_stale_page_details(&pages);
                 if self.active_section_key.as_deref() == Some(section_key.as_str()) {
                     self.loading_onenote_pages = false;
                     self.pages = pages;
@@ -929,9 +966,16 @@ impl AppState {
                         .is_some_and(|pk| self.pages.iter().any(|p| p.page_key == pk));
                     if !valid {
                         self.active_page_key = self.pages.first().map(|p| p.page_key.clone());
-                        if let Some(pk) = self.active_page_key.clone() {
+                    }
+                    if let Some(pk) = self.active_page_key.clone() {
+                        if !self.page_details.contains_key(&pk) {
                             self.request_page_detail(pk);
                         }
+                        self.push_focus_to_sync();
+                    } else if self.active_notebook_key.is_some()
+                        || self.active_section_key.is_some()
+                    {
+                        self.push_focus_to_sync();
                     }
                 }
                 if let Some(cand) = notify_candidate {
@@ -1094,5 +1138,187 @@ impl AppState {
             UiMsg::Info(msg) => ui.info(msg),
             UiMsg::Error(msg) => ui.error(msg),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::StoredTokens;
+    use tokio::sync::watch;
+
+    fn make_test_app_with_cached_summary() -> (
+        AppState,
+        UiState,
+        watch::Receiver<FocusTarget>,
+        mpsc::UnboundedReceiver<SyncCommand>,
+    ) {
+        let cfg = AppConfig::default();
+        let tokens = StoredTokens {
+            access_token: "test-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("user-1".to_string()),
+            user_display_name: Some("Tester".to_string()),
+            user_email: Some("tester@example.com".to_string()),
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        storage
+            .upsert_onenote_notebooks(&[OnenoteNotebook {
+                notebook_key: "me|nb-1".to_string(),
+                id: "nb-1".to_string(),
+                scope: OnenoteScope::Me,
+                display_name: "Engineering".to_string(),
+                color: None,
+                is_default: true,
+                is_shared: false,
+                user_role: Some("Owner".to_string()),
+                created_at: None,
+                last_modified_at: Some("2026-11-18T10:00:00Z".to_string()),
+                created_by: None,
+                web_url: None,
+            }])
+            .unwrap();
+        storage
+            .upsert_onenote_sections(&[OnenoteSection {
+                section_key: "me|sec-1".to_string(),
+                id: "sec-1".to_string(),
+                scope: OnenoteScope::Me,
+                notebook_id: Some("nb-1".to_string()),
+                notebook_name: Some("Engineering".to_string()),
+                parent_section_group_id: None,
+                parent_section_group_name: None,
+                display_name: "Specs".to_string(),
+                color: None,
+                is_default: true,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: Some("2026-11-18T10:00:00Z".to_string()),
+                web_url: None,
+            }])
+            .unwrap();
+        storage
+            .upsert_onenote_pages(&[OnenotePageSummary {
+                page_key: "me|page-1".to_string(),
+                id: "page-1".to_string(),
+                scope: OnenoteScope::Me,
+                section_id: "sec-1".to_string(),
+                section_name: Some("Specs".to_string()),
+                notebook_id: Some("nb-1".to_string()),
+                notebook_name: Some("Engineering".to_string()),
+                title: "Initial Spec".to_string(),
+                level: 0,
+                order: 0,
+                created_at: Some("2026-11-18T09:00:00Z".to_string()),
+                last_modified_at: Some("2026-11-18T10:00:00Z".to_string()),
+                content_url: None,
+                web_url: None,
+                preview_text: None,
+                has_todo: false,
+            }])
+            .unwrap();
+
+        let (focus_tx, focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiMsg>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+
+        let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let ui = UiState::from_config(&cfg);
+        (app, ui, focus_rx, nudge_rx)
+    }
+
+    #[test]
+    fn test_startup_pushes_focus_hydrates_initial_page_and_rehydrates_on_remote_edit() {
+        let (mut app, mut ui, focus_rx, mut nudge_rx) = make_test_app_with_cached_summary();
+
+        // 1. load_cached_initial must push initial focus and hydrate the selected summary-only page
+        app.load_cached_initial();
+        assert_eq!(focus_rx.borrow().section_key.as_deref(), Some("me|sec-1"));
+        assert_eq!(focus_rx.borrow().page_key.as_deref(), Some("me|page-1"));
+        assert!(app.loading_onenote_detail);
+        assert_eq!(
+            nudge_rx.try_recv().ok(),
+            Some(SyncCommand::HydratePage {
+                page_key: "me|page-1".to_string()
+            })
+        );
+
+        // 2. Deliver hydrated page detail at T1
+        let summary_t1 = OnenotePageSummary {
+            page_key: "me|page-1".to_string(),
+            id: "page-1".to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec-1".to_string(),
+            section_name: Some("Specs".to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Engineering".to_string()),
+            title: "Initial Spec".to_string(),
+            level: 0,
+            order: 0,
+            created_at: Some("2026-11-18T09:00:00Z".to_string()),
+            last_modified_at: Some("2026-11-18T10:00:00Z".to_string()),
+            content_url: None,
+            web_url: None,
+            preview_text: Some("Old body".to_string()),
+            has_todo: false,
+        };
+        let detail_t1 = OnenotePageDetail {
+            summary: summary_t1.clone(),
+            raw_xhtml: "<html><body><p>Old body</p></body></html>".to_string(),
+            body_markdown: "Old body".to_string(),
+            body_plain: "Old body".to_string(),
+            blocks: Vec::new(),
+            resources: Vec::new(),
+            primary_div_id: None,
+            synced_at: Some("2026-11-18T10:00:00Z".to_string()),
+        };
+        app.handle_core_event(&mut ui, CoreEvent::OnenotePageDetailUpdated(Box::new(detail_t1)));
+        assert!(!app.loading_onenote_detail);
+        assert!(app.page_details.contains_key("me|page-1"));
+
+        // 3. Unchanged OnenotePagesUpdated at T1 keeps cached detail and avoids redundant HydratePage
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::OnenotePagesUpdated {
+                section_key: "me|sec-1".to_string(),
+                pages: vec![summary_t1.clone()],
+                notify_candidate: None,
+            },
+        );
+        assert!(app.page_details.contains_key("me|page-1"));
+        assert!(nudge_rx.try_recv().is_err());
+
+        // 4. Remote edit arrives with newer last_modified_at = T2 -> evicts stale detail and queues HydratePage
+        let mut summary_t2 = summary_t1;
+        summary_t2.last_modified_at = Some("2026-11-18T11:00:00Z".to_string());
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::OnenotePagesUpdated {
+                section_key: "me|sec-1".to_string(),
+                pages: vec![summary_t2],
+                notify_candidate: None,
+            },
+        );
+        assert!(!app.page_details.contains_key("me|page-1"));
+        assert!(app.loading_onenote_detail);
+        assert_eq!(
+            nudge_rx.try_recv().ok(),
+            Some(SyncCommand::HydratePage {
+                page_key: "me|page-1".to_string()
+            })
+        );
+
+        // 5. Action::RefreshAll sets syncing state, pushes focus, and requests RefreshAll
+        crate::ui::action::dispatch(crate::ui::action::Action::RefreshAll, &mut app, &mut ui);
+        assert!(app.syncing);
+        assert_eq!(app.sync_summary, "Syncing OneNote...");
+        assert_eq!(nudge_rx.try_recv().ok(), Some(SyncCommand::RefreshAll));
     }
 }

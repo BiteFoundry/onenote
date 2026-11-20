@@ -1,7 +1,9 @@
 //! SQLite persistence and FTS5 (`trigram` + `LIKE` hybrid) search for Microsoft OneNote.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::{
     models::{
@@ -17,64 +19,101 @@ const PAGE_SUMMARY_COLS: &str = "
     created_at, last_modified_at, content_url, web_url, preview_text, has_todo
 ";
 
+fn normalized_notebook_key(nb: &OnenoteNotebook) -> String {
+    if nb.notebook_key.trim().is_empty() {
+        nb.scope.make_entity_key(&nb.id)
+    } else {
+        nb.notebook_key.clone()
+    }
+}
+
+fn normalized_section_group_key(sg: &OnenoteSectionGroup) -> String {
+    if sg.section_group_key.trim().is_empty() {
+        sg.scope.make_entity_key(&sg.id)
+    } else {
+        sg.section_group_key.clone()
+    }
+}
+
+fn normalized_section_key(sec: &OnenoteSection) -> String {
+    if sec.section_key.trim().is_empty() {
+        sec.scope.make_entity_key(&sec.id)
+    } else {
+        sec.section_key.clone()
+    }
+}
+
+fn normalized_page_key(item: &OnenotePageSummary) -> String {
+    if item.page_key.trim().is_empty() {
+        item.scope.make_entity_key(&item.id)
+    } else {
+        item.page_key.clone()
+    }
+}
+
+fn upsert_onenote_notebooks_in_tx(
+    tx: &Transaction<'_>,
+    items: &[OnenoteNotebook],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "
+        INSERT INTO onenote_notebooks (
+            notebook_key, id, scope_json, scope_key, display_name, color,
+            is_default, is_shared, user_role, created_at, last_modified_at,
+            created_by, web_url
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6,
+            ?7, ?8, ?9, ?10, ?11,
+            ?12, ?13
+        )
+        ON CONFLICT(notebook_key) DO UPDATE SET
+            id = excluded.id,
+            scope_json = excluded.scope_json,
+            scope_key = excluded.scope_key,
+            display_name = excluded.display_name,
+            color = COALESCE(excluded.color, onenote_notebooks.color),
+            is_default = excluded.is_default,
+            is_shared = excluded.is_shared,
+            user_role = COALESCE(excluded.user_role, onenote_notebooks.user_role),
+            created_at = COALESCE(excluded.created_at, onenote_notebooks.created_at),
+            last_modified_at = COALESCE(excluded.last_modified_at, onenote_notebooks.last_modified_at),
+            created_by = COALESCE(excluded.created_by, onenote_notebooks.created_by),
+            web_url = COALESCE(excluded.web_url, onenote_notebooks.web_url)
+        ",
+    )?;
+
+    for nb in items {
+        let scope_key = nb.scope.scope_key();
+        let scope_json = serde_json::to_string(&nb.scope)?;
+        let notebook_key = normalized_notebook_key(nb);
+        stmt.execute(params![
+            notebook_key,
+            nb.id,
+            scope_json,
+            scope_key,
+            nb.display_name,
+            nb.color,
+            bool_to_i32(nb.is_default),
+            bool_to_i32(nb.is_shared),
+            nb.user_role,
+            nb.created_at,
+            nb.last_modified_at,
+            nb.created_by,
+            nb.web_url,
+        ])?;
+    }
+    Ok(())
+}
+
 pub fn upsert_onenote_notebooks(conn: &mut Connection, items: &[OnenoteNotebook]) -> Result<()> {
     if items.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "
-            INSERT INTO onenote_notebooks (
-                notebook_key, id, scope_json, scope_key, display_name, color,
-                is_default, is_shared, user_role, created_at, last_modified_at,
-                created_by, web_url
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6,
-                ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13
-            )
-            ON CONFLICT(notebook_key) DO UPDATE SET
-                id = excluded.id,
-                scope_json = excluded.scope_json,
-                scope_key = excluded.scope_key,
-                display_name = excluded.display_name,
-                color = COALESCE(excluded.color, onenote_notebooks.color),
-                is_default = excluded.is_default,
-                is_shared = excluded.is_shared,
-                user_role = COALESCE(excluded.user_role, onenote_notebooks.user_role),
-                created_at = COALESCE(excluded.created_at, onenote_notebooks.created_at),
-                last_modified_at = COALESCE(excluded.last_modified_at, onenote_notebooks.last_modified_at),
-                created_by = COALESCE(excluded.created_by, onenote_notebooks.created_by),
-                web_url = COALESCE(excluded.web_url, onenote_notebooks.web_url)
-            ",
-        )?;
-
-        for nb in items {
-            let scope_key = nb.scope.scope_key();
-            let scope_json = serde_json::to_string(&nb.scope)?;
-            let notebook_key = if nb.notebook_key.trim().is_empty() {
-                nb.scope.make_entity_key(&nb.id)
-            } else {
-                nb.notebook_key.clone()
-            };
-            stmt.execute(params![
-                notebook_key,
-                nb.id,
-                scope_json,
-                scope_key,
-                nb.display_name,
-                nb.color,
-                bool_to_i32(nb.is_default),
-                bool_to_i32(nb.is_shared),
-                nb.user_role,
-                nb.created_at,
-                nb.last_modified_at,
-                nb.created_by,
-                nb.web_url,
-            ])?;
-        }
-    }
+    upsert_onenote_notebooks_in_tx(&tx, items)?;
     tx.commit()?;
     Ok(())
 }
@@ -98,6 +137,56 @@ pub fn list_onenote_notebooks(conn: &Connection) -> Result<Vec<OnenoteNotebook>>
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
+fn upsert_onenote_section_groups_in_tx(
+    tx: &Transaction<'_>,
+    items: &[OnenoteSectionGroup],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "
+        INSERT INTO onenote_section_groups (
+            section_group_key, id, scope_json, scope_key, notebook_id,
+            parent_section_group_id, display_name, created_at, last_modified_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(section_group_key) DO UPDATE SET
+            id = excluded.id,
+            scope_json = excluded.scope_json,
+            scope_key = excluded.scope_key,
+            notebook_id = COALESCE(excluded.notebook_id, onenote_section_groups.notebook_id),
+            parent_section_group_id = COALESCE(
+                excluded.parent_section_group_id,
+                onenote_section_groups.parent_section_group_id
+            ),
+            display_name = excluded.display_name,
+            created_at = COALESCE(excluded.created_at, onenote_section_groups.created_at),
+            last_modified_at = COALESCE(
+                excluded.last_modified_at,
+                onenote_section_groups.last_modified_at
+            )
+        ",
+    )?;
+
+    for sg in items {
+        let scope_key = sg.scope.scope_key();
+        let scope_json = serde_json::to_string(&sg.scope)?;
+        let section_group_key = normalized_section_group_key(sg);
+        stmt.execute(params![
+            section_group_key,
+            sg.id,
+            scope_json,
+            scope_key,
+            sg.notebook_id,
+            sg.parent_section_group_id,
+            sg.display_name,
+            sg.created_at,
+            sg.last_modified_at,
+        ])?;
+    }
+    Ok(())
+}
+
 pub fn upsert_onenote_section_groups(
     conn: &mut Connection,
     items: &[OnenoteSectionGroup],
@@ -106,52 +195,7 @@ pub fn upsert_onenote_section_groups(
         return Ok(());
     }
     let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "
-            INSERT INTO onenote_section_groups (
-                section_group_key, id, scope_json, scope_key, notebook_id,
-                parent_section_group_id, display_name, created_at, last_modified_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ON CONFLICT(section_group_key) DO UPDATE SET
-                id = excluded.id,
-                scope_json = excluded.scope_json,
-                scope_key = excluded.scope_key,
-                notebook_id = COALESCE(excluded.notebook_id, onenote_section_groups.notebook_id),
-                parent_section_group_id = COALESCE(
-                    excluded.parent_section_group_id,
-                    onenote_section_groups.parent_section_group_id
-                ),
-                display_name = excluded.display_name,
-                created_at = COALESCE(excluded.created_at, onenote_section_groups.created_at),
-                last_modified_at = COALESCE(
-                    excluded.last_modified_at,
-                    onenote_section_groups.last_modified_at
-                )
-            ",
-        )?;
-
-        for sg in items {
-            let scope_key = sg.scope.scope_key();
-            let scope_json = serde_json::to_string(&sg.scope)?;
-            let section_group_key = if sg.section_group_key.trim().is_empty() {
-                sg.scope.make_entity_key(&sg.id)
-            } else {
-                sg.section_group_key.clone()
-            };
-            stmt.execute(params![
-                section_group_key,
-                sg.id,
-                scope_json,
-                scope_key,
-                sg.notebook_id,
-                sg.parent_section_group_id,
-                sg.display_name,
-                sg.created_at,
-                sg.last_modified_at,
-            ])?;
-        }
-    }
+    upsert_onenote_section_groups_in_tx(&tx, items)?;
     tx.commit()?;
     Ok(())
 }
@@ -173,78 +217,83 @@ pub fn list_onenote_section_groups(conn: &Connection) -> Result<Vec<OnenoteSecti
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
+fn upsert_onenote_sections_in_tx(
+    tx: &Transaction<'_>,
+    items: &[OnenoteSection],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "
+        INSERT INTO onenote_sections (
+            section_key, id, scope_json, scope_key, notebook_id, notebook_name,
+            parent_section_group_id, parent_section_group_name, display_name, color,
+            is_default, pages_url, created_at, last_modified_at, web_url
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            COALESCE(
+                ?6,
+                (SELECT display_name FROM onenote_notebooks WHERE notebook_key = ?4 || '|' || COALESCE(?5, ''))
+            ),
+            ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15
+        )
+        ON CONFLICT(section_key) DO UPDATE SET
+            id = excluded.id,
+            scope_json = excluded.scope_json,
+            scope_key = excluded.scope_key,
+            notebook_id = COALESCE(excluded.notebook_id, onenote_sections.notebook_id),
+            notebook_name = COALESCE(excluded.notebook_name, onenote_sections.notebook_name),
+            parent_section_group_id = COALESCE(
+                excluded.parent_section_group_id,
+                onenote_sections.parent_section_group_id
+            ),
+            parent_section_group_name = COALESCE(
+                excluded.parent_section_group_name,
+                onenote_sections.parent_section_group_name
+            ),
+            display_name = excluded.display_name,
+            color = COALESCE(excluded.color, onenote_sections.color),
+            is_default = excluded.is_default,
+            pages_url = COALESCE(excluded.pages_url, onenote_sections.pages_url),
+            created_at = COALESCE(excluded.created_at, onenote_sections.created_at),
+            last_modified_at = COALESCE(excluded.last_modified_at, onenote_sections.last_modified_at),
+            web_url = COALESCE(excluded.web_url, onenote_sections.web_url)
+        ",
+    )?;
+
+    for sec in items {
+        let scope_key = sec.scope.scope_key();
+        let scope_json = serde_json::to_string(&sec.scope)?;
+        let section_key = normalized_section_key(sec);
+        stmt.execute(params![
+            section_key,
+            sec.id,
+            scope_json,
+            scope_key,
+            sec.notebook_id,
+            sec.notebook_name,
+            sec.parent_section_group_id,
+            sec.parent_section_group_name,
+            sec.display_name,
+            sec.color,
+            bool_to_i32(sec.is_default),
+            sec.pages_url,
+            sec.created_at,
+            sec.last_modified_at,
+            sec.web_url,
+        ])?;
+    }
+    Ok(())
+}
+
 pub fn upsert_onenote_sections(conn: &mut Connection, items: &[OnenoteSection]) -> Result<()> {
     if items.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "
-            INSERT INTO onenote_sections (
-                section_key, id, scope_json, scope_key, notebook_id, notebook_name,
-                parent_section_group_id, parent_section_group_name, display_name, color,
-                is_default, pages_url, created_at, last_modified_at, web_url
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5,
-                COALESCE(
-                    ?6,
-                    (SELECT display_name FROM onenote_notebooks WHERE notebook_key = ?4 || '|' || COALESCE(?5, ''))
-                ),
-                ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15
-            )
-            ON CONFLICT(section_key) DO UPDATE SET
-                id = excluded.id,
-                scope_json = excluded.scope_json,
-                scope_key = excluded.scope_key,
-                notebook_id = COALESCE(excluded.notebook_id, onenote_sections.notebook_id),
-                notebook_name = COALESCE(excluded.notebook_name, onenote_sections.notebook_name),
-                parent_section_group_id = COALESCE(
-                    excluded.parent_section_group_id,
-                    onenote_sections.parent_section_group_id
-                ),
-                parent_section_group_name = COALESCE(
-                    excluded.parent_section_group_name,
-                    onenote_sections.parent_section_group_name
-                ),
-                display_name = excluded.display_name,
-                color = COALESCE(excluded.color, onenote_sections.color),
-                is_default = excluded.is_default,
-                pages_url = COALESCE(excluded.pages_url, onenote_sections.pages_url),
-                created_at = COALESCE(excluded.created_at, onenote_sections.created_at),
-                last_modified_at = COALESCE(excluded.last_modified_at, onenote_sections.last_modified_at),
-                web_url = COALESCE(excluded.web_url, onenote_sections.web_url)
-            ",
-        )?;
-
-        for sec in items {
-            let scope_key = sec.scope.scope_key();
-            let scope_json = serde_json::to_string(&sec.scope)?;
-            let section_key = if sec.section_key.trim().is_empty() {
-                sec.scope.make_entity_key(&sec.id)
-            } else {
-                sec.section_key.clone()
-            };
-            stmt.execute(params![
-                section_key,
-                sec.id,
-                scope_json,
-                scope_key,
-                sec.notebook_id,
-                sec.notebook_name,
-                sec.parent_section_group_id,
-                sec.parent_section_group_name,
-                sec.display_name,
-                sec.color,
-                bool_to_i32(sec.is_default),
-                sec.pages_url,
-                sec.created_at,
-                sec.last_modified_at,
-                sec.web_url,
-            ])?;
-        }
-    }
+    upsert_onenote_sections_in_tx(&tx, items)?;
     tx.commit()?;
     Ok(())
 }
@@ -297,113 +346,327 @@ pub fn list_onenote_sections(
     }
 }
 
+fn upsert_onenote_pages_in_tx(
+    tx: &Transaction<'_>,
+    items: &[OnenotePageSummary],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut page_stmt = tx.prepare(
+        "
+        INSERT INTO onenote_pages (
+            page_key, id, scope_json, scope_key, section_key, section_id,
+            section_name, notebook_id, notebook_name, title, level, page_order,
+            created_at, last_modified_at, content_url, web_url,
+            preview_text, has_todo, detail_json, body_plain
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6,
+            COALESCE(?7, (SELECT display_name FROM onenote_sections WHERE section_key = ?5)),
+            COALESCE(?8, (SELECT notebook_id FROM onenote_sections WHERE section_key = ?5)),
+            COALESCE(?9, (SELECT notebook_name FROM onenote_sections WHERE section_key = ?5)),
+            ?10, ?11, ?12,
+            ?13, ?14, ?15, ?16,
+            ?17, ?18, NULL, NULL
+        )
+        ON CONFLICT(page_key) DO UPDATE SET
+            id = excluded.id,
+            scope_json = excluded.scope_json,
+            scope_key = excluded.scope_key,
+            section_key = excluded.section_key,
+            section_id = excluded.section_id,
+            section_name = COALESCE(excluded.section_name, onenote_pages.section_name),
+            notebook_id = COALESCE(excluded.notebook_id, onenote_pages.notebook_id),
+            notebook_name = COALESCE(excluded.notebook_name, onenote_pages.notebook_name),
+            title = excluded.title,
+            level = excluded.level,
+            page_order = excluded.page_order,
+            created_at = COALESCE(excluded.created_at, onenote_pages.created_at),
+            last_modified_at = COALESCE(excluded.last_modified_at, onenote_pages.last_modified_at),
+            content_url = COALESCE(excluded.content_url, onenote_pages.content_url),
+            web_url = COALESCE(excluded.web_url, onenote_pages.web_url),
+            preview_text = CASE
+                WHEN excluded.last_modified_at IS NOT NULL
+                     AND onenote_pages.last_modified_at IS NOT NULL
+                     AND excluded.last_modified_at != onenote_pages.last_modified_at
+                THEN excluded.preview_text
+                ELSE COALESCE(excluded.preview_text, onenote_pages.preview_text)
+            END,
+            has_todo = CASE
+                WHEN excluded.has_todo != 0 THEN 1
+                WHEN excluded.last_modified_at IS NOT NULL
+                     AND onenote_pages.last_modified_at IS NOT NULL
+                     AND excluded.last_modified_at != onenote_pages.last_modified_at
+                THEN 0
+                WHEN onenote_pages.detail_json IS NOT NULL THEN onenote_pages.has_todo
+                ELSE 0
+            END,
+            detail_json = CASE
+                WHEN excluded.last_modified_at IS NOT NULL
+                     AND onenote_pages.last_modified_at IS NOT NULL
+                     AND excluded.last_modified_at != onenote_pages.last_modified_at
+                THEN excluded.detail_json
+                ELSE COALESCE(excluded.detail_json, onenote_pages.detail_json)
+            END,
+            body_plain = CASE
+                WHEN excluded.last_modified_at IS NOT NULL
+                     AND onenote_pages.last_modified_at IS NOT NULL
+                     AND excluded.last_modified_at != onenote_pages.last_modified_at
+                THEN excluded.body_plain
+                ELSE COALESCE(excluded.body_plain, onenote_pages.body_plain)
+            END
+        ",
+    )?;
+
+    let mut fts_del_stmt = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
+    let mut fts_ins_stmt = tx.prepare(
+        "
+        INSERT INTO onenote_fts (
+            page_key, section_key, title, notebook_name, section_name, body_plain
+        )
+        SELECT
+            page_key,
+            section_key,
+            title,
+            COALESCE(notebook_name, ''),
+            COALESCE(section_name, ''),
+            COALESCE(body_plain, preview_text, '')
+        FROM onenote_pages
+        WHERE page_key = ?1
+        ",
+    )?;
+
+    for item in items {
+        let scope_key = item.scope.scope_key();
+        let scope_json = serde_json::to_string(&item.scope)?;
+        let page_key = normalized_page_key(item);
+        let section_key = item.scope.make_entity_key(&item.section_id);
+        let preview_clean = item
+            .preview_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        page_stmt.execute(params![
+            page_key,
+            item.id,
+            scope_json,
+            scope_key,
+            section_key,
+            item.section_id,
+            item.section_name,
+            item.notebook_id,
+            item.notebook_name,
+            item.title,
+            item.level,
+            item.order,
+            item.created_at,
+            item.last_modified_at,
+            item.content_url,
+            item.web_url,
+            preview_clean,
+            bool_to_i32(item.has_todo),
+        ])?;
+
+        fts_del_stmt.execute(params![page_key])?;
+        fts_ins_stmt.execute(params![page_key])?;
+    }
+    Ok(())
+}
+
 pub fn upsert_onenote_pages(conn: &mut Connection, items: &[OnenotePageSummary]) -> Result<()> {
     if items.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction()?;
-    {
-        let mut page_stmt = tx.prepare(
-            "
-            INSERT INTO onenote_pages (
-                page_key, id, scope_json, scope_key, section_key, section_id,
-                section_name, notebook_id, notebook_name, title, level, page_order,
-                created_at, last_modified_at, content_url, web_url,
-                preview_text, has_todo, detail_json, body_plain
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6,
-                COALESCE(?7, (SELECT display_name FROM onenote_sections WHERE section_key = ?5)),
-                COALESCE(?8, (SELECT notebook_id FROM onenote_sections WHERE section_key = ?5)),
-                COALESCE(?9, (SELECT notebook_name FROM onenote_sections WHERE section_key = ?5)),
-                ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16,
-                ?17, ?18, NULL, NULL
-            )
-            ON CONFLICT(page_key) DO UPDATE SET
-                id = excluded.id,
-                scope_json = excluded.scope_json,
-                scope_key = excluded.scope_key,
-                section_key = excluded.section_key,
-                section_id = excluded.section_id,
-                section_name = COALESCE(excluded.section_name, onenote_pages.section_name),
-                notebook_id = COALESCE(excluded.notebook_id, onenote_pages.notebook_id),
-                notebook_name = COALESCE(excluded.notebook_name, onenote_pages.notebook_name),
-                title = excluded.title,
-                level = excluded.level,
-                page_order = excluded.page_order,
-                created_at = COALESCE(excluded.created_at, onenote_pages.created_at),
-                last_modified_at = COALESCE(excluded.last_modified_at, onenote_pages.last_modified_at),
-                content_url = COALESCE(excluded.content_url, onenote_pages.content_url),
-                web_url = COALESCE(excluded.web_url, onenote_pages.web_url),
-                preview_text = COALESCE(excluded.preview_text, onenote_pages.preview_text),
-                has_todo = CASE
-                    WHEN excluded.has_todo != 0 THEN 1
-                    WHEN onenote_pages.detail_json IS NOT NULL THEN onenote_pages.has_todo
-                    ELSE 0
-                END,
-                detail_json = COALESCE(excluded.detail_json, onenote_pages.detail_json),
-                body_plain = COALESCE(excluded.body_plain, onenote_pages.body_plain)
-            ",
-        )?;
+    upsert_onenote_pages_in_tx(&tx, items)?;
+    tx.commit()?;
+    Ok(())
+}
 
-        let mut fts_del_stmt = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
-        let mut fts_ins_stmt = tx.prepare(
-            "
-            INSERT INTO onenote_fts (
-                page_key, section_key, title, notebook_name, section_name, body_plain
-            )
-            SELECT
-                page_key,
-                section_key,
-                title,
-                COALESCE(notebook_name, ''),
-                COALESCE(section_name, ''),
-                COALESCE(body_plain, preview_text, '')
-            FROM onenote_pages
-            WHERE page_key = ?1
-            ",
-        )?;
+/// Atomically upserts the current hierarchy snapshot and prunes stale notebooks,
+/// section groups, sections, and orphaned pages + `onenote_fts` entries.
+pub fn reconcile_onenote_hierarchy(
+    conn: &mut Connection,
+    notebooks: &[OnenoteNotebook],
+    section_groups: &[OnenoteSectionGroup],
+    sections: &[OnenoteSection],
+    synced_all_scopes: bool,
+) -> Result<()> {
+    let tx = conn.transaction()?;
 
-        for item in items {
-            let scope_key = item.scope.scope_key();
-            let scope_json = serde_json::to_string(&item.scope)?;
-            let page_key = if item.page_key.trim().is_empty() {
-                item.scope.make_entity_key(&item.id)
-            } else {
-                item.page_key.clone()
-            };
-            let section_key = item.scope.make_entity_key(&item.section_id);
-            let preview_clean = item
-                .preview_text
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
+    upsert_onenote_notebooks_in_tx(&tx, notebooks)?;
+    upsert_onenote_section_groups_in_tx(&tx, section_groups)?;
+    upsert_onenote_sections_in_tx(&tx, sections)?;
 
-            page_stmt.execute(params![
-                page_key,
-                item.id,
-                scope_json,
-                scope_key,
-                section_key,
-                item.section_id,
-                item.section_name,
-                item.notebook_id,
-                item.notebook_name,
-                item.title,
-                item.level,
-                item.order,
-                item.created_at,
-                item.last_modified_at,
-                item.content_url,
-                item.web_url,
-                preview_clean,
-                bool_to_i32(item.has_todo),
-            ])?;
+    let keep_nb_keys: HashSet<String> = notebooks.iter().map(normalized_notebook_key).collect();
+    let keep_sg_keys: HashSet<String> = section_groups
+        .iter()
+        .map(normalized_section_group_key)
+        .collect();
+    let keep_sec_keys: HashSet<String> = sections.iter().map(normalized_section_key).collect();
 
-            fts_del_stmt.execute(params![page_key])?;
-            fts_ins_stmt.execute(params![page_key])?;
+    let reconciled_scopes: Option<HashSet<String>> = if synced_all_scopes {
+        None
+    } else {
+        let mut scopes = HashSet::new();
+        for nb in notebooks {
+            scopes.insert(nb.scope.scope_key());
+        }
+        for sg in section_groups {
+            scopes.insert(sg.scope.scope_key());
+        }
+        for sec in sections {
+            scopes.insert(sec.scope.scope_key());
+        }
+        Some(scopes)
+    };
+
+    let should_prune = synced_all_scopes
+        || reconciled_scopes
+            .as_ref()
+            .is_some_and(|scopes| !scopes.is_empty());
+
+    if should_prune {
+        let scope_in_reconciled = |scope_key: &str| -> bool {
+            match &reconciled_scopes {
+                None => true,
+                Some(scopes) => scopes.contains(scope_key),
+            }
+        };
+
+        // Prune stale notebooks
+        let stale_nbs: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT notebook_key, scope_key FROM onenote_notebooks")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(k, scope)| scope_in_reconciled(scope) && !keep_nb_keys.contains(k))
+                .map(|(k, _)| k)
+                .collect()
+        };
+        if !stale_nbs.is_empty() {
+            let mut del = tx.prepare("DELETE FROM onenote_notebooks WHERE notebook_key = ?1")?;
+            for k in stale_nbs {
+                del.execute(params![k])?;
+            }
+        }
+
+        // Prune stale section groups
+        let stale_sgs: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT section_group_key, scope_key FROM onenote_section_groups")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(k, scope)| scope_in_reconciled(scope) && !keep_sg_keys.contains(k))
+                .map(|(k, _)| k)
+                .collect()
+        };
+        if !stale_sgs.is_empty() {
+            let mut del =
+                tx.prepare("DELETE FROM onenote_section_groups WHERE section_group_key = ?1")?;
+            for k in stale_sgs {
+                del.execute(params![k])?;
+            }
+        }
+
+        // Prune stale sections and their per-section sync cursors
+        let stale_secs: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT section_key, scope_key FROM onenote_sections")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(k, scope)| scope_in_reconciled(scope) && !keep_sec_keys.contains(k))
+                .map(|(k, _)| k)
+                .collect()
+        };
+        if !stale_secs.is_empty() {
+            let mut del_sec = tx.prepare("DELETE FROM onenote_sections WHERE section_key = ?1")?;
+            let mut del_cur = tx.prepare("DELETE FROM sync_cursors WHERE scope_key = ?1")?;
+            for k in stale_secs {
+                del_sec.execute(params![k])?;
+                let cursor_key = format!("onenote:pages:{k}");
+                del_cur.execute(params![cursor_key])?;
+            }
+        }
+
+        // Prune orphaned pages (belonging to removed sections) and their FTS5 entries
+        let orphan_pages: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT page_key, section_key, scope_key FROM onenote_pages")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(_, sec_key, scope)| {
+                    scope_in_reconciled(scope) && !keep_sec_keys.contains(sec_key)
+                })
+                .map(|(pk, _, _)| pk)
+                .collect()
+        };
+        if !orphan_pages.is_empty() {
+            let mut del_page = tx.prepare("DELETE FROM onenote_pages WHERE page_key = ?1")?;
+            let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
+            for pk in orphan_pages {
+                del_page.execute(params![pk])?;
+                del_fts.execute(params![pk])?;
+            }
         }
     }
+
+    tx.commit()?;
+    Ok(())
+}
+
+/// Atomically upserts pages for a section and, when `is_complete_section_list` is true,
+/// deletes removed/moved pages (and their `onenote_fts` entries) for that section.
+pub fn reconcile_onenote_section_pages(
+    conn: &mut Connection,
+    section_key: &str,
+    pages: &[OnenotePageSummary],
+    is_complete_section_list: bool,
+) -> Result<()> {
+    let trimmed = section_key.trim();
+    if trimmed.is_empty() {
+        return upsert_onenote_pages(conn, pages);
+    }
+
+    let canonical_section_key = if trimmed.contains('|') {
+        trimmed.to_string()
+    } else {
+        OnenoteScope::Me.make_entity_key(trimmed)
+    };
+
+    let tx = conn.transaction()?;
+    upsert_onenote_pages_in_tx(&tx, pages)?;
+
+    if is_complete_section_list {
+        let keep_page_keys: HashSet<String> = pages.iter().map(normalized_page_key).collect();
+        let stale_pages: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT page_key FROM onenote_pages WHERE section_key = ?1")?;
+            let rows = stmt.query_map(params![canonical_section_key], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|pk| !keep_page_keys.contains(pk))
+                .collect()
+        };
+        if !stale_pages.is_empty() {
+            let mut del_page = tx.prepare("DELETE FROM onenote_pages WHERE page_key = ?1")?;
+            let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
+            for pk in stale_pages {
+                del_page.execute(params![pk])?;
+                del_fts.execute(params![pk])?;
+            }
+        }
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -602,6 +865,14 @@ pub fn get_onenote_page_detail(
     };
 
     let mut detail: OnenotePageDetail = serde_json::from_str(&detail_json)?;
+    if let (Some(cached_mod), Some(row_mod)) = (
+        detail.summary.last_modified_at.as_deref(),
+        row_modified.as_deref(),
+    ) {
+        if cached_mod != row_mod {
+            return Ok(None);
+        }
+    }
     detail.summary.title = row_title;
     detail.summary.level = row_level;
     detail.summary.order = row_order;
@@ -1390,5 +1661,212 @@ mod tests {
             .search_onenote_pages("PostgreSQL", None, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn test_upsert_pages_invalidates_stale_detail_when_last_modified_changes() {
+        let storage = Storage::open_in_memory().unwrap();
+        let initial_mod = "2026-11-15T10:00:00Z";
+        let summary = sample_page_summary(
+            OnenoteScope::Me,
+            "p-stale",
+            "sec-1",
+            "Initial Spec",
+            0,
+            initial_mod,
+        );
+        let detail = OnenotePageDetail {
+            summary: OnenotePageSummary {
+                preview_text: Some("Original body text".to_string()),
+                has_todo: true,
+                ..summary.clone()
+            },
+            raw_xhtml: "<html><body><p id=\"p:1\" data-tag=\"to-do\">Original body text</p></body></html>".to_string(),
+            body_markdown: "- [ ] Original body text".to_string(),
+            body_plain: "Original body text".to_string(),
+            blocks: vec![OnenoteBlock {
+                element_id: Some("p:1".to_string()),
+                tag: Some(OnenoteTagKind::Todo { completed: false }),
+                raw_html: None,
+                kind: OnenoteBlockKind::Paragraph {
+                    spans: vec![RichSpan::plain("Original body text")],
+                },
+            }],
+            resources: Vec::new(),
+            primary_div_id: None,
+            synced_at: Some(initial_mod.to_string()),
+        };
+        storage.upsert_onenote_page_detail(&detail).unwrap();
+        assert!(storage.get_onenote_page_detail("me|p-stale").unwrap().is_some());
+
+        // Same last_modified_at preserves detail_json, body_plain, preview_text, and has_todo.
+        let mut same_mod_summary = summary.clone();
+        same_mod_summary.title = "Renamed Without Content Edit".to_string();
+        storage.upsert_onenote_pages(&[same_mod_summary]).unwrap();
+        let preserved = storage
+            .get_onenote_page_detail("me|p-stale")
+            .unwrap()
+            .expect("detail should remain cached when last_modified_at is unchanged");
+        assert_eq!(preserved.summary.title, "Renamed Without Content Edit");
+        assert_eq!(preserved.body_plain, "Original body text");
+
+        // Newer last_modified_at invalidates stale detail_json & body_plain.
+        let mut newer_mod_summary = summary;
+        newer_mod_summary.title = "Updated Spec".to_string();
+        newer_mod_summary.last_modified_at = Some("2026-11-15T11:00:00Z".to_string());
+        storage.upsert_onenote_pages(&[newer_mod_summary]).unwrap();
+
+        assert!(
+            storage.get_onenote_page_detail("me|p-stale").unwrap().is_none(),
+            "detail must be invalidated when last_modified_at changes"
+        );
+        let updated_summary = storage.get_onenote_page_summary("me|p-stale").unwrap().unwrap();
+        assert_eq!(updated_summary.title, "Updated Spec");
+        assert_eq!(
+            updated_summary.last_modified_at.as_deref(),
+            Some("2026-11-15T11:00:00Z")
+        );
+        assert!(
+            storage
+                .search_onenote_pages("Original body", None, 10)
+                .unwrap()
+                .is_empty(),
+            "stale body_plain should be cleared from FTS5 index"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_prunes_deleted_notebooks_sections_and_pages_and_fts() {
+        let storage = Storage::open_in_memory().unwrap();
+        let nb1 = OnenoteNotebook {
+            notebook_key: "me|nb-1".to_string(),
+            id: "nb-1".to_string(),
+            scope: OnenoteScope::Me,
+            display_name: "Active Notebook".to_string(),
+            color: None,
+            is_default: true,
+            is_shared: false,
+            user_role: Some("Owner".to_string()),
+            created_at: None,
+            last_modified_at: None,
+            created_by: None,
+            web_url: None,
+        };
+        let nb2 = OnenoteNotebook {
+            notebook_key: "me|nb-2".to_string(),
+            id: "nb-2".to_string(),
+            scope: OnenoteScope::Me,
+            display_name: "Deleted Notebook".to_string(),
+            color: None,
+            is_default: false,
+            is_shared: false,
+            user_role: Some("Owner".to_string()),
+            created_at: None,
+            last_modified_at: None,
+            created_by: None,
+            web_url: None,
+        };
+        let sec1 = OnenoteSection {
+            section_key: "me|sec-1".to_string(),
+            id: "sec-1".to_string(),
+            scope: OnenoteScope::Me,
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Active Notebook".to_string()),
+            parent_section_group_id: None,
+            parent_section_group_name: None,
+            display_name: "Kept Section".to_string(),
+            color: None,
+            is_default: true,
+            pages_url: None,
+            created_at: None,
+            last_modified_at: None,
+            web_url: None,
+        };
+        let sec2 = OnenoteSection {
+            section_key: "me|sec-2".to_string(),
+            id: "sec-2".to_string(),
+            scope: OnenoteScope::Me,
+            notebook_id: Some("nb-2".to_string()),
+            notebook_name: Some("Deleted Notebook".to_string()),
+            parent_section_group_id: None,
+            parent_section_group_name: None,
+            display_name: "Removed Section".to_string(),
+            color: None,
+            is_default: false,
+            pages_url: None,
+            created_at: None,
+            last_modified_at: None,
+            web_url: None,
+        };
+        storage.upsert_onenote_notebooks(&[nb1.clone(), nb2]).unwrap();
+        storage.upsert_onenote_sections(&[sec1.clone(), sec2]).unwrap();
+
+        let p1 = sample_page_summary(
+            OnenoteScope::Me,
+            "p-1",
+            "sec-1",
+            "Alpha Architecture Roadmap",
+            0,
+            "2026-11-15T10:00:00Z",
+        );
+        let p2 = sample_page_summary(
+            OnenoteScope::Me,
+            "p-2",
+            "sec-1",
+            "Beta Removed Page",
+            1,
+            "2026-11-15T10:05:00Z",
+        );
+        let p3 = sample_page_summary(
+            OnenoteScope::Me,
+            "p-3",
+            "sec-2",
+            "Gamma Orphaned Notebook Page",
+            0,
+            "2026-11-15T10:10:00Z",
+        );
+        storage
+            .upsert_onenote_pages(&[p1.clone(), p2.clone(), p3])
+            .unwrap();
+        assert_eq!(storage.list_onenote_notebooks().unwrap().len(), 2);
+        assert_eq!(storage.list_onenote_sections(None).unwrap().len(), 2);
+        assert_eq!(
+            storage.search_onenote_pages("Gamma Orphaned", None, 10).unwrap().len(),
+            1
+        );
+
+        // Reconcile hierarchy down to 1 notebook and 1 section -> prunes nb-2, sec-2, and p-3 (+ FTS)
+        storage
+            .reconcile_onenote_hierarchy(&[nb1], &[], &[sec1], true)
+            .unwrap();
+        assert_eq!(storage.list_onenote_notebooks().unwrap().len(), 1);
+        assert_eq!(storage.list_onenote_notebooks().unwrap()[0].id, "nb-1");
+        assert_eq!(storage.list_onenote_sections(None).unwrap().len(), 1);
+        assert_eq!(storage.list_onenote_sections(None).unwrap()[0].id, "sec-1");
+        assert!(storage.list_onenote_pages("me|sec-2").unwrap().is_empty());
+        assert!(storage
+            .search_onenote_pages("Gamma Orphaned", None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(storage.list_onenote_pages("me|sec-1").unwrap().len(), 2);
+
+        // Reconcile section pages on sec-1 with complete list containing only p-1 -> prunes p-2 (+ FTS)
+        storage
+            .reconcile_onenote_section_pages("me|sec-1", &[p1], true)
+            .unwrap();
+        let remaining = storage.list_onenote_pages("me|sec-1").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "p-1");
+        assert!(storage
+            .search_onenote_pages("Beta Removed", None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage
+                .search_onenote_pages("Alpha Architecture", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

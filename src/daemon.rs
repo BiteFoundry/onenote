@@ -1219,10 +1219,38 @@ async fn run_initial_bootstrap(
                 summary: "Idle".to_string(),
             });
         }
-        Err(_) => {
+        Err(err) => {
+            let summary = match sync::classify_sync_error(&err) {
+                sync::SyncErrorKind::Forbidden403 => {
+                    let tok = graph
+                        .auth()
+                        .current_tokens()
+                        .await
+                        .map(|t| t.access_token);
+                    let msg = crate::auth::explain_graph_permission_error(
+                        &err.to_string(),
+                        tok.as_deref(),
+                    )
+                    .unwrap_or_else(|| err.to_string());
+                    let _ = event_tx.send(CoreEvent::SyncError(msg));
+                    "Sync failed".to_string()
+                }
+                sync::SyncErrorKind::Unauthorized401 => {
+                    let _ = event_tx.send(CoreEvent::SyncError(format!(
+                        "Authentication required: {err}"
+                    )));
+                    "Sync failed".to_string()
+                }
+                sync::SyncErrorKind::Transient => {
+                    let _ = event_tx.send(CoreEvent::SyncError(format!(
+                        "Initial sync failed: {err}"
+                    )));
+                    POLL_RETRY_SUMMARY.to_string()
+                }
+            };
             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                 busy: false,
-                summary: POLL_RETRY_SUMMARY.to_string(),
+                summary,
             });
         }
     }
@@ -1428,7 +1456,48 @@ async fn handle_client_connection(
             sync_ctrl.notify_activity();
             let mut broadcast_rx = broadcast_tx.subscribe();
             let status = shared.snapshot_status();
+            let replay_error = status.last_error.clone();
             write_json_line(&mut write_half, &ServerFrame::Subscribed(status)).await?;
+
+            if let Some(err) = replay_error {
+                if write_json_line(
+                    &mut write_half,
+                    &ServerFrame::Event(CoreEvent::SyncError(err)),
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(());
+                }
+            }
+
+            let st = storage.clone();
+            if let Ok(Ok((notebooks, section_groups, sections))) =
+                tokio::task::spawn_blocking(move || {
+                    let notebooks = st.list_onenote_notebooks()?;
+                    if notebooks.is_empty() {
+                        return Ok::<_, anyhow::Error>((Vec::new(), Vec::new(), Vec::new()));
+                    }
+                    let section_groups = st.list_onenote_section_groups()?;
+                    let sections = st.list_onenote_sections(None)?;
+                    Ok((notebooks, section_groups, sections))
+                })
+                .await
+            {
+                if !notebooks.is_empty() {
+                    let ev = CoreEvent::OnenoteHierarchyUpdated {
+                        notebooks,
+                        section_groups,
+                        sections,
+                    };
+                    if write_json_line(&mut write_half, &ServerFrame::Event(ev))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
 
             loop {
                 if *shutdown_rx.borrow() {
@@ -1912,5 +1981,111 @@ mod tests {
             Some("{\"ok\":false}")
         );
         assert_eq!(read_limited_line(&mut valid_reader).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_initial_bootstrap_403_records_last_error_in_daemon_status() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use serde_json::json;
+
+        use crate::auth::StoredTokens;
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/notebooks",
+                get(|| async {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": {
+                                "code": "AccessDenied",
+                                "message": "Forbidden"
+                            }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(|| async { Json(json!({ "value": [] })) }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths::from_config_dir(dir.path());
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tokens = StoredTokens {
+            access_token: "daemon-403-test-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("user-403".to_string()),
+            user_display_name: Some("Forbidden User".to_string()),
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        let daemon_paths = paths.clone();
+        let daemon_cfg = cfg.clone();
+        let daemon_handle = tokio::spawn(async move {
+            run_daemon_inner(
+                daemon_cfg,
+                daemon_paths,
+                graph,
+                storage,
+                Some("user-403".to_string()),
+                true,
+                false,
+            )
+            .await
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut recorded_err: Option<String> = None;
+        while Instant::now() < deadline {
+            if paths.state_file.exists() {
+                if let Ok(status) = query_daemon_status_at(&paths).await {
+                    if status.running && status.last_error.is_some() {
+                        recorded_err = status.last_error;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let err_text = recorded_err.expect("daemon status should record last_error on 403 bootstrap");
+        assert!(
+            err_text.contains("Insufficient Graph permissions (403)"),
+            "expected 403 permission guidance in last_error, got: {err_text}"
+        );
+
+        // Subscribing after a 403 initial bootstrap replays CoreEvent::SyncError immediately.
+        let mut conn = try_connect_tui_at(&cfg, &paths, Some("user-403"))
+            .await
+            .expect("TUI should attach to running daemon");
+        let replayed = tokio::time::timeout(Duration::from_secs(1), conn.events_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            replayed,
+            CoreEvent::SyncError(ref msg) if msg.contains("Insufficient Graph permissions (403)")
+        ));
+        drop(conn);
+
+        assert!(stop_daemon_at(&paths).await.unwrap());
+        let _ = daemon_handle.await;
+        server_handle.abort();
     }
 }

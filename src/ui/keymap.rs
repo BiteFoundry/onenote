@@ -79,6 +79,7 @@ impl KeyMap {
         match key.code {
             KeyCode::Char('?') => Some(KeyCommand::Help),
             KeyCode::Char('/') => Some(KeyCommand::Search),
+            KeyCode::Char('r') | KeyCode::Char('R') => Some(KeyCommand::Refresh),
             KeyCode::Char('.') => Some(KeyCommand::OpenContextMenu),
             KeyCode::Char('u') => Some(KeyCommand::OpenLinkExtractor),
             KeyCode::Char('h') => Some(KeyCommand::ToggleShowLinkUrls),
@@ -98,5 +99,28 @@ impl KeyMap {
             KeyCode::Char('y') => Some(KeyCommand::CopySelection),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_r_and_shift_r_trigger_refresh_only_outside_text_input() {
+        let km = KeyMap;
+        let lower_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        let upper_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let f5 = KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE);
+
+        assert_eq!(km.resolve_global(&lower_r, false), Some(KeyCommand::Refresh));
+        assert_eq!(km.resolve_global(&upper_r, false), Some(KeyCommand::Refresh));
+        assert_eq!(km.resolve_global(&lower_r, true), None);
+        assert_eq!(km.resolve_global(&upper_r, true), None);
+
+        // Ctrl+R and F5 continue to work even during text input
+        assert_eq!(km.resolve_global(&ctrl_r, true), Some(KeyCommand::Refresh));
+        assert_eq!(km.resolve_global(&f5, true), Some(KeyCommand::Refresh));
     }
 }

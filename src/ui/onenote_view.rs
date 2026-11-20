@@ -597,12 +597,16 @@ fn draw_note_canvas(
     let Some(detail) = app.active_page_detail().cloned() else {
         let msg = if app.loading_onenote_detail {
             "Loading OneNote page content..."
+        } else if app.notebooks.is_empty() && app.syncing {
+            "Syncing OneNote notebooks and sections..."
         } else if app.notebooks.is_empty() {
             "Select a notebook in the left sidebar or press B to create one."
+        } else if app.pages.is_empty() && app.loading_onenote_pages {
+            "Loading pages..."
         } else if app.pages.is_empty() {
             "No pages in this section yet (press n to create a page)."
         } else {
-            "Select a page (j/k or click)."
+            "Select a page (j/k or click) or press r to refresh."
         };
         frame.render_widget(Paragraph::new(msg).style(theme.muted_style()), inner);
         return;

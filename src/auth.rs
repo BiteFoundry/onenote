@@ -26,13 +26,23 @@ use url::Url;
 
 use crate::config::{credential_fallback_path, legacy_teams_config_dir, write_atomic, AppConfig};
 
-/// Default Microsoft Graph delegated OAuth scopes for `onenote-cli`.
+/// Default Microsoft Graph delegated OAuth scopes for `onenote-cli` (consumer-safe for `/common` and Personal MSA).
 pub const DEFAULT_SCOPES: &[&str] = &[
     "Notes.Read",
     "Notes.ReadWrite",
     "Notes.Create",
     "User.Read",
     "offline_access",
+];
+
+/// Well-known Microsoft Entra ID tenant GUID for Personal Microsoft Accounts (MSA / consumers).
+pub(crate) const CONSUMER_MSA_TENANT_ID: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
+
+/// Additional delegated scopes requested for explicit organizational (work/school) tenants.
+pub const ORG_EXTRA_SCOPES: &[&str] = &[
+    "Notes.Read.All",
+    "Notes.ReadWrite.All",
+    "Team.ReadBasic.All",
 ];
 
 const KEYRING_SERVICE: &str = "onenote-cli";
@@ -229,11 +239,54 @@ impl AuthManager {
         load_stored_tokens()
     }
 
-    fn effective_scopes_string(&self) -> String {
+    fn effective_scopes_for_tenant(&self, tenant_id: &str) -> String {
         if !self.config.scopes.is_empty() {
-            self.config.scopes.join(" ")
-        } else {
+            return self.config.scopes.join(" ");
+        }
+        if is_consumer_or_common_tenant(tenant_id) {
             DEFAULT_SCOPES.join(" ")
+        } else {
+            let mut scopes: Vec<&str> =
+                Vec::with_capacity(DEFAULT_SCOPES.len() + ORG_EXTRA_SCOPES.len());
+            scopes.extend_from_slice(DEFAULT_SCOPES);
+            scopes.extend_from_slice(ORG_EXTRA_SCOPES);
+            scopes.join(" ")
+        }
+    }
+
+    async fn post_refresh_token_with_fallback(
+        &self,
+        token_url: &str,
+        client_id: &str,
+        refresh_token: &str,
+        tenant_id: &str,
+    ) -> Result<TokenResponse> {
+        let scope = self.effective_scopes_for_tenant(tenant_id);
+        let params = [
+            ("client_id", client_id),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("scope", scope.as_str()),
+        ];
+        match self.post_token_form(token_url, &params).await {
+            Ok(resp) => Ok(resp),
+            Err(err)
+                if self.config.scopes.is_empty()
+                    && is_scope_consent_or_invalid_scope_error(&err) =>
+            {
+                let fallback_scope = DEFAULT_SCOPES.join(" ");
+                if scope == fallback_scope {
+                    return Err(err);
+                }
+                let fallback_params = [
+                    ("client_id", client_id),
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token),
+                    ("scope", fallback_scope.as_str()),
+                ];
+                self.post_token_form(token_url, &fallback_params).await
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -527,10 +580,35 @@ impl AuthManager {
 
     pub async fn current_tokens(&self) -> Option<StoredTokens> {
         if let Some(tok) = self.resolve_current_tokens_raw().await {
+            let is_external = matches!(
+                tok.auth_mode.as_str(),
+                "env_token" | "token_file" | "refresh_cmd" | "shared_teams_token_file"
+            );
+            if !is_external
+                && tok.is_expired_soon(0)
+                && !self.can_refresh_token(&tok)
+                && !self.has_refresh_cmd()
+                && self.config.share_m365_auth
+            {
+                if let Some(teams_tok) = self.load_legacy_teams_stored_tokens() {
+                    if self.can_refresh_token(&teams_tok) {
+                        if let Ok(upgraded) = self.upgrade_shared_teams_session(&teams_tok).await {
+                            return Some(upgraded);
+                        }
+                    }
+                }
+            }
             return Some(tok);
         }
         if self.has_refresh_cmd() {
             return self.run_external_refresh_cmd(None, true).await.ok();
+        }
+        if self.config.share_m365_auth {
+            if let Some(teams_tok) = self.load_legacy_teams_stored_tokens() {
+                if self.can_refresh_token(&teams_tok) {
+                    return self.upgrade_shared_teams_session(&teams_tok).await.ok();
+                }
+            }
         }
         None
     }
@@ -580,14 +658,18 @@ impl AuthManager {
             }
 
             if tok.auth_mode == "shared_teams_session" {
-                if !tok.is_expired_soon(90) && token_has_onenote_scopes(&tok.access_token) {
+                if !tok.is_expired_soon(90)
+                    && token_is_onenote_eligible_or_opaque(&tok.access_token)
+                {
                     return Ok(tok.access_token);
                 }
                 if self.can_refresh_token(&tok) {
                     let upgraded = self.upgrade_shared_teams_session(&tok).await?;
                     return Ok(upgraded.access_token);
                 }
-                if !tok.is_expired_soon(0) && token_has_onenote_scopes(&tok.access_token) {
+                if !tok.is_expired_soon(0)
+                    && token_is_onenote_eligible_or_opaque(&tok.access_token)
+                {
                     return Ok(tok.access_token);
                 }
                 bail!("Shared Microsoft 365 session expired. Run 'onenote login' first.");
@@ -619,6 +701,28 @@ impl AuthManager {
                 let refreshed = self.refresh_oauth_serialized(None, Some(90)).await?;
                 return Ok(refreshed.access_token);
             }
+            if tok.is_expired_soon(0) {
+                if self.config.share_m365_auth {
+                    if let Some(mut teams_tok) = self.load_legacy_teams_stored_tokens() {
+                        if !teams_tok.is_expired_soon(90)
+                            && token_has_onenote_scopes(&teams_tok.access_token)
+                        {
+                            teams_tok.auth_mode = "shared_teams_session".to_string();
+                            *self.tokens.write().await = Some(teams_tok.clone());
+                            return Ok(teams_tok.access_token);
+                        }
+                        if self.can_refresh_token(&teams_tok) {
+                            let upgraded = self.upgrade_shared_teams_session(&teams_tok).await?;
+                            return Ok(upgraded.access_token);
+                        }
+                    }
+                }
+                bail!(
+                    "Access token expired (exp: {}, auth_mode={}) — run 'onenote login' to re-authenticate.",
+                    format_local_exp(tok.expires_at),
+                    tok.auth_mode
+                );
+            }
             return Ok(tok.access_token);
         }
 
@@ -640,9 +744,11 @@ impl AuthManager {
         }
 
         if let Ok(Some(reloaded)) = self.load_from_configured_source() {
-            let mut guard = self.tokens.write().await;
-            *guard = Some(reloaded.clone());
-            return Ok(reloaded.access_token);
+            if !reloaded.is_expired_soon(0) {
+                let mut guard = self.tokens.write().await;
+                *guard = Some(reloaded.clone());
+                return Ok(reloaded.access_token);
+            }
         }
 
         // Shared M365 fallback: check teams-cli StoredTokens even if its access token is expired
@@ -673,12 +779,18 @@ impl AuthManager {
 
         // Re-check in case another concurrent task already cached a OneNote token.
         if let Some(ref mem) = *self.tokens.read().await {
-            if !mem.is_expired_soon(30) && token_has_onenote_scopes(&mem.access_token) {
+            if mem.access_token != teams_tok.access_token
+                && !mem.is_expired_soon(30)
+                && token_is_onenote_eligible_or_opaque(&mem.access_token)
+            {
                 return Ok(mem.clone());
             }
         }
         if let Ok(Some(disk)) = self.load_from_configured_source() {
-            if !disk.is_expired_soon(10) {
+            if disk.access_token != teams_tok.access_token
+                && !disk.is_expired_soon(10)
+                && token_is_onenote_eligible_or_opaque(&disk.access_token)
+            {
                 let mut guard = self.tokens.write().await;
                 *guard = Some(disk.clone());
                 return Ok(disk);
@@ -693,16 +805,13 @@ impl AuthManager {
             .ok_or_else(|| anyhow!("Shared Microsoft 365 session has no refresh token. Run 'onenote login'."))?;
 
         let token_url = self.token_endpoint(&teams_tok.tenant_id);
-        let scope = self.effective_scopes_string();
-        let params = [
-            ("client_id", teams_tok.client_id.as_str()),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", rt),
-            ("scope", scope.as_str()),
-        ];
-
         let token_resp = self
-            .post_token_form(&token_url, &params)
+            .post_refresh_token_with_fallback(
+                &token_url,
+                &teams_tok.client_id,
+                rt,
+                &teams_tok.tenant_id,
+            )
             .await
             .map_err(|err| {
                 anyhow!(
@@ -927,7 +1036,11 @@ impl AuthManager {
             }
             bail!("External token file is expired or was rejected. Refresh your token or set ONENOTE_TOKEN_REFRESH_CMD.");
         }
-        if self.tokens.read().await.is_none() {
+        let needs_shared_fallback = match self.tokens.read().await.as_ref() {
+            None => true,
+            Some(cur) => !self.can_refresh_token(cur),
+        };
+        if needs_shared_fallback {
             if let Some(shared_path) = self.resolve_shared_teams_token_file_path() {
                 if shared_path.exists() {
                     if let Ok(disk_tok) = self.cached_shared_teams_token_file(&shared_path) {
@@ -938,7 +1051,9 @@ impl AuthManager {
                             return Ok(disk_tok);
                         }
                     }
-                    bail!("Shared Teams token file was rejected or expired. Refresh your Teams token or run 'onenote login'.");
+                    if self.tokens.read().await.is_none() {
+                        bail!("Shared Teams token file was rejected or expired. Refresh your Teams token or run 'onenote login'.");
+                    }
                 }
             }
             if self.config.share_m365_auth {
@@ -1126,7 +1241,6 @@ impl AuthManager {
             .ok_or_else(|| anyhow!("No stored token found. Run 'onenote login' first."))?;
 
         let token_url = self.token_endpoint(&current.tenant_id);
-        let scope = self.effective_scopes_string();
 
         let token_resp = if let Some(rt) = current
             .refresh_token
@@ -1134,13 +1248,13 @@ impl AuthManager {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let params = [
-                ("client_id", current.client_id.as_str()),
-                ("grant_type", "refresh_token"),
-                ("refresh_token", rt),
-                ("scope", scope.as_str()),
-            ];
-            self.post_token_form(&token_url, &params).await?
+            self.post_refresh_token_with_fallback(
+                &token_url,
+                &current.client_id,
+                rt,
+                &current.tenant_id,
+            )
+            .await?
         } else if current.auth_mode == "client_credentials" {
             let secret = env_client_secret().ok_or_else(|| {
                 anyhow!("ONENOTE_CLIENT_SECRET environment variable is required to refresh client_credentials token.")
@@ -1214,7 +1328,7 @@ impl AuthManager {
     async fn login_device_code(&self, client_id: &str, tenant_id: &str) -> Result<StoredTokens> {
         let device_url = self.devicecode_endpoint(tenant_id);
         let token_url = self.token_endpoint(tenant_id);
-        let scope = self.effective_scopes_string();
+        let scope = self.effective_scopes_for_tenant(tenant_id);
 
         let res = self
             .http
@@ -1224,8 +1338,27 @@ impl AuthManager {
             .await
             .context("Failed to send Device Code request")?;
 
-        let status = res.status();
-        let body_text = res.text().await.unwrap_or_default();
+        let mut status = res.status();
+        let mut body_text = res.text().await.unwrap_or_default();
+        if !status.is_success() && self.config.scopes.is_empty() {
+            let fallback_scope = DEFAULT_SCOPES.join(" ");
+            let body_lower = body_text.to_ascii_lowercase();
+            if scope != fallback_scope
+                && (body_lower.contains("aadsts65001")
+                    || body_lower.contains("aadsts70011")
+                    || body_lower.contains("invalid_scope"))
+            {
+                let retry_res = self
+                    .http
+                    .post(&device_url)
+                    .form(&[("client_id", client_id), ("scope", fallback_scope.as_str())])
+                    .send()
+                    .await
+                    .context("Failed to send fallback Device Code request")?;
+                status = retry_res.status();
+                body_text = retry_res.text().await.unwrap_or_default();
+            }
+        }
         if !status.is_success() {
             bail!("Failed to start Device Code flow ({}): {}", status, body_text);
         }
@@ -1329,7 +1462,7 @@ impl AuthManager {
             .with_context(|| format!("Failed to bind local callback port (127.0.0.1:{bind_port})"))?;
         let actual_port = listener.local_addr()?.port();
         let redirect_uri = format!("http://localhost:{actual_port}");
-        let scope = self.effective_scopes_string();
+        let scope = self.effective_scopes_for_tenant(tenant_id);
 
         let mut auth_url = Url::parse(&self.authorize_endpoint(tenant_id))
             .context("Failed to build authorize URL")?;
@@ -1847,6 +1980,41 @@ struct JwtClaims {
     client_id: Option<String>,
     scopes: Vec<String>,
     roles: Vec<String>,
+}
+
+pub(crate) fn is_consumer_msa_tenant(tenant_id: &str) -> bool {
+    let trimmed = tenant_id.trim();
+    trimmed.eq_ignore_ascii_case("consumers")
+        || trimmed.eq_ignore_ascii_case(CONSUMER_MSA_TENANT_ID)
+}
+
+pub(crate) fn is_consumer_or_common_tenant(tenant_id: &str) -> bool {
+    let trimmed = tenant_id.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("common")
+        || is_consumer_msa_tenant(trimmed)
+}
+
+pub(crate) fn is_consumer_msa_token(tok: &StoredTokens) -> bool {
+    if is_consumer_msa_tenant(&tok.tenant_id) {
+        return true;
+    }
+    if let Some(claims) = parse_jwt_claims(&tok.access_token) {
+        if let Some(ref tid) = claims.tenant_id {
+            if is_consumer_msa_tenant(tid) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_scope_consent_or_invalid_scope_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("aadsts65001")
+        || msg.contains("aadsts70011")
+        || msg.contains("invalid_scope")
+        || msg.contains("consent_required")
 }
 
 fn token_has_onenote_scopes(token: &str) -> bool {
@@ -3514,5 +3682,284 @@ mod tests {
         mgr.logout().await.unwrap();
         assert!(mgr.current_tokens().await.is_none());
         assert!(cred_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_expired_stored_access_token_bails_or_upgrades_shared_m365() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+
+        let now = chrono::Utc::now().timestamp();
+
+        // 1. Expired non-refreshable stored access_token must bail with clear expiry error (never leak expired token)
+        let expired_tok = StoredTokens {
+            access_token: "expired-static-token".into(),
+            refresh_token: None,
+            expires_at: now - 120,
+            client_id: "cid".into(),
+            tenant_id: "common".into(),
+            user_id: Some("u1".into()),
+            user_display_name: Some("Tester".into()),
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let mgr_expired = AuthManager::from_tokens(AppConfig::default(), expired_tok.clone());
+        let err = mgr_expired
+            .valid_access_token()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_ascii_lowercase().contains("expired") && err.contains("onenote login"),
+            "expected clear expiry error with login hint, got: {err}"
+        );
+
+        // 2. When share_m365_auth = true and a refreshable teams-cli token exists,
+        // both valid_access_token() and current_tokens() silently upgrade to a valid OneNote token.
+        let refresh_hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = refresh_hits.clone();
+        let upgraded_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": now + 3600,
+                "scp": "User.Read Notes.Read Notes.ReadWrite Notes.Create offline_access",
+                "oid": "u-upgraded"
+            }),
+            false,
+        );
+        let jwt_clone = upgraded_jwt.clone();
+
+        let app = Router::new().route(
+            "/common/oauth2/v2.0/token",
+            post(move |body: String| {
+                let hits = hits_clone.clone();
+                let jwt = jwt_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    assert!(body.contains("grant_type=refresh_token"));
+                    Json(serde_json::json!({
+                        "access_token": jwt,
+                        "refresh_token": "rt-upgraded",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempdir().unwrap();
+        let teams_dir = dir.path().join("teams-cli");
+        std::fs::create_dir_all(&teams_dir).unwrap();
+        let teams_tok = StoredTokens {
+            access_token: make_test_jwt_with_encoder(
+                &serde_json::json!({
+                    "exp": now + 3600,
+                    "scp": "User.Read Chat.Read"
+                }),
+                false,
+            ),
+            refresh_token: Some("rt-teams-shared".into()),
+            expires_at: now + 3600,
+            client_id: "cid".into(),
+            tenant_id: "common".into(),
+            user_id: Some("u-upgraded".into()),
+            user_display_name: Some("Shared User".into()),
+            user_email: None,
+            auth_mode: "pkce".into(),
+        };
+        save_tokens_to_path(&teams_tok, &teams_dir.join("credentials.json")).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.auth_base_url = format!("http://{addr}");
+        cfg.share_m365_auth = true;
+
+        // 2a. Expired non-refreshable stored token upgrades via valid_access_token()
+        let cred_path_1 = dir.path().join("onenote-1").join("credentials.json");
+        let mgr_upgrade_expired = AuthManager::from_tokens(cfg.clone(), expired_tok)
+            .with_token_path(cred_path_1)
+            .with_legacy_teams_dir(teams_dir.clone());
+        let valid_tok = mgr_upgrade_expired.valid_access_token().await.unwrap();
+        assert_eq!(valid_tok, upgraded_jwt);
+
+        // 2b. Empty onenote token store upgrades via current_tokens() (for doctor / daemon start)
+        let cred_path_2 = dir.path().join("onenote-2").join("credentials.json");
+        let mgr_bootstrap_current = AuthManager::empty_for_test(cfg)
+            .with_token_path(cred_path_2)
+            .with_legacy_teams_dir(teams_dir);
+        let cur = mgr_bootstrap_current
+            .current_tokens()
+            .await
+            .expect("current_tokens() must bootstrap refreshable teams-cli token");
+        assert_eq!(cur.access_token, upgraded_jwt);
+        assert_eq!(cur.auth_mode, "shared_teams_session");
+        assert_eq!(refresh_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_shared_teams_session_opaque_msa_token_does_not_loop_refresh() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+
+        let refresh_hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = refresh_hits.clone();
+        let opaque_msa_token = "EwB4A8l6BAAU-opaque-personal-msa-token-12345";
+
+        let app = Router::new().route(
+            "/consumers/oauth2/v2.0/token",
+            post(move |body: String| {
+                let hits = hits_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    assert!(body.contains("grant_type=refresh_token"));
+                    // Consumer MSA requests must stay on consumer-safe DEFAULT_SCOPES (no .All / Team scopes)
+                    assert!(!body.contains("Notes.Read.All"));
+                    assert!(!body.contains("Team.ReadBasic.All"));
+                    Json(serde_json::json!({
+                        "access_token": opaque_msa_token,
+                        "refresh_token": "rt-msa-upgraded",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempdir().unwrap();
+        let teams_dir = dir.path().join("teams-cli");
+        std::fs::create_dir_all(&teams_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let teams_msa_tok = StoredTokens {
+            access_token: "EwB4A8l6BAAU-initial-teams-opaque".into(),
+            refresh_token: Some("rt-msa-teams".into()),
+            expires_at: now + 3600,
+            client_id: "cid".into(),
+            tenant_id: "consumers".into(),
+            user_id: None,
+            user_display_name: Some("MSA User".into()),
+            user_email: Some("msa@outlook.com".into()),
+            auth_mode: "pkce".into(),
+        };
+        save_tokens_to_path(&teams_msa_tok, &teams_dir.join("credentials.json")).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.auth_base_url = format!("http://{addr}");
+        cfg.share_m365_auth = true;
+
+        let onenote_cred_path = dir.path().join("onenote-cli").join("credentials.json");
+        let mgr = AuthManager::empty_for_test(cfg)
+            .with_token_path(onenote_cred_path)
+            .with_legacy_teams_dir(teams_dir);
+
+        let tok1 = mgr.valid_access_token().await.unwrap();
+        let tok2 = mgr.valid_access_token().await.unwrap();
+        assert_eq!(tok1, opaque_msa_token);
+        assert_eq!(tok2, opaque_msa_token);
+        assert_eq!(
+            refresh_hits.load(Ordering::SeqCst),
+            1,
+            "opaque MSA shared_teams_session token must not re-refresh on consecutive calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_effective_scopes_for_tenant_and_consent_fallback() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+
+        let cfg_default = AppConfig::default();
+        let mgr_scopes = AuthManager::empty_for_test(cfg_default);
+
+        // Consumer/common tenants remain consumer-safe
+        for tenant in ["common", "consumers", CONSUMER_MSA_TENANT_ID] {
+            let s = mgr_scopes.effective_scopes_for_tenant(tenant);
+            assert_eq!(s, DEFAULT_SCOPES.join(" "), "tenant={tenant}");
+            assert!(!s.contains("Notes.Read.All"));
+            assert!(!s.contains("Team.ReadBasic.All"));
+        }
+
+        // Explicit org tenants include organizational scopes
+        for tenant in [
+            "organizations",
+            "contoso.onmicrosoft.com",
+            "11111111-2222-3333-4444-555555555555",
+        ] {
+            let s = mgr_scopes.effective_scopes_for_tenant(tenant);
+            assert!(s.contains("Notes.Read.All"), "tenant={tenant}: {s}");
+            assert!(s.contains("Notes.ReadWrite.All"), "tenant={tenant}: {s}");
+            assert!(s.contains("Team.ReadBasic.All"), "tenant={tenant}: {s}");
+        }
+
+        // Org refresh falls back to DEFAULT_SCOPES on AADSTS65001 consent error
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let app = Router::new().route(
+            "/contoso.onmicrosoft.com/oauth2/v2.0/token",
+            post(move |body: String| {
+                let hits = hits_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if body.contains("Team.ReadBasic.All") || body.contains("Notes.Read.All") {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "invalid_grant",
+                                "error_description": "AADSTS65001: Consent required for Team.ReadBasic.All"
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "access_token": "org-fallback-token",
+                                "refresh_token": "rt-fallback",
+                                "expires_in": 3600
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.auth_base_url = format!("http://{addr}");
+        let expired_org = StoredTokens {
+            access_token: "old-org-token".into(),
+            refresh_token: Some("rt-org".into()),
+            expires_at: chrono::Utc::now().timestamp() - 60,
+            client_id: "cid".into(),
+            tenant_id: "contoso.onmicrosoft.com".into(),
+            user_id: Some("u-org".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".into(),
+        };
+        let mgr_org = AuthManager::from_tokens(cfg, expired_org);
+        let refreshed = mgr_org.valid_access_token().await.unwrap();
+        assert_eq!(refreshed, "org-fallback-token");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }

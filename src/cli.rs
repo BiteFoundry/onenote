@@ -430,7 +430,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             offline,
             cached,
             json,
-        }) => cmd_notebooks(cfg, include_teams, refresh, offline || cached, json).await,
+        }) => cmd_notebooks(cfg, include_teams, refresh, offline, cached, json).await,
         Some(Command::CreateNotebook {
             name,
             group,
@@ -443,7 +443,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             offline,
             cached,
             json,
-        }) => cmd_sections(cfg, notebook.as_deref(), refresh, offline || cached, json).await,
+        }) => cmd_sections(cfg, notebook.as_deref(), refresh, offline, cached, json).await,
         Some(Command::CreateSection {
             notebook,
             name,
@@ -456,7 +456,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             offline,
             cached,
             json,
-        }) => cmd_pages(cfg, &section, limit, refresh, offline || cached, json).await,
+        }) => cmd_pages(cfg, &section, limit, refresh, offline, cached, json).await,
         Some(Command::Read {
             page,
             format,
@@ -464,7 +464,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             offline,
             cached,
             json,
-        }) => cmd_read(cfg, &page, &format, preview_images, offline || cached, json).await,
+        }) => cmd_read(cfg, &page, &format, preview_images, offline, cached, json).await,
         Some(Command::Create {
             section,
             title,
@@ -600,18 +600,39 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
 // Shared Runtime & Domain Helpers (CLI / HTTP / MCP)
 // ---------------------------------------------------------------------------
 
+const CURSOR_NOTEBOOKS_PERSONAL: &str = "onenote:notebooks:personal";
+const CURSOR_NOTEBOOKS_ALL: &str = "onenote:notebooks:all";
+const CURSOR_SECTIONS_ALL: &str = "onenote:sections:all";
+const CURSOR_HIERARCHY: &str = "onenote:hierarchy";
+
 pub async fn open_runtime(
     cfg: &AppConfig,
     require_auth: bool,
 ) -> Result<(AuthManager, GraphClient, Storage)> {
+    open_runtime_inner(cfg, require_auth, false).await
+}
+
+async fn open_runtime_inner(
+    cfg: &AppConfig,
+    require_auth: bool,
+    offline: bool,
+) -> Result<(AuthManager, GraphClient, Storage)> {
     let auth = AuthManager::new(cfg.clone())?;
-    let user_id = if require_auth {
+    let mut user_id = if require_auth {
         let _ = auth.valid_access_token().await?;
         auth.current_tokens().await.and_then(|t| t.user_id)
     } else {
         auth.current_tokens().await.and_then(|t| t.user_id)
-    };
+    }
+    .filter(|id| !id.trim().is_empty());
+
     let graph = GraphClient::new(cfg.clone(), auth.clone())?;
+    if user_id.is_none() && !offline && (require_auth || auth.current_tokens().await.is_some()) {
+        user_id = graph
+            .resolve_my_user_id()
+            .await
+            .filter(|id| !id.trim().is_empty());
+    }
     let graph = if let Some(ref uid) = user_id {
         graph.with_my_user_id(uid.clone())
     } else {
@@ -620,6 +641,37 @@ pub async fn open_runtime(
     let db_file = config::db_path(user_id.as_deref());
     let storage = Storage::open(&db_file)?;
     Ok((auth, graph, storage))
+}
+
+fn is_cursor_fresh(storage: &Storage, scope_key: &str, ttl_secs: u64) -> bool {
+    if ttl_secs == 0 {
+        return false;
+    }
+    let Ok(Some(cursor)) = storage.get_sync_cursor(scope_key) else {
+        return false;
+    };
+    let Ok(synced_at) = chrono::DateTime::parse_from_rfc3339(&cursor.last_synced_at) else {
+        return false;
+    };
+    let age_secs = chrono::Utc::now()
+        .signed_duration_since(synced_at.with_timezone(&chrono::Utc))
+        .num_seconds();
+    age_secs < (ttl_secs as i64)
+}
+
+fn record_sync_cursor(storage: &Storage, scope_key: impl Into<String>, delta_link: Option<String>) {
+    let _ = storage.upsert_sync_cursor(&crate::models::SyncCursor {
+        scope_key: scope_key.into(),
+        delta_link,
+        history_next_link: None,
+        last_synced_at: chrono::Utc::now().to_rfc3339(),
+    });
+}
+
+async fn nudge_live_daemon(cfg: &AppConfig, graph: &GraphClient, cmd: sync::SyncCommand) {
+    if daemon::is_daemon_alive_fast(cfg, graph.my_user_id()) {
+        let _ = daemon::nudge_daemon(cfg, Some(cmd), None).await;
+    }
 }
 
 pub fn build_onenote_scope_from_args(
@@ -649,24 +701,64 @@ pub async fn load_onenote_notebooks(
     refresh: bool,
     offline: bool,
 ) -> Result<Vec<OnenoteNotebook>> {
+    load_onenote_notebooks_with_cache(storage, graph, include_teams, refresh, offline, false).await
+}
+
+pub async fn load_onenote_notebooks_with_cache(
+    storage: &Storage,
+    graph: &GraphClient,
+    include_teams: bool,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+) -> Result<Vec<OnenoteNotebook>> {
+    let filter_nbs = |items: Vec<OnenoteNotebook>| -> Vec<OnenoteNotebook> {
+        if include_teams {
+            items
+        } else {
+            items.into_iter().filter(|n| n.scope.is_personal()).collect()
+        }
+    };
+
+    if offline {
+        return Ok(filter_nbs(storage.list_onenote_notebooks()?));
+    }
+
     if !refresh {
-        let cached = storage.list_onenote_notebooks()?;
-        if !cached.is_empty() || offline {
-            return Ok(if include_teams {
-                cached
+        let cached_all = storage.list_onenote_notebooks()?;
+        let filtered = filter_nbs(cached_all);
+        if !filtered.is_empty() {
+            if cached {
+                let teams_synced = !include_teams
+                    || storage.get_sync_cursor(CURSOR_NOTEBOOKS_ALL).ok().flatten().is_some()
+                    || storage.get_sync_cursor(CURSOR_HIERARCHY).ok().flatten().is_some()
+                    || filtered.iter().any(|n| !n.scope.is_personal());
+                if teams_synced {
+                    return Ok(filtered);
+                }
             } else {
-                cached
-                    .into_iter()
-                    .filter(|n| n.scope.is_personal())
-                    .collect()
-            });
+                let ttl = graph.config().cli_cache_ttl_secs;
+                let fresh = if include_teams {
+                    is_cursor_fresh(storage, CURSOR_NOTEBOOKS_ALL, ttl)
+                        || is_cursor_fresh(storage, CURSOR_HIERARCHY, ttl)
+                } else {
+                    is_cursor_fresh(storage, CURSOR_NOTEBOOKS_PERSONAL, ttl)
+                        || is_cursor_fresh(storage, CURSOR_NOTEBOOKS_ALL, ttl)
+                        || is_cursor_fresh(storage, CURSOR_HIERARCHY, ttl)
+                };
+                if fresh {
+                    return Ok(filtered);
+                }
+            }
         }
     }
-    if offline {
-        return Ok(storage.list_onenote_notebooks()?);
-    }
+
     let fetched = graph.list_all_accessible_notebooks(include_teams).await?;
     storage.upsert_onenote_notebooks(&fetched)?;
+    record_sync_cursor(storage, CURSOR_NOTEBOOKS_PERSONAL, None);
+    if include_teams {
+        record_sync_cursor(storage, CURSOR_NOTEBOOKS_ALL, None);
+    }
     Ok(fetched)
 }
 
@@ -677,6 +769,17 @@ pub async fn load_onenote_sections(
     refresh: bool,
     offline: bool,
 ) -> Result<(Option<OnenoteNotebook>, Vec<OnenoteSection>)> {
+    load_onenote_sections_with_cache(storage, graph, notebook_query, refresh, offline, false).await
+}
+
+pub async fn load_onenote_sections_with_cache(
+    storage: &Storage,
+    graph: &GraphClient,
+    notebook_query: Option<&str>,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+) -> Result<(Option<OnenoteNotebook>, Vec<OnenoteSection>)> {
     let nb = if let Some(q) = notebook_query.map(str::trim).filter(|s| !s.is_empty()) {
         Some(resolver::resolve_notebook(graph, storage, q, offline).await?)
     } else {
@@ -684,14 +787,26 @@ pub async fn load_onenote_sections(
     };
     let nb_key = nb.as_ref().map(|n| n.notebook_key.clone());
 
-    if !refresh {
-        let cached = storage.list_onenote_sections(nb_key.as_deref())?;
-        if !cached.is_empty() || offline {
-            return Ok((nb, cached));
-        }
-    }
     if offline {
         return Ok((nb, storage.list_onenote_sections(nb_key.as_deref())?));
+    }
+
+    let scope_key = nb_key
+        .as_deref()
+        .map(|k| format!("onenote:sections:{k}"))
+        .unwrap_or_else(|| CURSOR_SECTIONS_ALL.to_string());
+    let ttl = graph.config().cli_cache_ttl_secs;
+
+    if !refresh {
+        let cached_secs = storage.list_onenote_sections(nb_key.as_deref())?;
+        if !cached_secs.is_empty()
+            && (cached
+                || is_cursor_fresh(storage, &scope_key, ttl)
+                || is_cursor_fresh(storage, CURSOR_SECTIONS_ALL, ttl)
+                || is_cursor_fresh(storage, CURSOR_HIERARCHY, ttl))
+        {
+            return Ok((nb, cached_secs));
+        }
     }
 
     let fetched = if let Some(ref target_nb) = nb {
@@ -700,9 +815,16 @@ pub async fn load_onenote_sections(
             .await?
     } else {
         let mut notebooks = storage.list_onenote_notebooks()?;
-        if notebooks.is_empty() {
+        if notebooks.is_empty()
+            || refresh
+            || (!cached
+                && !is_cursor_fresh(storage, CURSOR_NOTEBOOKS_ALL, ttl)
+                && !is_cursor_fresh(storage, CURSOR_HIERARCHY, ttl))
+        {
             notebooks = graph.list_all_accessible_notebooks(true).await?;
             storage.upsert_onenote_notebooks(&notebooks)?;
+            record_sync_cursor(storage, CURSOR_NOTEBOOKS_PERSONAL, None);
+            record_sync_cursor(storage, CURSOR_NOTEBOOKS_ALL, None);
         }
         let (groups, sections) = graph.list_all_accessible_sections(&notebooks).await?;
         if !groups.is_empty() {
@@ -711,6 +833,7 @@ pub async fn load_onenote_sections(
         sections
     };
     storage.upsert_onenote_sections(&fetched)?;
+    record_sync_cursor(storage, scope_key, None);
     Ok((nb, storage.list_onenote_sections(nb_key.as_deref())?))
 }
 
@@ -747,13 +870,20 @@ pub async fn list_onenote_pages_helper(
     refresh: bool,
     offline: bool,
 ) -> Result<(OnenoteSection, Vec<OnenotePageSummary>)> {
+    list_onenote_pages_with_cache(storage, graph, section_query, limit, refresh, offline, false)
+        .await
+}
+
+pub async fn list_onenote_pages_with_cache(
+    storage: &Storage,
+    graph: &GraphClient,
+    section_query: &str,
+    limit: usize,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+) -> Result<(OnenoteSection, Vec<OnenotePageSummary>)> {
     let sec = resolve_onenote_section_query(storage, graph, section_query, offline).await?;
-    if !refresh {
-        let cached = storage.list_onenote_pages(&sec.section_key)?;
-        if !cached.is_empty() || offline {
-            return Ok((sec, cached.into_iter().take(limit).collect()));
-        }
-    }
     if offline {
         return Ok((
             sec.clone(),
@@ -764,8 +894,19 @@ pub async fn list_onenote_pages_helper(
                 .collect(),
         ));
     }
+
+    let cursor_key = format!("onenote:pages:{}", sec.section_key);
+    if !refresh {
+        let cached_pages = storage.list_onenote_pages(&sec.section_key)?;
+        let ttl = graph.config().cli_cache_ttl_secs;
+        if !cached_pages.is_empty() && (cached || is_cursor_fresh(storage, &cursor_key, ttl)) {
+            return Ok((sec, cached_pages.into_iter().take(limit).collect()));
+        }
+    }
+
     let fetched = graph.list_onenote_pages(&sec.scope, &sec.id, limit).await?;
     storage.upsert_onenote_pages(&fetched)?;
+    record_sync_cursor(storage, cursor_key, sec.last_modified_at.clone());
     Ok((sec, fetched.into_iter().take(limit).collect()))
 }
 
@@ -775,12 +916,22 @@ pub async fn load_onenote_page_detail(
     page_query: &str,
     offline: bool,
 ) -> Result<OnenotePageDetail> {
+    load_onenote_page_detail_with_cache(storage, graph, page_query, offline, false).await
+}
+
+pub async fn load_onenote_page_detail_with_cache(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    offline: bool,
+    cached: bool,
+) -> Result<OnenotePageDetail> {
     let q = page_query.trim();
     if q.is_empty() {
         bail!("Page ID or title is empty.");
     }
 
-    if offline {
+    if offline || cached {
         if let Some(detail) = storage.get_onenote_page_detail(q)? {
             return Ok(detail);
         }
@@ -789,7 +940,9 @@ pub async fn load_onenote_page_detail(
                 return Ok(detail);
             }
         }
-        bail!("OneNote page not found in offline cache: {q}");
+        if offline {
+            bail!("OneNote page not found in offline cache: {q}");
+        }
     }
 
     let cached_summary = resolver::resolve_page_cached(storage, q, None);
@@ -1068,9 +1221,6 @@ pub async fn search_onenote_helper(
 
 async fn cmd_tui(cfg: &AppConfig) -> Result<()> {
     let (auth, graph, storage) = open_runtime(cfg, true).await?;
-    if storage.list_onenote_notebooks()?.is_empty() {
-        let _ = sync::bootstrap_onenote(&graph, &storage).await;
-    }
     tui::run_with_persona(cfg.clone(), Persona::detect(), auth, graph, storage).await
 }
 
@@ -1316,10 +1466,13 @@ async fn cmd_notebooks(
     include_teams: bool,
     refresh: bool,
     offline: bool,
+    cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let notebooks = load_onenote_notebooks(&storage, &graph, include_teams, refresh, offline).await?;
+    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, offline).await?;
+    let notebooks =
+        load_onenote_notebooks_with_cache(&storage, &graph, include_teams, refresh, offline, cached)
+            .await?;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&json!({ "notebooks": notebooks }))?);
     } else if notebooks.is_empty() {
@@ -1345,6 +1498,7 @@ async fn cmd_create_notebook(
     let scope = build_onenote_scope_from_args(group, site)?;
     let created = graph.create_onenote_notebook(&scope, name.trim()).await?;
     storage.upsert_onenote_notebooks(std::slice::from_ref(&created))?;
+    nudge_live_daemon(cfg, &graph, sync::SyncCommand::RefreshHierarchy).await;
     if json_out {
         println!(
             "{}",
@@ -1364,10 +1518,13 @@ async fn cmd_sections(
     notebook: Option<&str>,
     refresh: bool,
     offline: bool,
+    cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let (nb, sections) = load_onenote_sections(&storage, &graph, notebook, refresh, offline).await?;
+    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, offline).await?;
+    let (nb, sections) =
+        load_onenote_sections_with_cache(&storage, &graph, notebook, refresh, offline, cached)
+            .await?;
     if json_out {
         println!(
             "{}",
@@ -1396,6 +1553,7 @@ async fn cmd_create_section(
         .create_onenote_section(&nb.scope, &nb.id, name.trim())
         .await?;
     storage.upsert_onenote_sections(std::slice::from_ref(&created))?;
+    nudge_live_daemon(cfg, &graph, sync::SyncCommand::RefreshHierarchy).await;
     if json_out {
         println!(
             "{}",
@@ -1416,11 +1574,20 @@ async fn cmd_pages(
     limit: usize,
     refresh: bool,
     offline: bool,
+    cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let (sec, pages) =
-        list_onenote_pages_helper(&storage, &graph, section_query, limit, refresh, offline).await?;
+    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, offline).await?;
+    let (sec, pages) = list_onenote_pages_with_cache(
+        &storage,
+        &graph,
+        section_query,
+        limit,
+        refresh,
+        offline,
+        cached,
+    )
+    .await?;
     if json_out {
         println!(
             "{}",
@@ -1444,10 +1611,11 @@ async fn cmd_read(
     format: &str,
     preview_images: bool,
     offline: bool,
+    cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let detail = load_onenote_page_detail(&storage, &graph, page, offline).await?;
+    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, offline).await?;
+    let detail = load_onenote_page_detail_with_cache(&storage, &graph, page, offline, cached).await?;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&json!({ "page": detail }))?);
         return Ok(());
@@ -1514,6 +1682,14 @@ async fn cmd_create(
     let (sec, created) =
         create_onenote_page_helper(&storage, &graph, section, title, &body, inline_images, level)
             .await?;
+    nudge_live_daemon(
+        cfg,
+        &graph,
+        sync::SyncCommand::RefreshSectionPages {
+            section_key: sec.section_key.clone(),
+        },
+    )
+    .await;
     if json_out {
         println!(
             "{}",
@@ -1543,6 +1719,14 @@ async fn cmd_append(
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let updated =
         append_onenote_page_helper(&storage, &graph, page, &body, &inline_images).await?;
+    nudge_live_daemon(
+        cfg,
+        &graph,
+        sync::SyncCommand::HydratePage {
+            page_key: updated.summary.page_key.clone(),
+        },
+    )
+    .await;
     if json_out {
         println!(
             "{}",
@@ -1581,6 +1765,14 @@ async fn cmd_update_page(
         block_id,
     )
     .await?;
+    nudge_live_daemon(
+        cfg,
+        &graph,
+        sync::SyncCommand::HydratePage {
+            page_key: updated.summary.page_key.clone(),
+        },
+    )
+    .await;
     if json_out {
         println!(
             "{}",
@@ -1602,6 +1794,14 @@ async fn cmd_check(
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let (updated, target_id, completed) =
         toggle_onenote_todo_helper(&storage, &graph, page, block_id, index).await?;
+    nudge_live_daemon(
+        cfg,
+        &graph,
+        sync::SyncCommand::HydratePage {
+            page_key: updated.summary.page_key.clone(),
+        },
+    )
+    .await;
     if json_out {
         println!(
             "{}",
@@ -1635,7 +1835,16 @@ async fn cmd_delete(cfg: &AppConfig, page: &str, yes: bool, json_out: bool) -> R
         }
     }
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let section_key = resolver::resolve_page_cached(&storage, page, None)
+        .map(|s| s.scope.make_entity_key(&s.section_id));
     let deleted_key = delete_onenote_page_helper(&storage, &graph, page).await?;
+    let nudge_cmd = match section_key {
+        Some(sec_key) => sync::SyncCommand::RefreshSectionPages {
+            section_key: sec_key,
+        },
+        None => sync::SyncCommand::RefreshAll,
+    };
+    nudge_live_daemon(cfg, &graph, nudge_cmd).await;
     if json_out {
         println!(
             "{}",
@@ -1764,6 +1973,7 @@ fn cmd_preview_file(
 async fn cmd_sync(cfg: &AppConfig, json_out: bool) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let summary = sync::bootstrap_onenote(&graph, &storage).await?;
+    nudge_live_daemon(cfg, &graph, sync::SyncCommand::RefreshAll).await;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {

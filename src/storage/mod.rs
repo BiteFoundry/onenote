@@ -226,6 +226,38 @@ impl Storage {
         onenote::upsert_onenote_pages(&mut conn, items)
     }
 
+    pub fn reconcile_onenote_hierarchy(
+        &self,
+        notebooks: &[OnenoteNotebook],
+        section_groups: &[OnenoteSectionGroup],
+        sections: &[OnenoteSection],
+        synced_all_scopes: bool,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::reconcile_onenote_hierarchy(
+            &mut conn,
+            notebooks,
+            section_groups,
+            sections,
+            synced_all_scopes,
+        )
+    }
+
+    pub fn reconcile_onenote_section_pages(
+        &self,
+        section_key: &str,
+        pages: &[OnenotePageSummary],
+        is_complete_section_list: bool,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::reconcile_onenote_section_pages(
+            &mut conn,
+            section_key,
+            pages,
+            is_complete_section_list,
+        )
+    }
+
     pub fn list_onenote_pages(&self, section_key: &str) -> Result<Vec<OnenotePageSummary>> {
         let conn = self.read_conn()?;
         onenote::list_onenote_pages(&conn, section_key)

@@ -35,11 +35,14 @@ use onenote_cli::{
 struct MockGraphState {
     base_url: String,
     notebooks: Arc<Mutex<Vec<Value>>>,
+    joined_teams: Arc<Mutex<Vec<Value>>>,
+    group_notebooks: Arc<Mutex<std::collections::HashMap<String, Vec<Value>>>>,
     sections: Arc<Mutex<Vec<Value>>>,
     pages: Arc<Mutex<Vec<Value>>>,
     page_xhtml: Arc<Mutex<std::collections::HashMap<String, String>>>,
     patches_received: Arc<Mutex<Vec<String>>>,
     deleted_pages: Arc<Mutex<Vec<String>>>,
+    notebook_list_hits: Arc<Mutex<usize>>,
 }
 
 impl MockGraphState {
@@ -74,6 +77,8 @@ impl MockGraphState {
                 "lastModifiedDateTime": "2026-11-18T10:00:00Z",
                 "links": { "oneNoteWebUrl": { "href": "https://onedrive.live.com/nb-1" } }
             })])),
+            joined_teams: Arc::new(Mutex::new(Vec::new())),
+            group_notebooks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sections: Arc::new(Mutex::new(vec![json!({
                 "id": "sec-1",
                 "displayName": "Specs",
@@ -96,6 +101,7 @@ impl MockGraphState {
             page_xhtml: Arc::new(Mutex::new(xhtml_map)),
             patches_received: Arc::new(Mutex::new(Vec::new())),
             deleted_pages: Arc::new(Mutex::new(Vec::new())),
+            notebook_list_hits: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -131,11 +137,30 @@ async fn spawn_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<
         )
         .route(
             "/v1.0/me/joinedTeams",
-            get(|| async { Json(json!({ "value": [] })) }),
+            get(|State(st): State<MockGraphState>| async move {
+                let items = st.joined_teams.lock().unwrap().clone();
+                Json(json!({ "value": items }))
+            }),
+        )
+        .route(
+            "/v1.0/groups/{group_id}/onenote/notebooks",
+            get(
+                |State(st): State<MockGraphState>, AxumPath(group_id): AxumPath<String>| async move {
+                    let items = st
+                        .group_notebooks
+                        .lock()
+                        .unwrap()
+                        .get(&group_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    Json(json!({ "value": items }))
+                },
+            ),
         )
         .route(
             "/v1.0/me/onenote/notebooks",
             get(|State(st): State<MockGraphState>| async move {
+                *st.notebook_list_hits.lock().unwrap() += 1;
                 let items = st.notebooks.lock().unwrap().clone();
                 Json(json!({ "value": items }))
             })
@@ -641,4 +666,147 @@ async fn e2e_http_serve_and_mcp_tools() {
 
     api_server.abort();
     graph_server.abort();
+}
+
+#[tokio::test]
+async fn e2e_cli_default_zero_ttl_fetches_fresh_and_cached_flag_uses_cache() {
+    let (base_url, mock_state, server) = spawn_mock_graph().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, graph, storage) = make_test_runtime(base_url.clone(), dir.path());
+    assert_eq!(cfg.cli_cache_ttl_secs, 0);
+
+    // 1. Default invocation (cli_cache_ttl_secs = 0, refresh = false, cached = false) fetches 1 notebook
+    let first = cli::load_onenote_notebooks_with_cache(&storage, &graph, false, false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(*mock_state.notebook_list_hits.lock().unwrap(), 1);
+
+    // 2. Add a 2nd personal notebook on MockGraph; next default call MUST fetch fresh without --refresh
+    mock_state.notebooks.lock().unwrap().push(json!({
+        "id": "nb-2",
+        "displayName": "Product Specs",
+        "isDefault": false,
+        "isShared": false,
+        "userRole": "Owner",
+        "createdDateTime": "2026-11-19T00:00:00Z",
+        "lastModifiedDateTime": "2026-11-19T10:00:00Z"
+    }));
+    let second =
+        cli::load_onenote_notebooks_with_cache(&storage, &graph, false, false, false, false)
+            .await
+            .unwrap();
+    assert_eq!(second.len(), 2);
+    assert_eq!(*mock_state.notebook_list_hits.lock().unwrap(), 2);
+
+    // 3. Add a 3rd notebook on MockGraph; --cached returns cached 2 immediately without hitting Graph
+    mock_state.notebooks.lock().unwrap().push(json!({
+        "id": "nb-3",
+        "displayName": "Design Notes",
+        "isDefault": false,
+        "isShared": false,
+        "userRole": "Owner"
+    }));
+    let from_cache =
+        cli::load_onenote_notebooks_with_cache(&storage, &graph, false, false, false, true)
+            .await
+            .unwrap();
+    assert_eq!(from_cache.len(), 2);
+    assert_eq!(*mock_state.notebook_list_hits.lock().unwrap(), 2);
+
+    // 4. --cached on an EMPTY cache falls back to Graph (unlike --offline which stays network-free)
+    let empty_storage = Storage::open_in_memory().unwrap();
+    let offline_empty = cli::load_onenote_notebooks_with_cache(
+        &empty_storage,
+        &graph,
+        false,
+        false,
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(offline_empty.is_empty());
+    assert_eq!(*mock_state.notebook_list_hits.lock().unwrap(), 2);
+
+    let cached_fallback = cli::load_onenote_notebooks_with_cache(
+        &empty_storage,
+        &graph,
+        false,
+        false,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cached_fallback.len(), 3);
+    assert_eq!(*mock_state.notebook_list_hits.lock().unwrap(), 3);
+
+    // 5. Non-zero TTL serves personal cache, while --include-teams still fetches group notebooks!
+    mock_state.joined_teams.lock().unwrap().push(json!({
+        "id": "grp-1",
+        "displayName": "Platform Team"
+    }));
+    mock_state.group_notebooks.lock().unwrap().insert(
+        "grp-1".to_string(),
+        vec![json!({
+            "id": "nb-team-1",
+            "displayName": "Platform Team Notebook",
+            "isDefault": false,
+            "isShared": true,
+            "userRole": "Contributor"
+        })],
+    );
+
+    let mut ttl_cfg = cfg.clone();
+    ttl_cfg.cli_cache_ttl_secs = 300;
+    let ttl_tokens = StoredTokens {
+        access_token: "e2e-test-token".to_string(),
+        refresh_token: None,
+        expires_at: chrono::Utc::now().timestamp() + 3600,
+        client_id: "cid".to_string(),
+        tenant_id: "tid".to_string(),
+        user_id: Some("user-1".to_string()),
+        user_display_name: Some("Alice Engineer".to_string()),
+        user_email: Some("alice@contoso.com".to_string()),
+        auth_mode: "access_token".to_string(),
+    };
+    let ttl_auth = AuthManager::from_tokens(ttl_cfg.clone(), ttl_tokens);
+    let ttl_graph = GraphClient::new(ttl_cfg, ttl_auth)
+        .unwrap()
+        .with_my_user_id("user-1");
+    let ttl_storage = Storage::open_in_memory().unwrap();
+
+    // Fetch personal notebooks (populates personal cursor only)
+    let personal_nbs =
+        cli::load_onenote_notebooks(&ttl_storage, &ttl_graph, false, false, false)
+            .await
+            .unwrap();
+    assert_eq!(personal_nbs.len(), 3);
+    let hits_after_personal = *mock_state.notebook_list_hits.lock().unwrap();
+
+    // Repeat personal call within TTL -> cache hit (no extra Graph request)
+    let personal_cached =
+        cli::load_onenote_notebooks(&ttl_storage, &ttl_graph, false, false, false)
+            .await
+            .unwrap();
+    assert_eq!(personal_cached.len(), 3);
+    assert_eq!(
+        *mock_state.notebook_list_hits.lock().unwrap(),
+        hits_after_personal
+    );
+
+    // Now request --include-teams -> must fetch group notebooks instead of returning personal-only cache
+    let with_teams =
+        cli::load_onenote_notebooks(&ttl_storage, &ttl_graph, true, false, false)
+            .await
+            .unwrap();
+    assert_eq!(with_teams.len(), 4);
+    assert!(with_teams.iter().any(|n| n.id == "nb-team-1"));
+    assert_eq!(
+        *mock_state.notebook_list_hits.lock().unwrap(),
+        hits_after_personal + 1
+    );
+
+    server.abort();
 }
