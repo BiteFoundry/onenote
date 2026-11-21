@@ -443,6 +443,121 @@ pub fn db_path(user_id: Option<&str>) -> PathBuf {
     data_dir().join(sanitized).join("cache.db")
 }
 
+const MAX_IDENTITY_MAP_ENTRIES: usize = 64;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdentityMapRecord {
+    version: u32,
+    user_id: String,
+    recorded_at: String,
+}
+
+pub fn identity_map_dir() -> PathBuf {
+    data_dir().join("identity-map")
+}
+
+fn token_fingerprint(access_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(access_token.trim().as_bytes()))
+}
+
+pub fn lookup_identity(access_token: &str) -> Option<String> {
+    lookup_identity_in(&identity_map_dir(), access_token)
+}
+
+pub fn record_identity(access_token: &str, user_id: &str) -> Result<()> {
+    record_identity_in(&identity_map_dir(), access_token, user_id)
+}
+
+fn lookup_identity_in(dir: &Path, access_token: &str) -> Option<String> {
+    if access_token.trim().is_empty() {
+        return None;
+    }
+    let path = dir.join(format!("{}.json", token_fingerprint(access_token)));
+    let raw = fs::read_to_string(&path).ok()?;
+    let rec: IdentityMapRecord = serde_json::from_str(&raw).ok()?;
+    if rec.version != 1 {
+        return None;
+    }
+    let uid = rec.user_id.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    Some(uid.to_string())
+}
+
+fn prune_identity_map(dir: &Path, keep_path: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(bool, std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || !name.ends_with(".json") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let is_current = p == keep_path;
+        files.push((is_current, mtime, p));
+    }
+    if files.len() <= MAX_IDENTITY_MAP_ENTRIES {
+        return;
+    }
+    files.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let excess = files.len() - MAX_IDENTITY_MAP_ENTRIES;
+    for (_, _, p) in files.into_iter().take(excess) {
+        let _ = fs::remove_file(p);
+    }
+}
+
+fn record_identity_in(dir: &Path, access_token: &str, user_id: &str) -> Result<()> {
+    let trimmed_uid = user_id.trim();
+    if trimmed_uid.is_empty() {
+        anyhow::bail!("Cannot record empty user_id for token identity");
+    }
+    let path = dir.join(format!("{}.json", token_fingerprint(access_token)));
+    let record = IdentityMapRecord {
+        version: 1,
+        user_id: trimmed_uid.to_string(),
+        recorded_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    };
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    let mut last_err = None;
+    for attempt in 0..5 {
+        match write_atomic_0600(&path, &bytes) {
+            Ok(()) => {
+                prune_identity_map(dir, &path);
+                return Ok(());
+            }
+            Err(err) => {
+                if lookup_identity_in(dir, access_token).as_deref() == Some(trimmed_uid) {
+                    prune_identity_map(dir, &path);
+                    return Ok(());
+                }
+                last_err = Some(err);
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+    }
+    if lookup_identity_in(dir, access_token).as_deref() == Some(trimmed_uid) {
+        prune_identity_map(dir, &path);
+        return Ok(());
+    }
+    Err(last_err.unwrap())
+}
+
 pub fn default_download_dir() -> PathBuf {
     dirs::download_dir()
         .or_else(dirs::home_dir)
@@ -967,5 +1082,117 @@ mod tests {
         ]);
         let cfg = AppConfig::load();
         assert_eq!(cfg.image_protocol, ImageProtocolPreference::Kitty);
+    }
+
+    #[test]
+    fn identity_roundtrip_and_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        record_identity_in(dir.path(), "tok-a", "user-a").unwrap();
+        record_identity_in(dir.path(), "tok-b", "user-b").unwrap();
+
+        assert_eq!(lookup_identity_in(dir.path(), "tok-a").as_deref(), Some("user-a"));
+        assert_eq!(lookup_identity_in(dir.path(), "tok-b").as_deref(), Some("user-b"));
+        assert_eq!(lookup_identity_in(dir.path(), "tok-c"), None);
+
+        let files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 2);
+        for entry in &files {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            assert!(!fname.contains("tok-a"), "filename leaked token: {fname}");
+            let content = fs::read_to_string(entry.path()).unwrap();
+            assert!(
+                !content.contains("tok-a"),
+                "file content leaked token: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_corrupt_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.json", token_fingerprint("tok-a")));
+        fs::write(&path, "not json").unwrap();
+
+        assert_eq!(lookup_identity_in(dir.path(), "tok-a"), None);
+        record_identity_in(dir.path(), "tok-a", "user-a").unwrap();
+        assert_eq!(lookup_identity_in(dir.path(), "tok-a").as_deref(), Some("user-a"));
+    }
+
+    #[test]
+    fn identity_rerecord_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        record_identity_in(dir.path(), "tok-a", "user-a").unwrap();
+        record_identity_in(dir.path(), "tok-a", "user-z").unwrap();
+
+        assert_eq!(lookup_identity_in(dir.path(), "tok-a").as_deref(), Some("user-z"));
+        let files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .collect();
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn identity_concurrent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let p = dir_path.clone();
+                s.spawn(move || {
+                    record_identity_in(&p, &format!("tok-{i}"), &format!("user-{i}")).unwrap();
+                });
+            }
+            for _ in 0..8 {
+                let p = dir_path.clone();
+                s.spawn(move || {
+                    record_identity_in(&p, "tok-same", "user-s").unwrap();
+                });
+            }
+        });
+
+        for i in 0..8 {
+            assert_eq!(
+                lookup_identity_in(dir.path(), &format!("tok-{i}")).as_deref(),
+                Some(format!("user-{i}").as_str())
+            );
+        }
+        assert_eq!(
+            lookup_identity_in(dir.path(), "tok-same").as_deref(),
+            Some("user-s")
+        );
+
+        let tmp_leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            tmp_leftovers.is_empty(),
+            "leftover .tmp files: {tmp_leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn identity_prunes_to_64() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..70 {
+            record_identity_in(dir.path(), &format!("tok-{i}"), &format!("user-{i}")).unwrap();
+        }
+
+        let json_files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .collect();
+        assert_eq!(json_files.len(), 64);
+        assert_eq!(
+            lookup_identity_in(dir.path(), "tok-69").as_deref(),
+            Some("user-69")
+        );
     }
 }

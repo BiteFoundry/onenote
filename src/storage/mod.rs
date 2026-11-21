@@ -431,6 +431,11 @@ impl Storage {
         onenote::delete_onenote_page(&mut conn, page_key_or_id)
     }
 
+    pub fn count_onenote_pages(&self) -> Result<(u64, u64)> {
+        let conn = self.read_conn()?;
+        onenote::count_onenote_pages(&conn)
+    }
+
     pub fn search_onenote_pages(
         &self,
         query: &str,

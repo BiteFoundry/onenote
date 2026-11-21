@@ -1487,6 +1487,15 @@ pub fn delete_onenote_page(conn: &mut Connection, page_key_or_id: &str) -> Resul
     Ok(())
 }
 
+pub fn count_onenote_pages(conn: &Connection) -> Result<(u64, u64)> {
+    let (pages, pages_with_body): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(detail_json IS NOT NULL), 0) FROM onenote_pages",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((pages.max(0) as u64, pages_with_body.max(0) as u64))
+}
+
 pub fn search_onenote_pages(
     conn: &Connection,
     query: &str,

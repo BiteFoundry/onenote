@@ -35,10 +35,10 @@ If installed via `npx`:
 | Tool | Description | Key Parameters |
 | --- | --- | --- |
 | `whoami` | Return signed-in Microsoft 365 profile & auth mode | _(none)_ |
-| `list_notebooks` | List accessible OneNote notebooks (personal, Teams/Group, SharePoint) | `include_teams?`, `refresh?`, `offline?` |
-| `list_sections` | List sections in a notebook or across all notebooks | `notebook?`, `refresh?`, `offline?` |
-| `list_pages` | List pages in a section (supports `Notebook/Section`, name, or ID) | `section` (required), `limit?`, `refresh?`, `offline?` |
-| `get_page` | Read Markdown and page metadata, with XHTML, blocks and resources in the default response | `page` (required), `compact?`, `offline?` |
+| `list_notebooks` | List accessible OneNote notebooks (personal, Teams/Group, SharePoint) | `include_teams?`, `limit?`, `cursor?`, `refresh?`, `offline?` |
+| `list_sections` | List sections in a notebook or across all notebooks | `notebook?`, `limit?`, `cursor?`, `refresh?`, `offline?` |
+| `list_pages` | List pages in a section (supports `Notebook/Section`, name, or ID) | `section` (required), `limit?`, `cursor?`, `refresh?`, `offline?` |
+| `get_page` | Read compact Markdown and identifiers; pass compact: false for XHTML, blocks and resources | `page` (required), `compact?`, `offline?` |
 | `create_notebook` | Create a new OneNote notebook | `name` (required), `group_id?`, `site_id?` |
 | `rename_notebook` | Rename a OneNote notebook package by explicit storage IDs | `drive_id`, `item_id`, `name` (all required) |
 | `create_section` | Create a new section inside a notebook | `notebook` (required), `name` (required) |
@@ -51,12 +51,18 @@ If installed via `npx`:
 | `update_block`, `update_page` | Replace a block, edit its text, or update the page title/body | `page` (required), `block_id?`, `title?`, `markdown?`, `replace_text?`, `with_text?`, `expected_content?`, `force?` |
 | `toggle_todo` | Set or toggle a checkbox by element ID or zero-based index | `page` (required), `block_id?`, `todo_index?`, `completed?`, `expected_content?`, `force?` |
 | `delete_page` | Permanently delete a OneNote page | `page` (required), `confirm: true` (required) |
-| `search_pages` | Full-text search across locally cached OneNote pages (SQLite FTS5) | `query` (required), `section?`, `limit?`, `refresh?` |
+| `search_pages` | Full-text search across locally cached OneNote pages (SQLite FTS5) | `query` (required), `section?`, `limit?`, `cursor?`, `refresh?` |
 | `download_resource` | Download an embedded OneNote image or file attachment to disk | `page` (required), `index?`, `out_dir?` |
+
+The server resolves the signed-in account and local cache on the first `tools/call`; `initialize`, `ping`, and `tools/list` respond without contacting Graph or selecting a cache.
 
 ### Page reads and writes
 
-Pass `compact: true` to `get_page` for `page.id`, `page.title`, `page.last_modified_at` and `page.body_markdown`. Read without `compact` to find `page.blocks[].element_id`, or inspect `page.raw_xhtml`. Use current element IDs for block writes. Both `update_block` and its `update_page` alias appear in `tools/list`.
+`get_page` returns the compact page by default, including `page.page_key`, `page.scope`, `page.omitted`, and `page.hint`. Pass `compact: false` to read `page.blocks[].element_id`, `page.raw_xhtml`, and `page.resources`. Write tools (`append_page`, `update_block`, `update_page`, `toggle_todo`) always return the full `page` object. Use current element IDs for block writes. Both `update_block` and its `update_page` alias appear in `tools/list`.
+
+### List paging
+
+`list_notebooks` and `list_sections` return up to 50 items by default (`limit` range `1`–`1000`); `list_pages` defaults to 50 and `search_pages` defaults to 30. All four responses include `returned`, `has_more`, and `next_cursor` (pass `next_cursor` back as `cursor` to read the next page). When called with `offline: true`, `list_notebooks`, `list_sections`, and `list_pages` also include `cache_synced_at` (an RFC 3339 timestamp string, or `null` when the cache has never been synced). `search_pages` includes `cache: { pages, pages_with_body }` to show how many cached pages exist and how many have hydrated bodies.
 
 `rename_section` takes the section's current ID from `list_sections`. `rename_notebook` takes the current DriveItem ID and requires a delegated file-write token. The desktop tools use the Windows app's object IDs from `GetHierarchy`. [Hierarchy operations and permissions](API.md#hierarchy-operations)
 

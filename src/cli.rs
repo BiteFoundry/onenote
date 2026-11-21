@@ -114,6 +114,12 @@ pub enum Command {
         /// Include Microsoft Teams / M365 Group shared notebooks
         #[arg(long = "include-teams", default_value_t = false)]
         include_teams: bool,
+        /// Maximum number of notebooks to return (default: 50 with --json, unbounded in text mode)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1000))]
+        limit: Option<u64>,
+        /// Offset cursor from the previous response's `next_cursor`
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
         #[arg(long)]
         refresh: bool,
         #[arg(long)]
@@ -149,6 +155,12 @@ pub enum Command {
     #[command(visible_alias = "sec")]
     Sections {
         notebook: Option<String>,
+        /// Maximum number of sections to return (default: 50 with --json, unbounded in text mode)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1000))]
+        limit: Option<u64>,
+        /// Offset cursor from the previous response's `next_cursor`
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
         #[arg(long)]
         refresh: bool,
         #[arg(long)]
@@ -201,6 +213,9 @@ pub enum Command {
         section: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Offset cursor from the previous response's `next_cursor`
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
         #[arg(long)]
         refresh: bool,
         #[arg(long)]
@@ -214,8 +229,10 @@ pub enum Command {
     #[command(visible_alias = "cat")]
     Read {
         page: String,
-        #[arg(long, default_value = "md", value_parser = ["md", "plain", "blocks", "xhtml"])]
-        format: String,
+        /// Text output format: md, plain, blocks or xhtml [default: md].
+        /// With --json, an explicit --format keeps the full JSON page unless --compact is given.
+        #[arg(long, value_parser = ["md", "plain", "blocks", "xhtml"])]
+        format: Option<String>,
         #[arg(long = "preview-images")]
         preview_images: bool,
         #[arg(long)]
@@ -224,7 +241,10 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
-        /// Return page ID, title, modification time and Markdown with --json
+        /// With --json: return the full page (blocks, raw XHTML, resources)
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
+        /// With --json: return the compact page (the default when --format is not given)
         #[arg(long, requires = "json")]
         compact: bool,
     },
@@ -359,6 +379,9 @@ pub enum Command {
         refresh: bool,
         #[arg(long, default_value_t = 30)]
         limit: usize,
+        /// Offset cursor from the previous response's `next_cursor`
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
         #[arg(long)]
         json: bool,
     },
@@ -762,11 +785,13 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
         Some(Command::Doctor { online, json }) => cmd_doctor(cfg, online, json).await,
         Some(Command::Notebooks {
             include_teams,
+            limit,
+            cursor,
             refresh,
             offline,
             cached,
             json,
-        }) => cmd_notebooks(cfg, include_teams, refresh, offline, cached, json).await,
+        }) => cmd_notebooks(cfg, include_teams, limit, cursor, refresh, offline, cached, json).await,
         Some(Command::CreateNotebook {
             name,
             group,
@@ -790,11 +815,13 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
         }
         Some(Command::Sections {
             notebook,
+            limit,
+            cursor,
             refresh,
             offline,
             cached,
             json,
-        }) => cmd_sections(cfg, notebook.as_deref(), refresh, offline, cached, json).await,
+        }) => cmd_sections(cfg, notebook.as_deref(), limit, cursor, refresh, offline, cached, json).await,
         Some(Command::CreateSection {
             notebook,
             name,
@@ -830,11 +857,12 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
         Some(Command::Pages {
             section,
             limit,
+            cursor,
             refresh,
             offline,
             cached,
             json,
-        }) => cmd_pages(cfg, &section, limit, refresh, offline, cached, json).await,
+        }) => cmd_pages(cfg, &section, limit, cursor, refresh, offline, cached, json).await,
         Some(Command::Read {
             page,
             format,
@@ -842,17 +870,19 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             offline,
             cached,
             json,
+            full,
             compact,
         }) => {
             cmd_read(
                 cfg,
                 &page,
-                &format,
+                format.as_deref(),
                 preview_images,
                 offline,
                 cached,
                 json,
                 compact,
+                full,
             )
             .await
         }
@@ -991,8 +1021,9 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             section,
             refresh,
             limit,
+            cursor,
             json,
-        }) => cmd_search(cfg, &query, section.as_deref(), refresh, limit, json).await,
+        }) => cmd_search(cfg, &query, section.as_deref(), refresh, limit, cursor, json).await,
         Some(Command::Resource {
             page,
             index,
@@ -1032,10 +1063,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             let (_auth, graph, storage) = open_runtime(cfg, false).await?;
             serve::run(cfg.clone(), graph, storage, &bind, port, api_key).await
         }
-        Some(Command::Mcp) => {
-            let (_auth, graph, storage) = open_runtime(cfg, false).await?;
-            crate::mcp::run(cfg.clone(), graph, storage).await
-        }
+        Some(Command::Mcp) => crate::mcp::run(cfg.clone()).await,
     }
 }
 
@@ -1048,34 +1076,86 @@ const CURSOR_NOTEBOOKS_ALL: &str = "onenote:notebooks:all";
 const CURSOR_SECTIONS_ALL: &str = "onenote:sections:all";
 const CURSOR_HIERARCHY: &str = "onenote:hierarchy";
 
+const UNKNOWN_IDENTITY_MSG: &str = "Unknown identity: the current token carries no user ID and no identity is recorded for it, so the local cache cannot be selected. Run `onenote whoami` once while online (MCP: call the whoami tool), then retry.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityMode {
+    LocalOnly,
+    AllowNetwork,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentitySource {
+    NoToken,
+    Token,
+    IdentityMap,
+    GraphMe,
+}
+
+async fn resolve_cache_user_id(
+    auth: &AuthManager,
+    graph: &GraphClient,
+    mode: IdentityMode,
+) -> Result<(Option<String>, IdentitySource)> {
+    let Some(tok) = auth.current_tokens().await else {
+        return Ok((None, IdentitySource::NoToken));
+    };
+    if let Some(id) = tok
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return Ok((Some(id.to_string()), IdentitySource::Token));
+    }
+    if let Some(id) = config::lookup_identity(&tok.access_token) {
+        return Ok((Some(id), IdentitySource::IdentityMap));
+    }
+    if mode == IdentityMode::LocalOnly {
+        bail!("{UNKNOWN_IDENTITY_MSG}");
+    }
+    let id = graph
+        .require_my_user_id()
+        .await
+        .context(
+            "Cannot select a cache for the current token: GET /me failed, so the signed-in account is unknown.",
+        )?;
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "Cannot select a cache for the current token: GET /me failed, so the signed-in account is unknown."
+        );
+    }
+    let _ = config::record_identity(&tok.access_token, trimmed);
+    Ok((Some(trimmed.to_string()), IdentitySource::GraphMe))
+}
+
 pub async fn open_runtime(
     cfg: &AppConfig,
     require_auth: bool,
 ) -> Result<(AuthManager, GraphClient, Storage)> {
-    open_runtime_inner(cfg, require_auth, false).await
+    open_runtime_inner(cfg, require_auth, IdentityMode::AllowNetwork).await
+}
+
+pub(crate) async fn open_mcp_runtime(
+    cfg: &AppConfig,
+    mode: IdentityMode,
+) -> Result<(GraphClient, Storage)> {
+    let (_auth, graph, storage) = open_runtime_inner(cfg, false, mode).await?;
+    Ok((graph, storage))
 }
 
 async fn open_runtime_inner(
     cfg: &AppConfig,
     require_auth: bool,
-    offline: bool,
+    mode: IdentityMode,
 ) -> Result<(AuthManager, GraphClient, Storage)> {
     let auth = AuthManager::new(cfg.clone())?;
-    let mut user_id = if require_auth {
+    if require_auth {
         let _ = auth.valid_access_token().await?;
-        auth.current_tokens().await.and_then(|t| t.user_id)
-    } else {
-        auth.current_tokens().await.and_then(|t| t.user_id)
     }
-    .filter(|id| !id.trim().is_empty());
-
     let graph = GraphClient::new(cfg.clone(), auth.clone())?;
-    if user_id.is_none() && !offline && (require_auth || auth.current_tokens().await.is_some()) {
-        user_id = graph
-            .resolve_my_user_id()
-            .await
-            .filter(|id| !id.trim().is_empty());
-    }
+    let (user_id, _source) = resolve_cache_user_id(&auth, &graph, mode).await?;
     let graph = if let Some(ref uid) = user_id {
         graph.with_my_user_id(uid.clone())
     } else {
@@ -1102,6 +1182,53 @@ fn is_cursor_fresh(storage: &Storage, scope_key: &str, ttl_secs: u64) -> bool {
     age_secs < (ttl_secs as i64)
 }
 
+pub(crate) fn latest_sync_at(storage: &Storage, scope_keys: &[&str]) -> Option<String> {
+    let mut best: Option<(chrono::DateTime<chrono::FixedOffset>, String)> = None;
+    for &key in scope_keys {
+        let Ok(Some(cursor)) = storage.get_sync_cursor(key) else {
+            continue;
+        };
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&cursor.last_synced_at) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(cur, _)| ts > *cur) {
+            best = Some((ts, cursor.last_synced_at));
+        }
+    }
+    best.map(|(_, raw)| raw)
+}
+
+pub(crate) fn notebooks_cache_synced_at(storage: &Storage) -> Option<String> {
+    latest_sync_at(
+        storage,
+        &[
+            CURSOR_NOTEBOOKS_PERSONAL,
+            CURSOR_NOTEBOOKS_ALL,
+            CURSOR_HIERARCHY,
+        ],
+    )
+}
+
+pub(crate) fn sections_cache_synced_at(
+    storage: &Storage,
+    notebook: Option<&OnenoteNotebook>,
+) -> Option<String> {
+    if let Some(nb) = notebook {
+        let nb_cursor = format!("onenote:sections:{}", nb.notebook_key);
+        latest_sync_at(
+            storage,
+            &[nb_cursor.as_str(), CURSOR_SECTIONS_ALL, CURSOR_HIERARCHY],
+        )
+    } else {
+        latest_sync_at(storage, &[CURSOR_SECTIONS_ALL, CURSOR_HIERARCHY])
+    }
+}
+
+pub(crate) fn pages_cache_synced_at(storage: &Storage, section_key: &str) -> Option<String> {
+    let page_cursor = format!("onenote:pages:{section_key}");
+    latest_sync_at(storage, &[page_cursor.as_str()])
+}
+
 fn record_sync_cursor(storage: &Storage, scope_key: impl Into<String>, delta_link: Option<String>) {
     let _ = storage.upsert_sync_cursor(&crate::models::SyncCursor {
         scope_key: scope_key.into(),
@@ -1109,6 +1236,33 @@ fn record_sync_cursor(storage: &Storage, scope_key: impl Into<String>, delta_lin
         history_next_link: None,
         last_synced_at: chrono::Utc::now().to_rfc3339(),
     });
+}
+
+pub(crate) fn page_slice<T>(items: Vec<T>, offset: usize, limit: usize) -> (Vec<T>, bool) {
+    let has_more = items.len() > offset.saturating_add(limit);
+    (items.into_iter().skip(offset).take(limit).collect(), has_more)
+}
+
+pub(crate) fn next_cursor(offset: usize, limit: usize, has_more: Option<bool>) -> Option<String> {
+    (has_more == Some(true)).then(|| offset.saturating_add(limit).to_string())
+}
+
+pub(crate) fn parse_mcp_cursor(args: &serde_json::Value) -> Result<usize> {
+    match args.get("cursor") {
+        None | Some(serde_json::Value::Null) => Ok(0),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("Invalid cursor: pass the next_cursor value from the previous response.")
+        }),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid cursor: pass the next_cursor value from the previous response."
+                )
+            }),
+        Some(_) => bail!("Invalid cursor: pass the next_cursor value from the previous response."),
+    }
 }
 
 pub(crate) async fn nudge_live_daemon(cfg: &AppConfig, graph: &GraphClient, cmd: sync::SyncCommand) {
@@ -1354,19 +1508,31 @@ pub async fn list_onenote_pages_helper(
     refresh: bool,
     offline: bool,
 ) -> Result<(OnenoteSection, Vec<OnenotePageSummary>)> {
-    list_onenote_pages_with_cache(storage, graph, section_query, limit, refresh, offline, false)
-        .await
+    let (sec, pages, _has_more) = list_onenote_pages_with_cache(
+        storage,
+        graph,
+        section_query,
+        limit,
+        0,
+        refresh,
+        offline,
+        false,
+    )
+    .await?;
+    Ok((sec, pages))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn list_onenote_pages_with_cache(
     storage: &Storage,
     graph: &GraphClient,
     section_query: &str,
     limit: usize,
+    offset: usize,
     refresh: bool,
     offline: bool,
     cached: bool,
-) -> Result<(OnenoteSection, Vec<OnenotePageSummary>)> {
+) -> Result<(OnenoteSection, Vec<OnenotePageSummary>, Option<bool>)> {
     let mut sec = resolve_onenote_section_query_with_refresh(
         storage,
         graph,
@@ -1375,15 +1541,13 @@ pub async fn list_onenote_pages_with_cache(
         refresh,
     )
     .await?;
+    if limit == 0 {
+        return Ok((sec, Vec::new(), None));
+    }
     if offline {
-        return Ok((
-            sec.clone(),
-            storage
-                .list_onenote_pages(&sec.section_key)?
-                .into_iter()
-                .take(limit)
-                .collect(),
-        ));
+        let all = storage.list_onenote_pages(&sec.section_key)?;
+        let (sliced, has_more) = page_slice(all, offset, limit);
+        return Ok((sec, sliced, Some(has_more)));
     }
 
     let mut cursor_key = format!("onenote:pages:{}", sec.section_key);
@@ -1391,11 +1555,14 @@ pub async fn list_onenote_pages_with_cache(
         let cached_pages = storage.list_onenote_pages(&sec.section_key)?;
         let ttl = graph.config().cli_cache_ttl_secs;
         if !cached_pages.is_empty() && (cached || is_cursor_fresh(storage, &cursor_key, ttl)) {
-            return Ok((sec, cached_pages.into_iter().take(limit).collect()));
+            let (sliced, has_more) = page_slice(cached_pages, offset, limit);
+            return Ok((sec, sliced, Some(has_more)));
         }
     }
 
-    let fetched = match graph.list_onenote_pages(&sec.scope, &sec.id, limit).await {
+    let end = offset.saturating_add(limit);
+    let want = end.saturating_add(1);
+    let fetched = match graph.list_onenote_pages(&sec.scope, &sec.id, want).await {
         Ok(pages) => pages,
         Err(err) if !refresh && crate::graph::onenote::is_not_found_error(&err) => {
             let refreshed_sec = resolve_onenote_section_query_with_refresh(
@@ -1411,14 +1578,15 @@ pub async fn list_onenote_pages_with_cache(
             }
             sec = refreshed_sec;
             cursor_key = format!("onenote:pages:{}", sec.section_key);
-            graph.list_onenote_pages(&sec.scope, &sec.id, limit).await?
+            graph.list_onenote_pages(&sec.scope, &sec.id, want).await?
         }
         Err(err) => return Err(err),
     };
-    let is_complete = fetched.len() < limit;
-    storage.reconcile_onenote_section_pages(&sec.section_key, &fetched, is_complete)?;
+    let has_more = fetched.len() > end;
+    storage.reconcile_onenote_section_pages(&sec.section_key, &fetched, !has_more)?;
     record_sync_cursor(storage, cursor_key, sec.last_modified_at.clone());
-    Ok((sec, fetched.into_iter().take(limit).collect()))
+    let sliced = fetched.into_iter().skip(offset).take(limit).collect();
+    Ok((sec, sliced, Some(has_more)))
 }
 
 pub async fn load_onenote_page_detail(
@@ -2259,21 +2427,55 @@ pub async fn search_onenote_helper(
     refresh: bool,
     limit: usize,
 ) -> Result<Vec<OnenoteSearchHit>> {
+    let (hits, _has_more) =
+        search_onenote_with_offset(storage, graph, query, section_filter, refresh, limit, 0)
+            .await?;
+    Ok(hits)
+}
+
+pub async fn search_onenote_with_offset(
+    storage: &Storage,
+    graph: &GraphClient,
+    query: &str,
+    section_filter: Option<&str>,
+    refresh: bool,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<OnenoteSearchHit>, Option<bool>)> {
     if refresh {
         let _ = sync::bootstrap_onenote(graph, storage).await?;
     }
-    let mut hits = storage.search_onenote_pages(query, None, limit.saturating_mul(2).max(20))?;
-    if let Some(sec_q) = section_filter.map(str::trim).filter(|s| !s.is_empty()) {
+    if limit == 0 {
+        return Ok((Vec::new(), None));
+    }
+    let sec_filter = section_filter.map(str::trim).filter(|s| !s.is_empty());
+    let end = offset.saturating_add(limit);
+    let want = end.saturating_add(1);
+    let fetch_n = if sec_filter.is_some() {
+        want.saturating_mul(2).max(20)
+    } else {
+        want
+    };
+    let mut raw = storage.search_onenote_pages(query, None, fetch_n)?;
+    let raw_full = raw.len() == fetch_n;
+    if let Some(sec_q) = sec_filter {
         let needle = sec_q.to_lowercase();
-        hits.retain(|h| {
+        raw.retain(|h| {
             h.section_id == sec_q
                 || h.section_name
                     .as_deref()
                     .is_some_and(|n| n.to_lowercase().contains(&needle))
         });
     }
-    hits.truncate(limit);
-    Ok(hits)
+    let has_more = if raw.len() > end {
+        Some(true)
+    } else if sec_filter.is_some() && raw_full {
+        None
+    } else {
+        Some(false)
+    };
+    let hits = raw.into_iter().skip(offset).take(limit).collect();
+    Ok((hits, has_more))
 }
 
 // ---------------------------------------------------------------------------
@@ -2392,6 +2594,13 @@ async fn cmd_whoami(cfg: &AppConfig, json_out: bool) -> Result<()> {
     let (auth, graph, _storage) = open_runtime(cfg, true).await?;
     let tok = auth.current_tokens().await;
     let me = graph.get_me().await?;
+    if let Some(t) = tok
+        .as_ref()
+        .filter(|t| t.user_id.as_deref().is_none_or(|u| u.trim().is_empty()))
+    {
+        config::record_identity(&t.access_token, &me.id)
+            .context("Signed in, but the identity binding for this token could not be saved")?;
+    }
     let diag = tok
         .as_ref()
         .map(|t| diagnose_access_token_scopes(&t.access_token))
@@ -2433,9 +2642,21 @@ async fn cmd_whoami(cfg: &AppConfig, json_out: bool) -> Result<()> {
 async fn cmd_doctor(cfg: &AppConfig, online: bool, json_out: bool) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
     let tok = auth.current_tokens().await;
-    let user_id = tok.as_ref().and_then(|t| t.user_id.clone());
-    let db_file = config::db_path(user_id.as_deref());
-    let storage = Storage::open(&db_file).ok();
+    let graph = GraphClient::new(cfg.clone(), auth.clone())?;
+    let (db_file, cache_identity) =
+        match resolve_cache_user_id(&auth, &graph, IdentityMode::LocalOnly).await {
+            Ok((user_id, source)) => {
+                let label = match source {
+                    IdentitySource::NoToken => "no_token",
+                    IdentitySource::Token => "token",
+                    IdentitySource::IdentityMap => "identity_map",
+                    IdentitySource::GraphMe => "graph_me",
+                };
+                (Some(config::db_path(user_id.as_deref())), label)
+            }
+            Err(_) => (None, "unresolved"),
+        };
+    let storage = db_file.as_ref().and_then(|p| Storage::open(p).ok());
     let nb_count = storage
         .as_ref()
         .and_then(|s| s.list_onenote_notebooks().ok())
@@ -2456,7 +2677,6 @@ async fn cmd_doctor(cfg: &AppConfig, online: bool, json_out: bool) -> Result<()>
     let mut online_ok: Option<bool> = None;
     let mut online_error: Option<String> = None;
     if online {
-        let graph = GraphClient::new(cfg.clone(), auth.clone())?;
         match graph.list_onenote_notebooks(&OnenoteScope::Me).await {
             Ok(_) => online_ok = Some(true),
             Err(e) => {
@@ -2474,6 +2694,7 @@ async fn cmd_doctor(cfg: &AppConfig, online: bool, json_out: bool) -> Result<()>
                 "config_file": config::config_file_path(),
                 "credentials_file": config::credential_fallback_path(),
                 "db_file": db_file,
+                "cache_identity": cache_identity,
                 "download_dir": cfg.resolved_download_dir(),
                 "graph_base_url": cfg.graph_base_url,
                 "logged_in": tok.is_some(),
@@ -2491,7 +2712,11 @@ async fn cmd_doctor(cfg: &AppConfig, online: bool, json_out: bool) -> Result<()>
     } else {
         println!("onenote-cli v{}", env!("CARGO_PKG_VERSION"));
         println!("Config:         {}", config::config_file_path().display());
-        println!("Database:       {}", db_file.display());
+        match db_file.as_ref() {
+            Some(path) => println!("Database:       {}", path.display()),
+            None => println!("Database:       (unresolved)"),
+        }
+        println!("Cache identity: {cache_identity}");
         println!("Downloads:      {}", cfg.resolved_download_dir().display());
         println!(
             "Auth:           {}",
@@ -2522,20 +2747,53 @@ async fn cmd_doctor(cfg: &AppConfig, online: bool, json_out: bool) -> Result<()>
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_notebooks(
     cfg: &AppConfig,
     include_teams: bool,
+    limit: Option<u64>,
+    cursor: usize,
     refresh: bool,
     offline: bool,
     cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, offline).await?;
-    let notebooks =
+    let mode = if offline {
+        IdentityMode::LocalOnly
+    } else {
+        IdentityMode::AllowNetwork
+    };
+    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, mode).await?;
+    let all_notebooks =
         load_onenote_notebooks_with_cache(&storage, &graph, include_teams, refresh, offline, cached)
             .await?;
+    let effective = limit.map(|n| n as usize).or(json_out.then_some(50));
+    let (notebooks, has_more, next) = match effective {
+        Some(n) => {
+            let (sliced, more) = page_slice(all_notebooks, cursor, n);
+            let next = next_cursor(cursor, n, Some(more));
+            (sliced, more, next)
+        }
+        None => {
+            let sliced = if cursor == 0 {
+                all_notebooks
+            } else {
+                all_notebooks.into_iter().skip(cursor).collect()
+            };
+            (sliced, false, None)
+        }
+    };
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "notebooks": notebooks }))?);
+        let mut out = json!({
+            "notebooks": notebooks,
+            "returned": notebooks.len(),
+            "has_more": has_more,
+            "next_cursor": next,
+        });
+        if offline {
+            out["cache_synced_at"] = json!(notebooks_cache_synced_at(&storage));
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else if notebooks.is_empty() {
         println!("No OneNote notebooks found.");
     } else {
@@ -2543,6 +2801,9 @@ async fn cmd_notebooks(
             let def = if nb.is_default { " [default]" } else { "" };
             let owner = nb.scope.owner_label();
             println!("{}  ({owner}){def}  [{}]", nb.display_name, nb.notebook_key);
+        }
+        if let Some(next) = next {
+            eprintln!("More results: rerun with --cursor {next}");
         }
     }
     Ok(())
@@ -2574,29 +2835,63 @@ async fn cmd_create_notebook(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_sections(
     cfg: &AppConfig,
     notebook: Option<&str>,
+    limit: Option<u64>,
+    cursor: usize,
     refresh: bool,
     offline: bool,
     cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, offline).await?;
-    let (nb, sections) =
+    let mode = if offline {
+        IdentityMode::LocalOnly
+    } else {
+        IdentityMode::AllowNetwork
+    };
+    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, mode).await?;
+    let (nb, all_sections) =
         load_onenote_sections_with_cache(&storage, &graph, notebook, refresh, offline, cached)
             .await?;
+    let effective = limit.map(|n| n as usize).or(json_out.then_some(50));
+    let (sections, has_more, next) = match effective {
+        Some(n) => {
+            let (sliced, more) = page_slice(all_sections, cursor, n);
+            let next = next_cursor(cursor, n, Some(more));
+            (sliced, more, next)
+        }
+        None => {
+            let sliced = if cursor == 0 {
+                all_sections
+            } else {
+                all_sections.into_iter().skip(cursor).collect()
+            };
+            (sliced, false, None)
+        }
+    };
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "notebook": nb, "sections": sections }))?
-        );
+        let mut out = json!({
+            "notebook": nb,
+            "sections": sections,
+            "returned": sections.len(),
+            "has_more": has_more,
+            "next_cursor": next,
+        });
+        if offline {
+            out["cache_synced_at"] = json!(sections_cache_synced_at(&storage, nb.as_ref()));
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else if sections.is_empty() {
         println!("No OneNote sections found.");
     } else {
         for sec in &sections {
             let nb_label = sec.notebook_name.as_deref().unwrap_or("Notebook");
             println!("{nb_label} › {}  [{}]", sec.display_name, sec.section_key);
+        }
+        if let Some(next) = next {
+            eprintln!("More results: rerun with --cursor {next}");
         }
     }
     Ok(())
@@ -2652,31 +2947,47 @@ async fn cmd_rename_section(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_pages(
     cfg: &AppConfig,
     section_query: &str,
     limit: usize,
+    cursor: usize,
     refresh: bool,
     offline: bool,
     cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, offline).await?;
-    let (sec, pages) = list_onenote_pages_with_cache(
+    let mode = if offline {
+        IdentityMode::LocalOnly
+    } else {
+        IdentityMode::AllowNetwork
+    };
+    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, mode).await?;
+    let (sec, pages, has_more) = list_onenote_pages_with_cache(
         &storage,
         &graph,
         section_query,
         limit,
+        cursor,
         refresh,
         offline,
         cached,
     )
     .await?;
+    let next = next_cursor(cursor, limit, has_more);
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "section": sec, "pages": pages }))?
-        );
+        let mut out = json!({
+            "section": sec,
+            "pages": pages,
+            "returned": pages.len(),
+            "has_more": has_more,
+            "next_cursor": next,
+        });
+        if offline {
+            out["cache_synced_at"] = json!(pages_cache_synced_at(&storage, &sec.section_key));
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else if pages.is_empty() {
         println!("No pages in section '{}'.", sec.display_name);
     } else {
@@ -2685,20 +2996,81 @@ async fn cmd_pages(
             let todo_mark = if p.has_todo { " [todo]" } else { "" };
             println!("{indent}{}{}  [{}]", p.title, todo_mark, p.page_key);
         }
+        if let Some(next) = next {
+            eprintln!("More pages: rerun with --cursor {next}");
+        }
     }
     Ok(())
 }
 
-pub(crate) fn page_content_json(detail: &OnenotePageDetail, compact: bool) -> serde_json::Value {
-    if compact {
-        json!({
-            "id": detail.summary.id,
-            "title": detail.summary.title,
-            "last_modified_at": detail.summary.last_modified_at,
-            "body_markdown": detail.body_markdown,
-        })
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageSurface {
+    Cli,
+    Mcp,
+}
+
+const COMPACT_PAGE_OMITTED_FIELDS: &[&str] = &[
+    "raw_xhtml",
+    "body_plain",
+    "primary_div_id",
+    "summary.created_at",
+    "summary.content_url",
+    "summary.order",
+    "summary.preview_text",
+];
+
+pub(crate) fn page_content_json(
+    detail: &OnenotePageDetail,
+    compact: bool,
+    surface: PageSurface,
+) -> serde_json::Value {
+    if !compact {
+        return json!(detail);
+    }
+    let page_key = &detail.summary.page_key;
+    let hint = match surface {
+        PageSurface::Cli => format!(
+            "Run: onenote read \"{page_key}\" --json --full  (adds blocks[].element_id, raw_xhtml, resources)"
+        ),
+        PageSurface::Mcp => {
+            let encoded_key =
+                serde_json::to_string(page_key).unwrap_or_else(|_| format!("\"{page_key}\""));
+            format!(
+                "Call get_page with {{\"page\":{encoded_key},\"compact\":false}} for blocks[].element_id, raw_xhtml and resources"
+            )
+        }
+    };
+    json!({
+        "page_key": detail.summary.page_key,
+        "id": detail.summary.id,
+        "scope": detail.summary.scope,
+        "title": detail.summary.title,
+        "section_id": detail.summary.section_id,
+        "section_name": detail.summary.section_name,
+        "notebook_id": detail.summary.notebook_id,
+        "notebook_name": detail.summary.notebook_name,
+        "level": detail.summary.level,
+        "last_modified_at": detail.summary.last_modified_at,
+        "web_url": detail.summary.web_url,
+        "has_todo": detail.summary.has_todo,
+        "synced_at": detail.synced_at,
+        "body_markdown": detail.body_markdown,
+        "omitted": {
+            "fields": COMPACT_PAGE_OMITTED_FIELDS,
+            "blocks": detail.blocks.len(),
+            "resources": detail.resources.len(),
+        },
+        "hint": hint,
+    })
+}
+
+fn read_json_is_compact(format_explicit: bool, compact: bool, full: bool) -> bool {
+    if full {
+        false
+    } else if compact {
+        true
     } else {
-        json!(detail)
+        !format_explicit
     }
 }
 
@@ -2706,17 +3078,24 @@ pub(crate) fn page_content_json(detail: &OnenotePageDetail, compact: bool) -> se
 async fn cmd_read(
     cfg: &AppConfig,
     page: &str,
-    format: &str,
+    format: Option<&str>,
     preview_images: bool,
     offline: bool,
     cached: bool,
     json_out: bool,
     compact: bool,
+    full: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, offline).await?;
+    let mode = if offline {
+        IdentityMode::LocalOnly
+    } else {
+        IdentityMode::AllowNetwork
+    };
+    let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, mode).await?;
     let detail = load_onenote_page_detail_with_cache(&storage, &graph, page, offline, cached).await?;
     if json_out {
-        let page = page_content_json(&detail, compact);
+        let is_compact = read_json_is_compact(format.is_some(), compact, full);
+        let page = page_content_json(&detail, is_compact, PageSurface::Cli);
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({ "page": page }))?
@@ -2724,7 +3103,7 @@ async fn cmd_read(
         return Ok(());
     }
 
-    match format {
+    match format.unwrap_or("md") {
         "xhtml" => println!("{}", detail.raw_xhtml),
         "plain" => {
             println!("# {}\n", detail.summary.title);
@@ -3017,20 +3396,41 @@ async fn cmd_delete(cfg: &AppConfig, page: &str, yes: bool, json_out: bool) -> R
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_search(
     cfg: &AppConfig,
     query: &str,
     section: Option<&str>,
     refresh: bool,
     limit: usize,
+    cursor: usize,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, refresh).await?;
-    let hits = search_onenote_helper(&storage, &graph, query, section, refresh, limit).await?;
+    let mode = if refresh {
+        IdentityMode::AllowNetwork
+    } else {
+        IdentityMode::LocalOnly
+    };
+    let (_auth, graph, storage) = open_runtime_inner(cfg, refresh, mode).await?;
+    let (hits, has_more) =
+        search_onenote_with_offset(&storage, &graph, query, section, refresh, limit, cursor)
+            .await?;
     if json_out {
+        let (pages, pages_with_body) = storage.count_onenote_pages()?;
+        let next = next_cursor(cursor, limit, has_more);
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "query": query, "hits": hits }))?
+            serde_json::to_string_pretty(&json!({
+                "query": query,
+                "hits": hits,
+                "returned": hits.len(),
+                "has_more": has_more,
+                "next_cursor": next,
+                "cache": {
+                    "pages": pages,
+                    "pages_with_body": pages_with_body,
+                },
+            }))?
         );
     } else if hits.is_empty() {
         println!("No matching OneNote pages found for '{query}'.");
@@ -3827,5 +4227,178 @@ mod tests {
                 "should normalize hyphen text argv: {hyphen_text:?}"
             );
         }
+    }
+
+    #[test]
+    fn read_json_parse_forms() {
+        let cli = Cli::try_parse_from(["onenote", "read", "p", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Read {
+                format: None,
+                full: false,
+                compact: false,
+                json: true,
+                ..
+            }
+        ));
+
+        let cli =
+            Cli::try_parse_from(["onenote", "read", "p", "--format", "md", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Read {
+                format: Some(ref f),
+                full: false,
+                compact: false,
+                json: true,
+                ..
+            } if f == "md"
+        ));
+    }
+
+    #[test]
+    fn read_json_shape_matrix() {
+        assert!(read_json_is_compact(false, false, false));
+        assert!(read_json_is_compact(false, true, false));
+        assert!(!read_json_is_compact(false, false, true));
+        assert!(!read_json_is_compact(true, false, false));
+        assert!(read_json_is_compact(true, true, false));
+        assert!(!read_json_is_compact(true, false, true));
+    }
+
+    #[test]
+    fn read_full_conflicts_with_compact() {
+        use clap::error::ErrorKind;
+        let err = Cli::try_parse_from([
+            "onenote", "read", "p", "--json", "--compact", "--full",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn read_selectors_require_json() {
+        use clap::error::ErrorKind;
+        let err_full = Cli::try_parse_from(["onenote", "read", "p", "--full"]).unwrap_err();
+        assert_eq!(err_full.kind(), ErrorKind::MissingRequiredArgument);
+
+        let err_compact = Cli::try_parse_from(["onenote", "read", "p", "--compact"]).unwrap_err();
+        assert_eq!(err_compact.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn read_format_with_json_parses() {
+        assert!(
+            Cli::try_parse_from(["onenote", "read", "p", "--format", "xhtml", "--json"]).is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "onenote", "read", "p", "--format", "xhtml", "--json", "--compact",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["onenote", "read", "p", "--format", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn list_limit_bounds() {
+        assert!(Cli::try_parse_from(["onenote", "sections", "--limit", "0"]).is_err());
+        assert!(Cli::try_parse_from(["onenote", "sections", "--limit", "1001"]).is_err());
+        assert!(
+            Cli::try_parse_from(["onenote", "sections", "--limit", "1000", "--cursor", "5"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["onenote", "sections", "--cursor", "x"]).is_err());
+    }
+
+    #[test]
+    fn page_slice_boundaries() {
+        let base = vec![1, 2, 3, 4, 5];
+        let (s, m) = page_slice(base.clone(), 0, 5);
+        assert_eq!((s.len(), m), (5, false));
+        let (s, m) = page_slice(base.clone(), 0, 4);
+        assert_eq!((s.len(), m), (4, true));
+        let (s, m) = page_slice(base.clone(), 4, 1);
+        assert_eq!((s.len(), m), (1, false));
+        let (s, m) = page_slice(base.clone(), 5, 1);
+        assert_eq!((s.len(), m), (0, false));
+        let (s, m) = page_slice(base, 9, 2);
+        assert_eq!((s.len(), m), (0, false));
+    }
+
+    #[test]
+    fn compact_page_json_keys() {
+        use crate::models::{OnenoteBlockKind, RichSpan};
+
+        let make_block = |id: &str| OnenoteBlock {
+            element_id: Some(id.to_string()),
+            tag: None,
+            raw_html: Some(format!("<p id=\"{id}\">text</p>")),
+            kind: OnenoteBlockKind::Paragraph {
+                spans: vec![RichSpan::plain("text")],
+            },
+        };
+        let detail = OnenotePageDetail {
+            summary: OnenotePageSummary {
+                page_key: "group:G1|gpage-1".to_string(),
+                id: "gpage-1".to_string(),
+                scope: OnenoteScope::Group {
+                    group_id: "G1".to_string(),
+                    group_name: None,
+                },
+                section_id: "gsec-1".to_string(),
+                section_name: Some("Specs".to_string()),
+                notebook_id: Some("gnb-1".to_string()),
+                notebook_name: Some("Engineering".to_string()),
+                title: "Architecture Spec".to_string(),
+                level: 0,
+                order: 1,
+                created_at: Some("2026-11-01T00:00:00Z".to_string()),
+                last_modified_at: Some("2026-11-02T00:00:00Z".to_string()),
+                content_url: Some("https://example.invalid/content".to_string()),
+                web_url: Some("https://example.invalid/gpage-1".to_string()),
+                preview_text: Some("preview".to_string()),
+                has_todo: true,
+            },
+            raw_xhtml: "<html><body><p>text</p></body></html>".to_string(),
+            body_markdown: "# Architecture Spec".to_string(),
+            body_plain: "Architecture Spec".to_string(),
+            blocks: vec![make_block("p:1"), make_block("p:2"), make_block("p:3")],
+            resources: vec![OnenoteResource {
+                element_id: Some("img:1".to_string()),
+                resource_url: "https://example.invalid/res-1".to_string(),
+                fullres_url: None,
+                mime_type: "image/png".to_string(),
+                file_name: Some("diagram.png".to_string()),
+                is_image: true,
+                alt_text: None,
+            }],
+            primary_div_id: Some("div:1".to_string()),
+            synced_at: Some("2026-11-21T11:07:40Z".to_string()),
+        };
+
+        let cli_compact = page_content_json(&detail, true, PageSurface::Cli);
+        assert_eq!(cli_compact["page_key"], "group:G1|gpage-1");
+        assert_eq!(cli_compact["scope"]["scope_type"], "group");
+        assert_eq!(cli_compact["scope"]["group_id"], "G1");
+        assert_eq!(cli_compact["omitted"]["blocks"], 3);
+        assert_eq!(cli_compact["omitted"]["resources"], 1);
+        assert!(cli_compact.get("blocks").is_none());
+        assert!(cli_compact.get("raw_xhtml").is_none());
+        assert!(cli_compact["hint"].as_str().unwrap().contains("--full"));
+
+        let mcp_compact = page_content_json(&detail, true, PageSurface::Mcp);
+        assert_eq!(mcp_compact["page_key"], "group:G1|gpage-1");
+        assert_eq!(mcp_compact["scope"]["group_id"], "G1");
+        assert_eq!(mcp_compact["omitted"]["blocks"], 3);
+        assert_eq!(mcp_compact["omitted"]["resources"], 1);
+        assert!(mcp_compact.get("blocks").is_none());
+        assert!(mcp_compact.get("raw_xhtml").is_none());
+        assert!(mcp_compact["hint"]
+            .as_str()
+            .unwrap()
+            .contains("\"compact\":false"));
+
+        assert_eq!(page_content_json(&detail, false, PageSurface::Cli), json!(detail));
+        assert_eq!(page_content_json(&detail, false, PageSurface::Mcp), json!(detail));
     }
 }

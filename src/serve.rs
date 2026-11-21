@@ -162,6 +162,8 @@ fn default_page_limit() -> usize {
 #[derive(Debug, Default, Deserialize)]
 pub struct GetPageQuery {
     #[serde(default)]
+    pub section: Option<String>,
+    #[serde(default)]
     pub offline: bool,
 }
 
@@ -523,7 +525,16 @@ async fn get_page(
     AxumPath(page_key): AxumPath<String>,
     Query(query): Query<GetPageQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let page = cli::load_onenote_page_detail(&state.storage, &state.graph, &page_key, query.offline)
+    let resolved = cli::resolve_page_query_in_section(
+        &state.storage,
+        &state.graph,
+        &page_key,
+        query.section.as_deref(),
+        query.offline,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    let page = cli::load_onenote_page_detail(&state.storage, &state.graph, &resolved, query.offline)
         .await
         .map_err(onenote_api_error)?;
     Ok(Json(json!({ "ok": true, "page": page })))

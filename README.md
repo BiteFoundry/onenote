@@ -64,6 +64,8 @@ onenote whoami --json
 
 For persistent environment configuration, set `ONENOTE_CLIENT_ID` and `ONENOTE_TENANT_ID`.
 
+When supplying a token without an embedded user ID (for example an opaque `ONENOTE_ACCESS_TOKEN` or `ONENOTE_TOKEN_FILE`), run `onenote whoami` once while online to record only the token fingerprint and user ID under `identity-map/`. Running local `search` (without `--refresh`) or `--offline` with an unrecorded token returns an `Unknown identity` error instead of falling back to an empty `default` cache. Running `onenote search <query> --refresh` also records the identity binding. Whenever the token rotates or changes, run `onenote whoami` once again for the new token.
+
 ---
 
 ## Keybindings Cheat Sheet
@@ -97,13 +99,17 @@ onenote pages "Acme Engineering/Architecture" --json
 onenote rename-section 'me|SECTION_ID' --name 'Architecture Notes' --json
 onenote rename-notebook --drive-id DRIVE_ID --item-id ITEM_ID --name 'Engineering Notes' --json
 onenote read "Q4 Architecture RFC" --json
-onenote read "Q4 Architecture RFC" --json --compact
+onenote read "Q4 Architecture RFC" --json --full
 onenote copy-page 'me|PAGE_ID' --section 'me|SECTION_ID' --json
 onenote create "Architecture" --title "Release Notes" '## Shipped
 - [x] WAL pool' --json
 onenote check "Migration Cutover" --block-id 'p:m3' --done --json
 onenote search "canary" --json
 ```
+
+`onenote read PAGE --json` returns compact Markdown and identifiers by default; pass `--full` for parsed blocks, raw XHTML, and resources. Passing an explicit `--format <fmt> --json` returns the full JSON page, and adding `--compact` selects the compact shape.
+
+`onenote notebooks --json` and `onenote sections --json` return 50 items by default (text output stays unbounded unless `--limit` is passed); `pages` defaults to 50 and `search` defaults to 30. All four JSON list responses include `returned`, `has_more`, and `next_cursor`, which can be passed back with `--limit` and `--cursor` to page through results.
 
 Use `onenote read PAGE --format blocks` to find a checkbox or text block's current element ID. Use `--done` or `--undone` to set a checkbox state. Omit both flags to toggle it.
 

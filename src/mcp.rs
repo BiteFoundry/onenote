@@ -26,9 +26,10 @@ use crate::{
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
-pub async fn run(config: AppConfig, graph: GraphClient, storage: Storage) -> Result<()> {
+pub async fn run(config: AppConfig) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
+    let mut runtime: Option<(GraphClient, Storage)> = None;
 
     for line_res in stdin.lock().lines() {
         let line = match line_res {
@@ -52,7 +53,55 @@ pub async fn run(config: AppConfig, graph: GraphClient, storage: Storage) -> Res
                 continue;
             }
         };
-        if let Some(resp) = handle_request_value(&config, &graph, &storage, req).await {
+        if let Some(resp_opt) = handle_protocol_value(&req) {
+            if let Some(resp) = resp_opt {
+                writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
+                stdout.flush()?;
+            }
+            continue;
+        }
+        if runtime.is_none() {
+            let params = req.get("params");
+            let tool_name = params
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let args = params.and_then(|p| p.get("arguments"));
+            let is_search_local = matches!(tool_name, "search_pages" | "onenote_search_pages")
+                && args
+                    .and_then(|a| a.get("refresh"))
+                    .and_then(Value::as_bool)
+                    != Some(true);
+            let is_offline = args
+                .and_then(|a| a.get("offline"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let mode = if is_search_local || is_offline {
+                cli::IdentityMode::LocalOnly
+            } else {
+                cli::IdentityMode::AllowNetwork
+            };
+            match cli::open_mcp_runtime(&config, mode).await {
+                Ok(rt) => runtime = Some(rt),
+                Err(err) => {
+                    let id = req.get("id").cloned().unwrap_or(Value::Null);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": format!("Error: {err:#}") }],
+                            "isError": true,
+                        }
+                    });
+                    writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
+                    stdout.flush()?;
+                    continue;
+                }
+            }
+        }
+        let (graph, storage) = runtime.as_ref().unwrap();
+        if let Some(resp) = handle_request_value(&config, graph, storage, req).await {
             writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
             stdout.flush()?;
         }
@@ -60,24 +109,18 @@ pub async fn run(config: AppConfig, graph: GraphClient, storage: Storage) -> Res
     Ok(())
 }
 
-/// Handles a single JSON-RPC 2.0 MCP message and returns an optional JSON response (`None` for notifications).
-pub async fn handle_request_value(
-    config: &AppConfig,
-    graph: &GraphClient,
-    storage: &Storage,
-    req: Value,
-) -> Option<Value> {
+/// Answers every method that needs no runtime. Returns None for tools/call.
+pub fn handle_protocol_value(req: &Value) -> Option<Option<Value>> {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
 
     if method == "notifications/initialized" || method.starts_with("notifications/") {
-        return None;
+        return Some(None);
     }
 
     let id = id.unwrap_or(Value::Null);
     match method {
-        "initialize" => Some(json!({
+        "initialize" => Some(Some(json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": {
@@ -88,58 +131,72 @@ pub async fn handle_request_value(
                     "version": env!("CARGO_PKG_VERSION"),
                 }
             }
-        })),
-        "ping" => Some(json!({
+        }))),
+        "ping" => Some(Some(json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": {}
-        })),
-        "tools/list" => Some(json!({
+        }))),
+        "tools/list" => Some(Some(json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": { "tools": tool_definitions() }
-        })),
-        "tools/call" => {
-            let tool_name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            match dispatch_tool(config, graph, storage, tool_name, &args).await {
-                Ok(result_val) => {
-                    let is_error = tool_name == "copy_page" && result_val["ok"] == false;
-                    let text = serde_json::to_string_pretty(&result_val)
-                        .unwrap_or_else(|_| result_val.to_string());
-                    Some(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": text }],
-                            "structuredContent": result_val,
-                            "isError": is_error,
-                        }
-                    }))
-                }
-                Err(err) => Some(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{ "type": "text", "text": format!("Error: {err}") }],
-                        "isError": true,
-                    }
-                })),
-            }
-        }
-        other => Some(json!({
+        }))),
+        "tools/call" => None,
+        other => Some(Some(json!({
             "jsonrpc": "2.0",
             "id": id,
             "error": {
                 "code": -32601,
                 "message": format!("Method not found: {other}")
+            }
+        }))),
+    }
+}
+
+/// Handles a single JSON-RPC 2.0 MCP message and returns an optional JSON response (`None` for notifications).
+pub async fn handle_request_value(
+    config: &AppConfig,
+    graph: &GraphClient,
+    storage: &Storage,
+    req: Value,
+) -> Option<Value> {
+    if let Some(resp) = handle_protocol_value(&req) {
+        return resp;
+    }
+
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    let tool_name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    match dispatch_tool(config, graph, storage, tool_name, &args).await {
+        Ok(result_val) => {
+            let is_error = tool_name == "copy_page" && result_val["ok"] == false;
+            let text = serde_json::to_string_pretty(&result_val)
+                .unwrap_or_else(|_| result_val.to_string());
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": text }],
+                    "structuredContent": result_val,
+                    "isError": is_error,
+                }
+            }))
+        }
+        Err(err) => Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{ "type": "text", "text": format!("Error: {err}") }],
+                "isError": true,
             }
         })),
     }
@@ -170,7 +227,7 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "whoami",
-            "description": "Return the currently signed-in Microsoft 365 user profile.",
+            "description": "Return the currently signed-in Microsoft 365 user profile and the active auth mode.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
@@ -180,6 +237,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "include_teams": { "type": "boolean", "description": "Include Microsoft Teams/Group shared notebooks" },
+                    "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 },
+                    "cursor": { "type": "string", "description": "next_cursor from the previous response" },
                     "refresh": { "type": "boolean", "description": "Force refresh from Microsoft Graph" },
                     "offline": { "type": "boolean", "description": "Read local SQLite cache only" }
                 }
@@ -192,6 +251,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "notebook": { "type": "string", "description": "Optional notebook key, ID, or display name" },
+                    "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 },
+                    "cursor": { "type": "string", "description": "next_cursor from the previous response" },
                     "refresh": { "type": "boolean" },
                     "offline": { "type": "boolean" }
                 }
@@ -206,6 +267,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "section": { "type": "string" },
                     "limit": { "type": "integer", "default": 50 },
+                    "cursor": { "type": "string", "description": "next_cursor from the previous response" },
                     "refresh": { "type": "boolean" },
                     "offline": { "type": "boolean" }
                 }
@@ -213,14 +275,14 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_page",
-            "description": "Read a OneNote page including parsed blocks (with element_id & data-tag), GFM Markdown, plain text, and embedded resources.",
+            "description": "Read a OneNote page. Returns compact Markdown and identifiers by default; set compact:false for parsed blocks (element_id, data-tag), plain text, raw XHTML and embedded resources.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string", "description": "Page key, ID, or title" },
                     "offline": { "type": "boolean" },
-                    "compact": { "type": "boolean", "description": "Return ID, title, modification time and Markdown" }
+                    "compact": { "type": "boolean", "default": true, "description": "Default true. Set false for blocks[].element_id, raw_xhtml and resources." }
                 }
             }
         }),
@@ -382,7 +444,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "query": { "type": "string" },
                     "section": { "type": "string" },
                     "refresh": { "type": "boolean" },
-                    "limit": { "type": "integer", "default": 30 }
+                    "limit": { "type": "integer", "default": 30 },
+                    "cursor": { "type": "string", "description": "next_cursor from the previous response" }
                 }
             }
         }),
@@ -412,23 +475,53 @@ async fn dispatch_tool(
     match name {
         "whoami" => {
             let me = graph.get_me().await?;
-            Ok(json!({ "ok": true, "user": me }))
+            let auth_mode = graph.auth().current_tokens().await.map(|t| t.auth_mode);
+            Ok(json!({ "ok": true, "user": me, "auth_mode": auth_mode }))
         }
         "list_notebooks" | "onenote_list_notebooks" => {
             let include_teams = args.get("include_teams").and_then(Value::as_bool).unwrap_or(false);
             let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
             let offline = args.get("offline").and_then(Value::as_bool).unwrap_or(false);
-            let notebooks =
+            let limit = parse_bounded_limit(args, 50)?;
+            let offset = cli::parse_mcp_cursor(args)?;
+            let all_notebooks =
                 cli::load_onenote_notebooks(storage, graph, include_teams, refresh, offline).await?;
-            Ok(json!({ "ok": true, "notebooks": notebooks }))
+            let (notebooks, has_more) = cli::page_slice(all_notebooks, offset, limit);
+            let next = cli::next_cursor(offset, limit, Some(has_more));
+            let mut out = json!({
+                "ok": true,
+                "notebooks": notebooks,
+                "returned": notebooks.len(),
+                "has_more": has_more,
+                "next_cursor": next,
+            });
+            if offline {
+                out["cache_synced_at"] = json!(cli::notebooks_cache_synced_at(storage));
+            }
+            Ok(out)
         }
         "list_sections" | "onenote_list_sections" => {
             let notebook = args.get("notebook").and_then(Value::as_str);
             let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
             let offline = args.get("offline").and_then(Value::as_bool).unwrap_or(false);
-            let (nb, sections) =
+            let limit = parse_bounded_limit(args, 50)?;
+            let offset = cli::parse_mcp_cursor(args)?;
+            let (nb, all_sections) =
                 cli::load_onenote_sections(storage, graph, notebook, refresh, offline).await?;
-            Ok(json!({ "ok": true, "notebook": nb, "sections": sections }))
+            let (sections, has_more) = cli::page_slice(all_sections, offset, limit);
+            let next = cli::next_cursor(offset, limit, Some(has_more));
+            let mut out = json!({
+                "ok": true,
+                "notebook": nb,
+                "sections": sections,
+                "returned": sections.len(),
+                "has_more": has_more,
+                "next_cursor": next,
+            });
+            if offline {
+                out["cache_synced_at"] = json!(cli::sections_cache_synced_at(storage, nb.as_ref()));
+            }
+            Ok(out)
         }
         "list_pages" | "onenote_list_pages" => {
             let section = required_str(args, "section")?;
@@ -437,12 +530,26 @@ async fn dispatch_tool(
                 .and_then(Value::as_u64)
                 .map(|n| n as usize)
                 .unwrap_or(50);
+            let offset = cli::parse_mcp_cursor(args)?;
             let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
             let offline = args.get("offline").and_then(Value::as_bool).unwrap_or(false);
-            let (sec, pages) =
-                cli::list_onenote_pages_helper(storage, graph, section, limit, refresh, offline)
-                    .await?;
-            Ok(json!({ "ok": true, "section": sec, "pages": pages }))
+            let (sec, pages, has_more) = cli::list_onenote_pages_with_cache(
+                storage, graph, section, limit, offset, refresh, offline, false,
+            )
+            .await?;
+            let next = cli::next_cursor(offset, limit, has_more);
+            let mut out = json!({
+                "ok": true,
+                "section": sec,
+                "pages": pages,
+                "returned": pages.len(),
+                "has_more": has_more,
+                "next_cursor": next,
+            });
+            if offline {
+                out["cache_synced_at"] = json!(cli::pages_cache_synced_at(storage, &sec.section_key));
+            }
+            Ok(out)
         }
         "get_page" | "onenote_get_page" => {
             let page = required_str(args, "page")?;
@@ -451,8 +558,11 @@ async fn dispatch_tool(
             let compact = args
                 .get("compact")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
-            Ok(json!({ "ok": true, "page": cli::page_content_json(&detail, compact) }))
+                .unwrap_or(true);
+            Ok(json!({
+                "ok": true,
+                "page": cli::page_content_json(&detail, compact, cli::PageSurface::Mcp),
+            }))
         }
         "create_notebook" | "onenote_create_notebook" => {
             let nb_name = required_str(args, "name")?;
@@ -676,9 +786,25 @@ async fn dispatch_tool(
                 .and_then(Value::as_u64)
                 .map(|v| v as usize)
                 .unwrap_or(30);
-            let hits =
-                cli::search_onenote_helper(storage, graph, query, section, refresh, limit).await?;
-            Ok(json!({ "ok": true, "query": query, "hits": hits }))
+            let offset = cli::parse_mcp_cursor(args)?;
+            let (hits, has_more) = cli::search_onenote_with_offset(
+                storage, graph, query, section, refresh, limit, offset,
+            )
+            .await?;
+            let (pages, pages_with_body) = storage.count_onenote_pages()?;
+            let next = cli::next_cursor(offset, limit, has_more);
+            Ok(json!({
+                "ok": true,
+                "query": query,
+                "hits": hits,
+                "returned": hits.len(),
+                "has_more": has_more,
+                "next_cursor": next,
+                "cache": {
+                    "pages": pages,
+                    "pages_with_body": pages_with_body,
+                },
+            }))
         }
         "download_resource" | "onenote_download_resource" => {
             let page = required_str(args, "page")?;
@@ -705,6 +831,21 @@ async fn dispatch_tool(
     }
 }
 
+fn parse_bounded_limit(args: &Value, default: usize) -> Result<usize> {
+    match args.get("limit") {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => {
+            let Some(n) = v.as_i64() else {
+                bail!("limit must be between 1 and 1000");
+            };
+            if !(1..=1000).contains(&n) {
+                bail!("limit must be between 1 and 1000");
+            }
+            Ok(n as usize)
+        }
+    }
+}
+
 fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     let val = args
         .get(key)
@@ -727,4 +868,62 @@ fn string_array(args: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_methods_need_no_runtime() {
+        let init = handle_protocol_value(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }));
+        let init_val = init.expect("initialize handled").expect("initialize returns response");
+        assert!(init_val["result"]["serverInfo"].is_object());
+
+        let ping = handle_protocol_value(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping",
+            "params": {}
+        }));
+        assert!(ping.expect("ping handled").is_some());
+
+        let list = handle_protocol_value(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/list",
+            "params": {}
+        }));
+        let list_val = list.expect("tools/list handled").expect("tools/list returns response");
+        let tools = list_val["result"]["tools"].as_array().expect("tools array");
+        assert!(!tools.is_empty());
+
+        let notif = handle_protocol_value(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }));
+        assert_eq!(notif, Some(None));
+
+        let call = handle_protocol_value(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "whoami", "arguments": {} }
+        }));
+        assert_eq!(call, None);
+
+        let bogus = handle_protocol_value(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "bogus/method",
+            "params": {}
+        }));
+        let bogus_val = bogus.expect("bogus handled").expect("bogus returns error");
+        assert!(bogus_val["error"].is_object());
+    }
 }

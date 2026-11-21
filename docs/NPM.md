@@ -32,7 +32,7 @@ terminal image preview (`Kitty` / `iTerm2` / `Sixel` / `Halfblock` via `onenote 
 and the interactive TUI).
 
 - `onenote login`, `onenote logout`, `onenote whoami`, `onenote doctor --online`
-- `onenote notebooks`, `onenote sections [notebook]`, `onenote pages <section>`, `onenote read <page> [--json [--compact]]`
+- `onenote notebooks [--limit N] [--cursor N]`, `onenote sections [notebook] [--limit N] [--cursor N]`, `onenote pages <section> [--limit N] [--cursor N]`, `onenote read <page> [--json [--full]]`
 - `onenote create-notebook <name>`, `onenote create-section <notebook> <name>`
 - `onenote rename-section <section-id> --name <new-name> [--json]`
 - `onenote rename-notebook --drive-id <drive-id> --item-id <item-id> --name <name> [--json]`
@@ -41,7 +41,7 @@ and the interactive TUI).
 - `onenote append <page> [markdown] [--file <file>] [--image <path>]`
 - `onenote update <page> [--title <title>] [--body <markdown> | --file <file>] [--block-id <id>]`
 - `onenote check <page> [--block-id <id> | --index <n>] [--done | --undone]`, `onenote delete <page> --yes`
-- `onenote search <query>`, `onenote resource <page> [--index <n>] [--out <directory>]`
+- `onenote search <query> [--limit N] [--cursor N]`, `onenote resource <page> [--index <n>] [--out <directory>]`
 - `onenote sync`, `onenote daemon <start|status|stop|restart|run>`, `onenote tui`, `onenote serve`, `onenote mcp`, `onenote preview-file <path>`, `onenote self-update`
 
 ```sh

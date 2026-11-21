@@ -33,12 +33,12 @@ All OneNote endpoints are served under both `/v1/onenote/...` and the shorter `/
 | `POST` | `/v1/onenote/sections` | Create section (`{ notebook, name }`) |
 | `GET` | `/v1/onenote/pages` | List pages in a section (`?section=...&limit=50&refresh=false&offline=false`) |
 | `POST` | `/v1/onenote/pages` | Create a top-level page (`{ section, title, markdown?, level?, image_paths? }`). `level` defaults to 0. |
-| `GET` | `/v1/onenote/pages/{page}` | Get structured page detail (`?section=...&refresh=false&offline=false`) |
+| `GET` | `/v1/onenote/pages/{page}` | Get structured page detail (`?section=...&offline=false`) |
 | `PATCH` | `/v1/onenote/pages/{page}` | Update block or page (`{ block_id?, title?, markdown?, section? }`) |
 | `DELETE` | `/v1/onenote/pages/{page}` | Delete page (`?section=...`) |
 | `POST` | `/v1/onenote/pages/{page}/append` | Append Markdown/images (`{ markdown, images? \| image_paths?, section? }`) |
 | `POST` | `/v1/onenote/pages/{page}/todo` | Set or toggle checkbox (`{ block_id?, index?, completed?, expected_content?, force?, section? }`; alias: `/pages/{page}/toggle-todo`) |
-| `GET` | `/v1/onenote/search` | Search local FTS5 cache (`?q=...&section=...&limit=20&refresh=false`) |
+| `GET` | `/v1/onenote/search` | Search local FTS5 cache (`?q=...&section=...&limit=30&refresh=false`) |
 | `POST` | `/v1/onenote/resources/download` | Download embedded resource (`{ page, index?, url?, out? \| out_dir?, section? }`; alias: `/pages/{page}/resources/download`) |
 
 ### Resource Download Response
@@ -111,4 +111,4 @@ onenote desktop-rename-section 'FULL_DESKTOP_SECTION_ID' --name 'Engineering Not
 
 Use levels 0, 1 and 2 for top-level pages and the two levels of subpages. A level update sends the page's ID and level and verifies the resulting level and original parent section. A section rename verifies the section ID, parent and name. The desktop Move workflow provides no documented Graph page-ID guarantee. [OneNote COM application interface](https://learn.microsoft.com/en-us/office/client-developer/onenote/application-interface-onenote) · [Hierarchy and XML schema enumerations](https://learn.microsoft.com/en-us/office/client-developer/onenote/enumerations-onenote-developer-reference)
 
-After a native hierarchy edit, wait for OneNote to sync. Use `onenote read PAGE --json` or MCP `get_page` to compare `summary.id`, `section_id`, `notebook_id`, `level`, and `raw_xhtml` with a previous read. Refresh hierarchy lists with `--refresh` and re-download referenced resources when binary preservation matters.
+After a native hierarchy edit, wait for OneNote to sync. Use `onenote read PAGE --json --full` or MCP `get_page` with `compact: false` to compare `summary.id`, `section_id`, `notebook_id`, `level`, and `raw_xhtml` with a previous read. Refresh hierarchy lists with `--refresh` and re-download referenced resources when binary preservation matters.
