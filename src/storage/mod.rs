@@ -352,6 +352,11 @@ impl Storage {
         onenote::prune_onenote_section_pages(&mut conn, section_key, pages)
     }
 
+    pub fn list_onenote_page_keys(&self, section_key: &str) -> Result<Vec<String>> {
+        let conn = self.read_conn()?;
+        onenote::list_onenote_page_keys(&conn, section_key)
+    }
+
     pub fn list_onenote_pages(&self, section_key: &str) -> Result<Vec<OnenotePageSummary>> {
         let conn = self.read_conn()?;
         onenote::list_onenote_pages(&conn, section_key)

@@ -1376,10 +1376,9 @@ async fn run_section_pages_refresh(
 ) -> bool {
     let (scope, section_id) = split_onenote_entity_key(section_key);
     let prev_ids: HashSet<String> = storage
-        .list_onenote_pages(section_key)
+        .list_onenote_page_keys(section_key)
         .unwrap_or_default()
         .into_iter()
-        .map(|p| p.page_key)
         .collect();
 
     match graph

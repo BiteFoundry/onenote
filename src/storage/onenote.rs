@@ -379,6 +379,26 @@ pub fn list_onenote_sections(
     }
 }
 
+#[derive(PartialEq)]
+struct PageSearchFields {
+    section_key: String,
+    title: String,
+    notebook_name: String,
+    section_name: String,
+    // None represents a retained body. A list upsert can only retain or clear body_plain.
+    preview: Option<String>,
+}
+
+fn map_page_search_fields(row: &rusqlite::Row<'_>) -> rusqlite::Result<PageSearchFields> {
+    Ok(PageSearchFields {
+        section_key: row.get(0)?,
+        title: row.get(1)?,
+        notebook_name: row.get(2)?,
+        section_name: row.get(3)?,
+        preview: row.get(4)?,
+    })
+}
+
 fn upsert_onenote_pages_in_tx(
     tx: &Transaction<'_>,
     items: &[OnenotePageSummary],
@@ -387,8 +407,24 @@ fn upsert_onenote_pages_in_tx(
     if items.is_empty() {
         return Ok(Vec::new());
     }
+    let page_keys: Vec<String> = items.iter().map(normalized_page_key).collect();
+    let mut indexed_keys: HashSet<String> = {
+        // FTS page_key is unindexed. Check the whole batch in a single scan of just that column.
+        let mut stmt = tx.prepare(
+            "SELECT page_key FROM onenote_fts WHERE page_key IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = stmt.query_map(params![serde_json::to_string(&page_keys)?], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
     let mut existing_stmt = tx.prepare(
-        "SELECT last_modified_at, detail_json IS NOT NULL FROM onenote_pages WHERE page_key = ?1",
+        "SELECT section_key, title, COALESCE(notebook_name, ''), COALESCE(section_name, ''),
+                CASE
+                    WHEN body_plain IS NULL THEN COALESCE(preview_text, '')
+                    WHEN ?2 IS NOT NULL AND ?2 IS NOT last_modified_at THEN
+                        CASE WHEN body_plain = COALESCE(?3, '') THEN COALESCE(?3, '') END
+                END,
+                last_modified_at, detail_json IS NOT NULL
+         FROM onenote_pages WHERE page_key = ?1",
     )?;
     let mut page_stmt = tx.prepare(
         "
@@ -488,6 +524,8 @@ fn upsert_onenote_pages_in_tx(
                 THEN excluded.body_plain
                 ELSE COALESCE(excluded.body_plain, onenote_pages.body_plain)
             END
+        RETURNING section_key, title, COALESCE(notebook_name, ''), COALESCE(section_name, ''),
+                  CASE WHEN body_plain IS NULL THEN COALESCE(preview_text, '') END
         ",
     )?;
 
@@ -510,10 +548,9 @@ fn upsert_onenote_pages_in_tx(
     )?;
 
     let mut invalidated_keys = Vec::new();
-    for item in items {
+    for (item, page_key) in items.iter().zip(page_keys) {
         let scope_key = item.scope.scope_key();
         let scope_json = serde_json::to_string(&item.scope)?;
-        let page_key = normalized_page_key(item);
         let section_key = item.scope.make_entity_key(&item.section_id);
         let preview_clean = item
             .preview_text
@@ -522,43 +559,55 @@ fn upsert_onenote_pages_in_tx(
             .filter(|s| !s.is_empty());
 
         let preserve_detail = preserve_detail_key == Some(page_key.as_str());
-        if let Some(incoming_mod) = item.last_modified_at.as_deref().filter(|_| !preserve_detail) {
-            if let Some((existing_mod, had_detail)) = existing_stmt
-                .query_row(params![&page_key], |r| {
-                    Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i32>(1)? != 0))
-                })
-                .optional()?
-            {
-                if had_detail && existing_mod.as_deref() != Some(incoming_mod) {
-                    invalidated_keys.push(page_key.clone());
-                }
-            }
+        let invalidating_mod = item.last_modified_at.as_deref().filter(|_| !preserve_detail);
+        let existing = existing_stmt
+            .query_row(params![page_key, invalidating_mod, preview_clean], |r| {
+                Ok((
+                    map_page_search_fields(r)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, bool>(6)?,
+                ))
+            })
+            .optional()?;
+        if existing.as_ref().is_some_and(|(_, existing_mod, had_detail)| {
+            *had_detail && invalidating_mod.is_some() && invalidating_mod != existing_mod.as_deref()
+        }) {
+            invalidated_keys.push(page_key.clone());
         }
 
-        page_stmt.execute(params![
-            page_key,
-            item.id,
-            scope_json,
-            scope_key,
-            section_key,
-            item.section_id,
-            item.section_name,
-            item.notebook_id,
-            item.notebook_name,
-            item.title,
-            item.level,
-            item.order,
-            item.created_at,
-            item.last_modified_at,
-            item.content_url,
-            item.web_url,
-            preview_clean,
-            bool_to_i32(item.has_todo),
-            bool_to_i32(preserve_detail),
-        ])?;
+        let search_fields = page_stmt.query_row(
+            params![
+                page_key,
+                item.id,
+                scope_json,
+                scope_key,
+                section_key,
+                item.section_id,
+                item.section_name,
+                item.notebook_id,
+                item.notebook_name,
+                item.title,
+                item.level,
+                item.order,
+                item.created_at,
+                item.last_modified_at,
+                item.content_url,
+                item.web_url,
+                preview_clean,
+                bool_to_i32(item.has_todo),
+                bool_to_i32(preserve_detail),
+            ],
+            map_page_search_fields,
+        )?;
 
-        fts_del_stmt.execute(params![page_key])?;
-        fts_ins_stmt.execute(params![page_key])?;
+        let was_indexed = indexed_keys.contains(&page_key);
+        if !was_indexed || existing.as_ref().map(|(fields, _, _)| fields) != Some(&search_fields) {
+            if was_indexed {
+                fts_del_stmt.execute(params![page_key])?;
+            }
+            fts_ins_stmt.execute(params![page_key])?;
+            indexed_keys.insert(page_key);
+        }
     }
     Ok(invalidated_keys)
 }
@@ -1023,17 +1072,10 @@ fn prune_onenote_section_pages_in_tx(
     preserve_page_key: Option<&str>,
 ) -> Result<()> {
     let keep_page_keys: HashSet<String> = pages.iter().map(normalized_page_key).collect();
-    let stale_pages: Vec<String> = {
-        let mut stmt =
-            tx.prepare("SELECT page_key FROM onenote_pages WHERE section_key = ?1")?;
-        let rows = stmt.query_map(params![canonical_section_key], |r| r.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|pk| {
-                !keep_page_keys.contains(pk) && preserve_page_key != Some(pk.as_str())
-            })
-            .collect()
-    };
+    let stale_pages: Vec<String> = list_onenote_page_keys(tx, canonical_section_key)?
+        .into_iter()
+        .filter(|pk| !keep_page_keys.contains(pk) && preserve_page_key != Some(pk.as_str()))
+        .collect();
     if !stale_pages.is_empty() {
         let mut del_page = tx.prepare("DELETE FROM onenote_pages WHERE page_key = ?1")?;
         let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
@@ -1064,6 +1106,27 @@ pub fn prune_onenote_section_pages(
     prune_onenote_section_pages_in_tx(&tx, &canonical_section_key, pages, None)?;
     tx.commit()?;
     Ok(())
+}
+
+pub fn list_onenote_page_keys(conn: &Connection, section_key: &str) -> Result<Vec<String>> {
+    let trimmed = section_key.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (sql, args) = if trimmed.contains('|') {
+        (
+            "SELECT page_key FROM onenote_pages WHERE section_key = ?1",
+            vec![trimmed.to_owned()],
+        )
+    } else {
+        (
+            "SELECT page_key FROM onenote_pages WHERE section_key = ?1 OR section_id = ?2",
+            vec![OnenoteScope::Me.make_entity_key(trimmed), trimmed.to_owned()],
+        )
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
 }
 
 pub fn list_onenote_pages(conn: &Connection, section_key: &str) -> Result<Vec<OnenotePageSummary>> {
@@ -2048,6 +2111,115 @@ mod tests {
             preserved_detail.primary_div_id.as_deref(),
             Some("div:{1111}{32}")
         );
+    }
+
+    #[test]
+    fn section_reconcile_rewrites_only_changed_or_missing_search_rows() {
+        let storage = Storage::open_in_memory().unwrap();
+        let stamp = "2026-11-15T09:00:00Z";
+        let mut first = sample_page_summary(
+            OnenoteScope::Me, "p1", "sec-a", "OriginalTitle", 0, stamp,
+        );
+        let mut second = sample_page_summary(
+            OnenoteScope::Me, "p2", "sec-a", "OtherTitle", 1, stamp,
+        );
+        second.preview_text = Some("PreviewOnly".into());
+        let detail = |summary, text| {
+            crate::parser::parse_onenote_page_xhtml(
+                summary,
+                &format!("<html><body><p>{text}</p></body></html>"),
+            )
+        };
+        storage.upsert_onenote_pages(&[second.clone()]).unwrap();
+        storage
+            .upsert_onenote_page_detail(&detail(first.clone(), "OriginalBody"))
+            .unwrap();
+        storage
+            .conn()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TABLE fts_writes (kind TEXT, page_key TEXT);
+                 CREATE TEMP TRIGGER fts_insert AFTER INSERT ON onenote_fts_content BEGIN
+                     INSERT INTO fts_writes VALUES ('insert', new.c0);
+                 END;
+                 CREATE TEMP TRIGGER fts_delete AFTER DELETE ON onenote_fts_content BEGIN
+                     INSERT INTO fts_writes VALUES ('delete', old.c0);
+                 END;",
+            )
+            .unwrap();
+
+        let take_writes = || {
+            let conn = storage.conn().lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT kind, page_key FROM fts_writes ORDER BY rowid")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap();
+            let writes: Vec<_> = rows.collect::<rusqlite::Result<_>>().unwrap();
+            conn.execute("DELETE FROM fts_writes", []).unwrap();
+            writes
+        };
+        let matches = |query: &str, section: Option<&str>| {
+            storage
+                .search_onenote_pages(query, section, 10)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.page_key)
+                .collect::<Vec<_>>()
+        };
+        let reconcile = |section, pages: &[OnenotePageSummary]| {
+            storage
+                .reconcile_onenote_section_pages(section, pages, true)
+                .unwrap();
+        };
+        let replacement = |key: &str| vec![("delete".into(), key.into()), ("insert".into(), key.into())];
+
+        let before = matches("OriginalBody", Some("me|sec-a"));
+        assert_eq!(before, ["me|p1"]);
+        first.preview_text = Some("Ignored while a body exists".into());
+        reconcile("me|sec-a", &[first.clone(), second.clone()]);
+        assert!(take_writes().is_empty());
+        assert_eq!(matches("OriginalBody", Some("me|sec-a")), before);
+
+        first.title = "RenamedTitle".into();
+        first.section_name = Some("RenamedSection".into());
+        first.notebook_name = Some("RenamedNotebook".into());
+        reconcile("me|sec-a", &[first.clone(), second.clone()]);
+        assert_eq!(take_writes(), replacement("me|p1"));
+        for query in ["RenamedTitle", "RenamedSection", "RenamedNotebook"] {
+            assert_eq!(matches(query, None), ["me|p1"]);
+        }
+        assert!(matches("OriginalTitle", None).is_empty());
+
+        storage
+            .conn()
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM onenote_fts WHERE page_key = 'me|p2'", [])
+            .unwrap();
+        assert_eq!(take_writes(), [("delete".into(), "me|p2".into())]);
+        reconcile("me|sec-a", &[first.clone(), second.clone()]);
+        assert_eq!(take_writes(), [("insert".into(), "me|p2".into())]);
+        assert_eq!(matches("PreviewOnly", None), ["me|p2"]);
+
+        first.section_id = "sec-b".into();
+        reconcile("me|sec-b", &[first.clone()]);
+        assert_eq!(take_writes(), replacement("me|p1"));
+        assert!(matches("OriginalBody", Some("me|sec-a")).is_empty());
+        assert_eq!(matches("OriginalBody", Some("me|sec-b")), ["me|p1"]);
+
+        storage
+            .upsert_onenote_page_detail(&detail(first, "EditedBody"))
+            .unwrap();
+        assert_eq!(take_writes(), replacement("me|p1"));
+        assert!(matches("OriginalBody", None).is_empty());
+        assert_eq!(matches("EditedBody", None), ["me|p1"]);
+
+        reconcile("me|sec-b", &[]);
+        assert_eq!(take_writes(), [("delete".into(), "me|p1".into())]);
+        assert!(matches("EditedBody", None).is_empty());
     }
 
     #[test]

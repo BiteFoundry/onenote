@@ -289,6 +289,7 @@ pub struct AppState {
     pub sections: Vec<OnenoteSection>,
     pub pages: Vec<OnenotePageSummary>,
     pub page_details: HashMap<String, OnenotePageDetail>,
+    previous_page_key: Option<String>,
 
     pub active_notebook_key: Option<String>,
     pub active_section_key: Option<String>,
@@ -355,6 +356,7 @@ impl AppState {
             sections: Vec::new(),
             pages: Vec::new(),
             page_details: HashMap::new(),
+            previous_page_key: None,
             active_notebook_key: None,
             active_section_key: None,
             active_page_key: None,
@@ -449,24 +451,53 @@ impl AppState {
         }
         if let Some(sec_key) = self.active_section_key.clone() {
             self.pages = self.storage.list_onenote_pages(&sec_key).unwrap_or_default();
-            let valid_page = self
-                .active_page_key
-                .as_deref()
-                .is_some_and(|pk| self.pages.iter().any(|p| p.page_key == pk));
-            if !valid_page {
-                self.active_page_key = self.pages.first().map(|p| p.page_key.clone());
-            }
-            if let Some(pk) = self.active_page_key.clone() {
-                if !self.page_details.contains_key(&pk) {
-                    if let Ok(Some(detail)) = self.storage.get_onenote_page_detail(&pk) {
-                        self.page_details.insert(pk, detail);
-                    }
-                }
-            }
+            let valid_page = valid_sec
+                && self
+                    .active_page_key
+                    .as_deref()
+                    .is_some_and(|pk| self.pages.iter().any(|p| p.page_key == pk));
+            let page_key = if valid_page {
+                self.active_page_key.clone()
+            } else {
+                self.pages.first().map(|p| p.page_key.clone())
+            };
+            self.set_active_page(page_key);
         } else {
             self.pages.clear();
-            self.active_page_key = None;
+            self.set_active_page(None);
         }
+    }
+
+    fn set_active_page(&mut self, page_key: Option<String>) {
+        if self.active_page_key != page_key {
+            if self.active_page_key.is_some() {
+                self.previous_page_key = self.active_page_key.take();
+            }
+            self.active_page_key = page_key;
+            self.loading_onenote_detail = false;
+            self.page_details.retain(|key, _| {
+                Some(key) == self.active_page_key.as_ref()
+                    || Some(key) == self.previous_page_key.as_ref()
+            });
+        }
+        if let Some(key) = &self.active_page_key {
+            if !self.page_details.contains_key(key) {
+                if let Ok(Some(detail)) = self.storage.get_onenote_page_detail(key) {
+                    self.page_details.insert(key.clone(), detail);
+                }
+            }
+        }
+    }
+
+    fn cache_page_detail(&mut self, detail: OnenotePageDetail) {
+        let key = &detail.summary.page_key;
+        if Some(key) == self.active_page_key.as_ref() {
+            self.loading_onenote_detail = false;
+        } else if Some(key) != self.previous_page_key.as_ref() {
+            // Sync and mutation handlers have already written the detail to SQLite.
+            return;
+        }
+        self.page_details.insert(key.clone(), detail);
     }
 
     pub fn push_focus_to_sync(&self) {
@@ -480,7 +511,6 @@ impl AppState {
     pub fn select_notebook(&mut self, notebook_key: String, ui: &mut UiState) {
         self.active_notebook_key = Some(notebook_key);
         self.active_section_key = None;
-        self.active_page_key = None;
         ui.onenote_scroll = 0;
         ui.onenote_selected_block = 0;
         self.ensure_active_section_and_pages_cached();
@@ -495,20 +525,14 @@ impl AppState {
 
     pub fn select_section(&mut self, section_key: String, ui: &mut UiState) {
         self.active_section_key = Some(section_key.clone());
-        self.active_page_key = None;
         ui.onenote_scroll = 0;
         ui.onenote_selected_block = 0;
         self.pages = self
             .storage
             .list_onenote_pages(&section_key)
             .unwrap_or_default();
-        self.active_page_key = self.pages.first().map(|p| p.page_key.clone());
+        self.set_active_page(self.pages.first().map(|p| p.page_key.clone()));
         if let Some(pk) = self.active_page_key.clone() {
-            if !self.page_details.contains_key(&pk) {
-                if let Ok(Some(detail)) = self.storage.get_onenote_page_detail(&pk) {
-                    self.page_details.insert(pk.clone(), detail);
-                }
-            }
             self.request_page_detail(pk);
         }
         self.request_section_pages(section_key);
@@ -516,14 +540,9 @@ impl AppState {
     }
 
     pub fn select_page(&mut self, page_key: String, ui: &mut UiState) {
-        self.active_page_key = Some(page_key.clone());
+        self.set_active_page(Some(page_key.clone()));
         ui.onenote_scroll = 0;
         ui.onenote_selected_block = 0;
-        if !self.page_details.contains_key(&page_key) {
-            if let Ok(Some(detail)) = self.storage.get_onenote_page_detail(&page_key) {
-                self.page_details.insert(page_key.clone(), detail);
-            }
-        }
         self.request_page_detail(page_key);
         self.push_focus_to_sync();
     }
@@ -1318,7 +1337,7 @@ impl AppState {
                         if let Some(new_sec_key) = moved_sec {
                             self.reconnect_active_page_section(new_sec_key);
                         } else {
-                            self.active_page_key = self.pages.first().map(|p| p.page_key.clone());
+                            self.set_active_page(self.pages.first().map(|p| p.page_key.clone()));
                         }
                     }
                     if let Some(pk) = self.active_page_key.clone() {
@@ -1342,11 +1361,13 @@ impl AppState {
                 }
             }
             CoreEvent::OnenotePageDetailUpdated(detail) => {
-                self.loading_onenote_detail = false;
                 let key = detail.summary.page_key.clone();
-                if self.active_page_key.as_deref() == Some(key.as_str())
-                    && !detail.summary.section_id.trim().is_empty()
-                {
+                if self.active_page_key.as_ref() != Some(&key) {
+                    self.sync_detail_summary_into_pages(&detail.summary);
+                    self.cache_page_detail(*detail);
+                    return;
+                }
+                if !detail.summary.section_id.trim().is_empty() {
                     let new_sec_key = detail
                         .summary
                         .scope
@@ -1378,7 +1399,7 @@ impl AppState {
                     }
                 }
                 self.sync_detail_summary_into_pages(&detail.summary);
-                self.page_details.insert(key, *detail);
+                self.cache_page_detail(*detail);
             }
             CoreEvent::SyncStateChanged { busy, summary } => {
                 self.syncing = busy;
@@ -1422,9 +1443,7 @@ impl AppState {
                 }
             }
             UiMsg::PageDetailLoaded(detail) => {
-                self.loading_onenote_detail = false;
-                let key = detail.summary.page_key.clone();
-                self.page_details.insert(key, *detail);
+                self.cache_page_detail(*detail);
             }
             UiMsg::NotebookCreated { task_id, notebook } => {
                 ui.tasks.finish(task_id);
@@ -1471,7 +1490,7 @@ impl AppState {
                 }
                 self.clear_draft(&format!("append:{pk}"));
                 self.sync_detail_summary_into_pages(&detail.summary);
-                self.page_details.insert(pk, *detail);
+                self.cache_page_detail(*detail);
                 ui.success(message);
             }
             UiMsg::EditConflict {
@@ -1481,12 +1500,11 @@ impl AppState {
                 message,
             } => {
                 ui.tasks.finish(task_id);
-                let pk = detail.summary.page_key.clone();
                 if let Some((draft_key, entry)) = draft_to_preserve {
                     self.save_draft_entry(draft_key, entry);
                 }
                 self.sync_detail_summary_into_pages(&detail.summary);
-                self.page_details.insert(pk, *detail);
+                self.cache_page_detail(*detail);
                 ui.warn(message);
             }
             UiMsg::PageDeleted { task_id, page_key } => {
@@ -1494,7 +1512,7 @@ impl AppState {
                 self.pages.retain(|p| p.page_key != page_key);
                 self.page_details.remove(&page_key);
                 if self.active_page_key.as_deref() == Some(page_key.as_str()) {
-                    self.active_page_key = self.pages.first().map(|p| p.page_key.clone());
+                    self.set_active_page(self.pages.first().map(|p| p.page_key.clone()));
                     if let Some(pk) = self.active_page_key.clone() {
                         self.request_page_detail(pk);
                     }
@@ -1672,6 +1690,80 @@ mod tests {
         let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
         let ui = UiState::from_config(&cfg);
         (app, ui, focus_rx, nudge_rx)
+    }
+
+    #[test]
+    fn test_recent_page_cache_reopens_evicted_details_and_isolates_late_updates() {
+        let (mut app, mut ui, _, _) = make_test_app_with_cached_summary();
+        app.load_cached_initial();
+
+        let make_detail = |mut summary: OnenotePageSummary, id: &str, body: &str| {
+            summary.id = id.to_string();
+            summary.page_key = format!("me|{id}");
+            parser::parse_onenote_page_xhtml(
+                summary,
+                &format!("<html><body><p>{body}</p></body></html>"),
+            )
+        };
+        let summary = app.active_page_summary().unwrap().clone();
+        let a = make_detail(summary.clone(), "page-1", "First cached body");
+        let b = make_detail(summary.clone(), "page-2", "Second cached body");
+        for detail in [&a, &b] {
+            app.storage.upsert_onenote_page_detail(detail).unwrap();
+        }
+
+        app.select_page(a.summary.page_key.clone(), &mut ui);
+        app.select_page(b.summary.page_key.clone(), &mut ui);
+        assert_eq!(app.page_details.len(), 2);
+
+        let mut form = crate::ui::overlays::onenote_form::OnenoteFormOverlay::edit_block(
+            b.summary.page_key.clone(),
+            b.summary.title.clone(),
+            "p:1".into(),
+            0,
+            b.body_plain.clone(),
+        );
+        form.body = "Unsaved draft".into();
+        ui.overlays.push(Overlay::OnenoteForm(form));
+
+        app.select_page("me|page-3".into(), &mut ui);
+        assert!(!app.page_details.contains_key(&a.summary.page_key));
+        for (id, body) in [
+            ("page-1", "Late evicted update"),
+            ("page-2", "Late previous update"),
+        ] {
+            let detail = make_detail(summary.clone(), id, body);
+            app.storage.upsert_onenote_page_detail(&detail).unwrap();
+            app.handle_core_event(&mut ui, CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
+        }
+        assert_eq!(app.active_page_key.as_deref(), Some("me|page-3"));
+        assert!(app.loading_onenote_detail);
+        assert_eq!(app.page_details.len(), 1);
+        assert_eq!(app.page_details["me|page-2"].body_plain, "Late previous update");
+        let Some(Overlay::OnenoteForm(form)) = ui.overlays.last() else {
+            panic!("expected edit form");
+        };
+        assert_eq!(form.body, "Unsaved draft");
+        assert!(form.error.is_none());
+
+        app.select_page(a.summary.page_key.clone(), &mut ui);
+        assert_eq!(app.active_page_detail().unwrap().body_plain, "Late evicted update");
+        assert!(!app.loading_onenote_detail);
+        assert_eq!(app.page_details.len(), 1);
+
+        for i in 3..=21 {
+            let detail = make_detail(summary.clone(), &format!("page-{i}"), "Visited body");
+            app.select_page(detail.summary.page_key.clone(), &mut ui);
+            app.storage.upsert_onenote_page_detail(&detail).unwrap();
+            app.handle_core_event(&mut ui, CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
+            assert_eq!(app.page_details.len(), 2);
+        }
+        app.select_page(a.summary.page_key, &mut ui);
+        assert_eq!(app.active_page_detail().unwrap().body_plain, "Late evicted update");
+        assert_eq!(app.page_details.len(), 2);
+        let stored_keys = app.storage.list_onenote_page_keys("me|sec-1").unwrap();
+        assert_eq!(stored_keys.len(), 21);
+        assert!(stored_keys.iter().all(|key| app.storage.get_onenote_page_detail(key).unwrap().is_some()));
     }
 
     #[test]
