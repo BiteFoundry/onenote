@@ -280,7 +280,7 @@ pub enum Command {
         page: Option<String>,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(long)]
         body: Option<String>,
         #[arg(long)]
         file: Option<PathBuf>,
@@ -293,7 +293,7 @@ pub enum Command {
         #[arg(long, requires = "replace_text")]
         with_text: Option<String>,
         /// Expected baseline content of the target block/page from your prior read; aborts with conflict if remote changed
-        #[arg(long = "expected-content", visible_alias = "base-content", allow_hyphen_values = true)]
+        #[arg(long = "expected-content", visible_alias = "base-content")]
         expected_content: Option<String>,
         /// Check for a newer `onenote` release on GitHub without installing (self-update mode)
         #[arg(long)]
@@ -333,7 +333,7 @@ pub enum Command {
         #[arg(long)]
         undone: bool,
         /// Expected baseline content of the target to-do block from your prior read; aborts with conflict if remote changed
-        #[arg(long = "expected-content", visible_alias = "base-content", allow_hyphen_values = true)]
+        #[arg(long = "expected-content", visible_alias = "base-content")]
         expected_content: Option<String>,
         /// Override conflict check if the target to-do block changed remotely
         #[arg(long)]
@@ -417,6 +417,293 @@ pub enum Command {
     /// Start the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
     Mcp,
+}
+
+impl Cli {
+    pub fn parse() -> Self {
+        Self::try_parse_from(std::env::args_os()).unwrap_or_else(|e| e.exit())
+    }
+
+    pub fn try_parse_from<I, T>(itr: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let normalized = normalize_hyphen_text_args(itr);
+        <Self as clap::Parser>::try_parse_from(normalized)
+    }
+}
+
+fn find_subcommand<'a>(cmd: &'a clap::Command, name: &str) -> Option<&'a clap::Command> {
+    cmd.get_subcommands()
+        .find(|sub| sub.get_name() == name || sub.get_all_aliases().any(|alias| alias == name))
+}
+
+fn find_long_arg<'a>(subcmd: &'a clap::Command, long_name: &str) -> Option<&'a clap::Arg> {
+    subcmd.get_arguments().find(|arg| {
+        arg.get_long() == Some(long_name)
+            || arg
+                .get_all_aliases()
+                .is_some_and(|aliases| aliases.contains(&long_name))
+    })
+}
+
+fn is_known_short_token(subcmd: &clap::Command, short_rest: &str) -> bool {
+    !short_rest.is_empty()
+        && short_rest.chars().all(|ch| {
+            matches!(ch, 'h' | 'V')
+                || subcmd.get_arguments().any(|arg| {
+                    arg.get_short() == Some(ch)
+                        || arg
+                            .get_all_short_aliases()
+                            .is_some_and(|aliases| aliases.contains(&ch))
+                })
+        })
+}
+
+fn is_known_flag_token(subcmd: &clap::Command, raw: &str) -> bool {
+    if let Some(long_body) = raw.strip_prefix("--") {
+        let name = long_body.split_once('=').map_or(long_body, |(name, _)| name);
+        return matches!(name, "help" | "version") || find_long_arg(subcmd, name).is_some();
+    }
+    if let Some(short_rest) = raw.strip_prefix('-') {
+        return is_known_short_token(subcmd, short_rest);
+    }
+    false
+}
+
+fn looks_like_long_flag(long_body: &str) -> bool {
+    if long_body.contains(['\n', '\r']) {
+        return false;
+    }
+    let name = long_body.split_once('=').map_or(long_body, |(name, _)| name);
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn is_hyphen_text_literal(subcmd: &clap::Command, raw: &str) -> bool {
+    let Some(rest) = raw.strip_prefix('-') else {
+        return false;
+    };
+    if rest.is_empty() || raw == "--" || is_known_flag_token(subcmd, raw) {
+        return false;
+    }
+    if let Some(long_body) = raw.strip_prefix("--") {
+        return !looks_like_long_flag(long_body);
+    }
+    true
+}
+
+fn subcommand_has_free_text(subcmd_name: &str) -> bool {
+    matches!(
+        subcmd_name,
+        "create"
+            | "append"
+            | "update"
+            | "check"
+            | "rename-section"
+            | "create-section"
+            | "desktop-rename-section"
+            | "create-notebook"
+            | "rename-notebook"
+            | "search"
+    )
+}
+
+fn is_free_text_option(subcmd_name: &str, arg_id: &str) -> bool {
+    match subcmd_name {
+        "create" => arg_id == "title",
+        "update" => matches!(
+            arg_id,
+            "title" | "body" | "replace_text" | "with_text" | "expected_content"
+        ),
+        "check" => arg_id == "expected_content",
+        "rename-section" | "rename-notebook" | "desktop-rename-section" => arg_id == "name",
+        _ => false,
+    }
+}
+
+fn is_free_text_positional(subcmd_name: &str, pos_index: usize) -> bool {
+    matches!(
+        (subcmd_name, pos_index),
+        ("create", 1)
+            | ("append", 1)
+            | ("create-section", 1)
+            | ("create-notebook", 0)
+            | ("search", 0)
+    )
+}
+
+fn may_be_hyphen_text_literal(raw: &str) -> bool {
+    let Some(rest) = raw.strip_prefix('-') else {
+        return false;
+    };
+    if rest.is_empty() || raw == "--" || matches!(raw, "-h" | "-V") {
+        return false;
+    }
+    if let Some(long_body) = raw.strip_prefix("--") {
+        return !looks_like_long_flag(long_body);
+    }
+    true
+}
+
+fn argv_needs_hyphen_normalization(raw: &[std::ffi::OsString]) -> bool {
+    if raw.len() <= 2 {
+        return false;
+    }
+    let Some(sub_arg) = raw[1].to_str() else {
+        return false;
+    };
+    if !subcommand_has_free_text(sub_arg) {
+        return false;
+    }
+    for tok in &raw[2..] {
+        let Some(tok_str) = tok.to_str() else {
+            continue;
+        };
+        if tok_str == "--" {
+            break;
+        }
+        if may_be_hyphen_text_literal(tok_str) {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_hyphen_text_args<I, T>(itr: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    let raw: Vec<std::ffi::OsString> = itr.into_iter().map(Into::into).collect();
+    if !argv_needs_hyphen_normalization(&raw) {
+        return raw;
+    }
+    let Some(sub_arg) = raw[1].to_str() else {
+        return raw;
+    };
+    let mut root_cmd = <Cli as clap::CommandFactory>::command();
+    root_cmd.build();
+    let Some(subcmd) = find_subcommand(&root_cmd, sub_arg) else {
+        return raw;
+    };
+    let sub_name = subcmd.get_name();
+
+    let mut before_dash = Vec::with_capacity(raw.len() + 1);
+    before_dash.push(raw[0].clone());
+    before_dash.push(raw[1].clone());
+    let mut deferred_pos: Vec<std::ffi::OsString> = Vec::new();
+    let mut pos_index = 0usize;
+    let mut i = 2usize;
+
+    while i < raw.len() {
+        let tok = &raw[i];
+        let Some(tok_str) = tok.to_str() else {
+            if deferred_pos.is_empty() {
+                before_dash.push(tok.clone());
+            } else {
+                deferred_pos.push(tok.clone());
+            }
+            pos_index += 1;
+            i += 1;
+            continue;
+        };
+
+        if tok_str == "--" {
+            if deferred_pos.is_empty() {
+                before_dash.extend_from_slice(&raw[i..]);
+            } else {
+                deferred_pos.extend_from_slice(&raw[i + 1..]);
+            }
+            break;
+        }
+
+        if let Some(long_body) = tok_str.strip_prefix("--") {
+            if let Some((long_name, _)) = long_body.split_once('=') {
+                if find_long_arg(subcmd, long_name).is_some() || looks_like_long_flag(long_body) {
+                    before_dash.push(tok.clone());
+                    i += 1;
+                    continue;
+                }
+            } else if let Some(arg) = find_long_arg(subcmd, long_body) {
+                if arg.get_action().takes_values() {
+                    if let Some(next) = raw.get(i + 1) {
+                        match next.to_str() {
+                            Some(next_str)
+                                if is_free_text_option(sub_name, arg.get_id().as_str())
+                                    && is_hyphen_text_literal(subcmd, next_str) =>
+                            {
+                                let mut combined = std::ffi::OsString::from(tok_str);
+                                combined.push("=");
+                                combined.push(next);
+                                before_dash.push(combined);
+                                i += 2;
+                                continue;
+                            }
+                            Some(next_str) if next_str != "-" && next_str.starts_with('-') => {
+                                before_dash.push(tok.clone());
+                                i += 1;
+                                continue;
+                            }
+                            _ => {
+                                before_dash.push(tok.clone());
+                                before_dash.push(next.clone());
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                before_dash.push(tok.clone());
+                i += 1;
+                continue;
+            }
+            if is_free_text_positional(sub_name, pos_index)
+                && is_hyphen_text_literal(subcmd, tok_str)
+            {
+                deferred_pos.push(tok.clone());
+                pos_index += 1;
+            } else {
+                before_dash.push(tok.clone());
+            }
+            i += 1;
+            continue;
+        }
+
+        if tok_str.len() > 1 && tok_str.starts_with('-') {
+            if is_known_flag_token(subcmd, tok_str) {
+                before_dash.push(tok.clone());
+                i += 1;
+                continue;
+            }
+            if is_free_text_positional(sub_name, pos_index)
+                && is_hyphen_text_literal(subcmd, tok_str)
+            {
+                deferred_pos.push(tok.clone());
+                pos_index += 1;
+            } else {
+                before_dash.push(tok.clone());
+            }
+            i += 1;
+            continue;
+        }
+
+        if deferred_pos.is_empty() {
+            before_dash.push(tok.clone());
+        } else {
+            deferred_pos.push(tok.clone());
+        }
+        pos_index += 1;
+        i += 1;
+    }
+
+    if !deferred_pos.is_empty() {
+        before_dash.push(std::ffi::OsString::from("--"));
+        before_dash.extend(deferred_pos);
+    }
+    before_dash
 }
 
 /// Fast-path for `--version` / `-V` / `--help` / `-h` before Tokio runtime spin-up (<1ms).
@@ -2955,5 +3242,472 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_hyphen_values_across_free_text_commands() {
+        const ITEM: &str = "- 목록 항목";
+        const TWO_LINE_LIST: &str = "- first\n- second";
+        const KO_TWO_LINE: &str = "- 첫째 항목\n- 둘째 항목";
+
+        // 1. create positional body + --title (Korean, two-line list, trailing --json)
+        let cli = Cli::try_parse_from(["onenote", "create", "sec", "--title", "Test", ITEM])
+            .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Create {
+                ref section,
+                ref title,
+                markdown_body: Some(ref body),
+                json: false,
+                ..
+            } if section == "sec" && title == "Test" && body == ITEM
+        ));
+
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "create",
+            "sec",
+            "--title",
+            ITEM,
+            TWO_LINE_LIST,
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Create {
+                ref section,
+                ref title,
+                markdown_body: Some(ref body),
+                json: true,
+                ..
+            } if section == "sec" && title == ITEM && body == TWO_LINE_LIST
+        ));
+
+        // 2. append positional body (Korean, two-line list, trailing --json, positional --)
+        let cli = Cli::try_parse_from(["onenote", "append", "page", ITEM, "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Append {
+                ref page,
+                markdown_body: Some(ref body),
+                json: true,
+                ..
+            } if page == "page" && body == ITEM
+        ));
+
+        let cli = Cli::try_parse_from(["onenote", "append", "page", KO_TWO_LINE]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Append {
+                markdown_body: Some(ref body),
+                ..
+            } if body == KO_TWO_LINE
+        ));
+
+        let cli = Cli::try_parse_from(["onenote", "append", "page", "---"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Append {
+                markdown_body: Some(ref body),
+                ..
+            } if body == "---"
+        ));
+
+        let cli = Cli::try_parse_from(["onenote", "append", "page", "--", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Append {
+                markdown_body: Some(ref body),
+                ..
+            } if body == "--dry-run"
+        ));
+
+        let cli = Cli::try_parse_from(["onenote", "append", "page", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Append {
+                markdown_body: None,
+                json: true,
+                ..
+            }
+        ));
+
+        // 3. update --body, --expected-content (--base-content), --replace-text, --with-text, --title
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "update",
+            "page",
+            "--title",
+            ITEM,
+            "--body",
+            TWO_LINE_LIST,
+            "--expected-content",
+            ITEM,
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Update {
+                page: Some(ref page),
+                title: Some(ref title),
+                body: Some(ref body),
+                expected_content: Some(ref exp),
+                json: true,
+                ..
+            } if page == "page" && title == ITEM && body == TWO_LINE_LIST && exp == ITEM
+        ));
+
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "update",
+            "page",
+            "--block-id",
+            "block",
+            "--replace-text",
+            "old",
+            "--with-text",
+            ITEM,
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Update {
+                replace_text: Some(ref from),
+                with_text: Some(ref to),
+                json: true,
+                ..
+            } if from == "old" && to == ITEM
+        ));
+
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "update",
+            "page",
+            "--block-id",
+            "block",
+            "--replace-text",
+            ITEM,
+            "--with-text",
+            "new",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Update {
+                replace_text: Some(ref from),
+                with_text: Some(ref to),
+                ..
+            } if from == ITEM && to == "new"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "update",
+            "page",
+            "--body",
+            "Text",
+            "--base-content",
+            ITEM,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Update {
+                expected_content: Some(ref exp),
+                ..
+            } if exp == ITEM
+        ));
+
+        // 4. check --expected-content
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "check",
+            "page",
+            "--expected-content",
+            "- [ ] task",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Check {
+                expected_content: Some(ref exp),
+                json: true,
+                ..
+            } if exp == "- [ ] task"
+        ));
+
+        // 5. section & notebook names + search
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "rename-section",
+            "sec",
+            "--name",
+            ITEM,
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::RenameSection {
+                ref section,
+                ref name,
+                json: true,
+            } if section == "sec" && name == ITEM
+        ));
+
+        let cli =
+            Cli::try_parse_from(["onenote", "create-section", "nb", ITEM, "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::CreateSection {
+                ref notebook,
+                ref name,
+                json: true,
+            } if notebook == "nb" && name == ITEM
+        ));
+
+        let cli = Cli::try_parse_from(["onenote", "create-notebook", ITEM, "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::CreateNotebook {
+                ref name,
+                json: true,
+                ..
+            } if name == ITEM
+        ));
+
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "rename-notebook",
+            "--drive-id",
+            "d1",
+            "--item-id",
+            "i1",
+            "--name",
+            ITEM,
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::RenameNotebook {
+                ref name,
+                json: true,
+                ..
+            } if name == ITEM
+        ));
+
+        let cli = Cli::try_parse_from(["onenote", "search", ITEM, "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Search {
+                ref query,
+                json: true,
+                ..
+            } if query == ITEM
+        ));
+
+        // 6. Explicit `--flag=value` accepts flag-looking text literally
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "update",
+            "page",
+            "--body=--dry-run",
+            "--title=--help",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Update {
+                title: Some(ref title),
+                body: Some(ref body),
+                json: true,
+                ..
+            } if title == "--help" && body == "--dry-run"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "rename-section",
+            "sec",
+            "--name=--json",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::RenameSection {
+                ref name,
+                json: true,
+                ..
+            } if name == "--json"
+        ));
+    }
+
+    #[test]
+    fn preserves_known_flags_help_and_missing_value_errors() {
+        use clap::error::ErrorKind;
+
+        const ITEM: &str = "- 목록 항목";
+
+        // Actual help invocations (standalone and trailing after completed hyphen values) return DisplayHelp
+        for argv in [
+            vec!["onenote", "create", "--help"],
+            vec!["onenote", "create", "sec", "--title", "Test", ITEM, "--help"],
+            vec!["onenote", "create", "sec", "--title", ITEM, "--help"],
+            vec!["onenote", "append", "--help"],
+            vec!["onenote", "append", "page", ITEM, "--help"],
+            vec!["onenote", "update", "--help"],
+            vec!["onenote", "update", "page", "--body", ITEM, "--help"],
+            vec![
+                "onenote",
+                "update",
+                "page",
+                "--block-id",
+                "blk",
+                "--replace-text",
+                "old",
+                "--with-text",
+                ITEM,
+                "--help",
+            ],
+            vec![
+                "onenote",
+                "update",
+                "page",
+                "--block-id",
+                "blk",
+                "--replace-text",
+                ITEM,
+                "--with-text",
+                "new",
+                "--help",
+            ],
+            vec![
+                "onenote",
+                "update",
+                "page",
+                "--body",
+                "Text",
+                "--expected-content",
+                ITEM,
+                "--help",
+            ],
+            vec!["onenote", "rename-section", "sec", "--name", ITEM, "--help"],
+            vec!["onenote", "search", ITEM, "--help"],
+            vec!["onenote", "search", "--help"],
+            vec!["onenote", "search", "-h"],
+        ] {
+            let err = Cli::try_parse_from(argv.clone()).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::DisplayHelp,
+                "expected DisplayHelp for {argv:?}, got: {err}"
+            );
+        }
+
+        // Missing option/positional values followed by known or flag-looking tokens must fail (never swallow flags)
+        for argv in [
+            vec!["onenote", "create", "sec", "--title", "--json"],
+            vec!["onenote", "create", "sec", "--title", "--dry-run"],
+            vec!["onenote", "create", "sec", "--title", "--help"],
+            vec!["onenote", "create", "sec", "--title", "-h"],
+            vec!["onenote", "append", "page", "--dry-run"],
+            vec!["onenote", "update", "page", "--body", "--json"],
+            vec!["onenote", "update", "page", "--body", "--dry-run"],
+            vec!["onenote", "update", "page", "--body", "--help"],
+            vec!["onenote", "update", "page", "--body", "-h"],
+            vec!["onenote", "update", "page", "--body", "--"],
+            vec![
+                "onenote",
+                "update",
+                "page",
+                "--block-id",
+                "blk",
+                "--replace-text",
+                "--with-text",
+                "new",
+            ],
+            vec![
+                "onenote",
+                "update",
+                "page",
+                "--block-id",
+                "blk",
+                "--replace-text",
+                "old",
+                "--with-text",
+                "--json",
+            ],
+            vec![
+                "onenote",
+                "update",
+                "page",
+                "--body",
+                "Text",
+                "--expected-content",
+                "--json",
+            ],
+            vec!["onenote", "check", "page", "--expected-content", "--json"],
+            vec!["onenote", "rename-section", "sec", "--name", "--json"],
+            vec!["onenote", "search", "--json"],
+            vec!["onenote", "search", "--dry-run"],
+            // Non-free-text fields keep their existing strict parsers
+            vec!["onenote", "create", "sec", "--title", "Test", "--level", "-1"],
+            vec!["onenote", "read", "page", "--format", "-bad"],
+            vec!["onenote", "update", "page", "--block-id", "-bad", "--body", "Text"],
+        ] {
+            let err = Cli::try_parse_from(argv.clone()).unwrap_err();
+            assert_ne!(
+                err.kind(),
+                ErrorKind::DisplayHelp,
+                "expected parse error (not help) for {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skips_second_clap_command_tree_when_argv_has_no_hyphen_text_candidates() {
+        let to_os = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+
+        for ordinary in [
+            &["onenote"][..],
+            &["onenote", "notebooks", "--include-teams", "--json"][..],
+            &["onenote", "create", "sec", "--title", "RFC-01", "# Heading", "--json"][..],
+            &["onenote", "create", "sec", "--title=- 목록 항목", "--json"][..],
+            &["onenote", "append", "page", "Plain body", "--json"][..],
+            &["onenote", "append", "page", "--", "- 목록 항목"][..],
+            &["onenote", "update", "page", "--body", "Updated", "--json"][..],
+            &["onenote", "update", "page", "--body", "--json"][..],
+            &["onenote", "update", "page", "--body", "--dry-run"][..],
+            &["onenote", "search", "architecture", "--help"][..],
+        ] {
+            assert!(
+                !argv_needs_hyphen_normalization(&to_os(ordinary)),
+                "should skip normalization for ordinary argv: {ordinary:?}"
+            );
+        }
+
+        for hyphen_text in [
+            &["onenote", "create", "sec", "--title", "- 목록 항목"][..],
+            &["onenote", "append", "page", "- first\n- second", "--json"][..],
+            &["onenote", "append", "page", "---"][..],
+            &["onenote", "update", "page", "--body", "- 목록 항목"][..],
+            &["onenote", "rename-section", "sec", "--name", "- 목록 항목"][..],
+            &["onenote", "search", "- 목록 항목", "--json"][..],
+        ] {
+            assert!(
+                argv_needs_hyphen_normalization(&to_os(hyphen_text)),
+                "should normalize hyphen text argv: {hyphen_text:?}"
+            );
+        }
     }
 }

@@ -2766,7 +2766,7 @@ pub fn build_replace_block_text_patch(
     to: &str,
 ) -> Result<Option<OnenotePatchCommand>> {
     let mut doc = Html::parse_document(&normalize_xhtml_for_html5ever(&detail.raw_xhtml));
-    let id = replace_element_text(&mut doc, target, from, to)?;
+    let id = replace_element_text(&mut doc, target, from, to, true)?;
     if from == to {
         return Ok(None);
     }
@@ -2774,14 +2774,177 @@ pub fn build_replace_block_text_patch(
     Ok(Some(replace_element(&id, el.html())))
 }
 
-fn replace_element_text(doc: &mut Html, target: &str, from: &str, to: &str) -> Result<String> {
+fn is_non_visible_html_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "script" | "style" | "head" | "meta" | "title" | "link" | "noscript" | "template"
+    )
+}
+
+fn is_replaced_or_void_break_tag(tag: &str) -> bool {
+    (is_html5_void_tag(tag) && !tag.eq_ignore_ascii_case("wbr"))
+        || matches!(
+            tag,
+            "object" | "iframe" | "svg" | "video" | "audio" | "canvas" | "textarea" | "select"
+        )
+}
+
+fn is_block_boundary_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "p" | "div"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "li"
+            | "ul"
+            | "ol"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "blockquote"
+            | "pre"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+            | "tr"
+            | "td"
+            | "th"
+            | "caption"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "nav"
+            | "aside"
+            | "figure"
+            | "figcaption"
+            | "address"
+    )
+}
+
+fn collect_visible_text_segments(el: ElementRef<'_>) -> Vec<(String, bool)> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let in_pre = el.value().name().eq_ignore_ascii_case("pre");
+    collect_visible_children(el, in_pre, &mut current, &mut segments);
+    if !current.is_empty() {
+        segments.push((current, in_pre));
+    }
+    segments
+}
+
+fn collect_visible_children(
+    parent: ElementRef<'_>,
+    in_pre: bool,
+    current: &mut String,
+    segments: &mut Vec<(String, bool)>,
+) {
+    for child in parent.children() {
+        match child.value() {
+            Node::Text(text) => current.push_str(text.text.as_ref()),
+            Node::Element(el) => {
+                let tag = el.name();
+                if is_non_visible_html_tag(tag) {
+                    continue;
+                }
+                if is_replaced_or_void_break_tag(tag) {
+                    if !current.is_empty() {
+                        segments.push((std::mem::take(current), in_pre));
+                    }
+                    continue;
+                }
+                let Some(child_el) = ElementRef::wrap(child) else {
+                    continue;
+                };
+                if is_block_boundary_tag(tag) {
+                    if !current.is_empty() {
+                        segments.push((std::mem::take(current), in_pre));
+                    }
+                    let child_pre = in_pre || tag.eq_ignore_ascii_case("pre");
+                    let mut child_buf = String::new();
+                    collect_visible_children(child_el, child_pre, &mut child_buf, segments);
+                    if !child_buf.is_empty() {
+                        segments.push((child_buf, child_pre));
+                    }
+                } else {
+                    collect_visible_children(child_el, in_pre, current, segments);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn count_overlapping_matches(haystack: &str, needle: &str) -> usize {
+    let Some(first_char) = needle.chars().next() else {
+        return 0;
+    };
+    let step = first_char.len_utf8();
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while let Some(pos) = haystack[offset..].find(needle) {
+        count += 1;
+        offset += pos + step;
+        if offset >= haystack.len() {
+            break;
+        }
+    }
+    count
+}
+
+fn count_visible_matches(el: ElementRef<'_>, needle: &str) -> usize {
+    let segments = collect_visible_text_segments(el);
+    let mut raw_total = 0usize;
+    let mut collapsed_total = 0usize;
+    for (segment, preserve_ws) in &segments {
+        let raw_hits = count_overlapping_matches(segment, needle);
+        raw_total += raw_hits;
+        if *preserve_ws {
+            collapsed_total += raw_hits;
+        } else {
+            let collapsed = collapse_html_whitespace(segment);
+            collapsed_total += count_overlapping_matches(&collapsed, needle);
+        }
+    }
+    raw_total.max(collapsed_total)
+}
+
+fn replace_element_text(
+    doc: &mut Html,
+    target: &str,
+    from: &str,
+    to: &str,
+    check_visible_duplicates: bool,
+) -> Result<String> {
     let first_char = from
         .chars()
         .next()
         .context("The text to replace must be nonempty.")?;
     let (el, id) = find_replace_element(doc, target)?;
+    if check_visible_duplicates && count_visible_matches(el, from) > 1 {
+        bail!("Text to replace is ambiguous in '{target}'. Use a longer exact substring.");
+    }
+    let root_id = el.id();
     let mut matches = el.descendants().filter_map(|node| {
         let text = node.value().as_text()?;
+        if check_visible_duplicates {
+            let hidden = node
+                .ancestors()
+                .take_while(|ancestor| ancestor.id() != root_id)
+                .filter_map(|ancestor| ancestor.value().as_element())
+                .any(|parent| {
+                    let tag = parent.name();
+                    is_non_visible_html_tag(tag) || is_replaced_or_void_break_tag(tag)
+                });
+            if hidden {
+                return None;
+            }
+        }
         let offset = text.find(from)?;
         // Overlapping occurrences are ambiguous too.
         let unique = !text[offset + first_char.len_utf8()..].contains(from);
@@ -2837,7 +3000,7 @@ fn aligned_text_replacements(
         }
         let target = block.element_id.as_deref()?;
         let (from, to) = changed_text(&baseline, edited)?;
-        let id = replace_element_text(&mut doc, target, from, to).ok()?;
+        let id = replace_element_text(&mut doc, target, from, to, false).ok()?;
         if ids.contains(&id) {
             return None;
         }
@@ -3692,6 +3855,178 @@ let ok = 1 < 2 && 3 > 1;
         assert!(error.to_string().contains("--block-id"));
         let error = build_checked_block_replacement(&detail, "div:left", "No layout").unwrap_err();
         assert!(error.to_string().contains("Graph does not support"));
+    }
+
+    #[test]
+    fn block_text_replace_counts_visible_text_across_inline_formatting_and_respects_boundaries() {
+        // 1. Duplicate where the second occurrence crosses <b> boundary must be rejected as ambiguous.
+        let both_detail = parse_onenote_page_xhtml(
+            sample_summary("Dup across bold"),
+            r#"<html><body>
+                <div id="div:left" style="position:absolute;left:0">
+                    <p id="p:test">alpha beta / alpha <b>beta</b></p>
+                </div>
+                <div id="div:right" style="position:absolute;left:100px"><p id="p:side">untouched</p></div>
+            </body></html>"#,
+        );
+        let err = build_replace_block_text_patch(&both_detail, "p:test", "alpha beta", "NEW")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "expected ambiguity error, got: {err}"
+        );
+        // Even a no-op replacement on an ambiguous phrase must fail.
+        let err =
+            build_replace_block_text_patch(&both_detail, "p:test", "alpha beta", "alpha beta")
+                .unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+
+        // Reversed order (first crosses <b>, second is plain) must also be rejected as ambiguous.
+        let rev_detail = parse_onenote_page_xhtml(
+            sample_summary("Dup reversed"),
+            r#"<html><body><div id="div:1"><p id="p:test">alpha <b>beta</b> / alpha beta</p></div></body></html>"#,
+        );
+        let err = build_replace_block_text_patch(&rev_detail, "p:test", "alpha beta", "NEW")
+            .unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+
+        // 2. Single occurrence spanning a formatting boundary must be rejected.
+        let split_detail = parse_onenote_page_xhtml(
+            sample_summary("Split bold"),
+            r#"<html><body><div id="div:1"><p id="p:test">alpha <b>beta</b></p></div></body></html>"#,
+        );
+        let err = build_replace_block_text_patch(&split_detail, "p:test", "alpha beta", "NEW")
+            .unwrap_err();
+        assert!(err.to_string().contains("single text node"));
+
+        // 3. Unique occurrence succeeds and preserves inline HTML + no-op returns None.
+        let unique_detail = parse_onenote_page_xhtml(
+            sample_summary("Unique"),
+            r#"<html><body>
+                <div id="div:left" style="position:absolute;left:0">
+                    <p id="p:test"><a href="https://example.invalid">ref</a> <b>alpha</b> beta</p>
+                </div>
+                <div id="div:right" style="position:absolute;left:100px"><p id="p:side">untouched</p></div>
+            </body></html>"#,
+        );
+        let patch = build_replace_block_text_patch(&unique_detail, "p:test", "alpha", "NEW")
+            .unwrap()
+            .expect("unique replacement emits one patch");
+        assert_eq!(patch.target, "p:test");
+        assert_eq!(patch.action, "replace");
+        assert_eq!(
+            Html::parse_fragment(&patch.content),
+            Html::parse_fragment(
+                r#"<p id="p:test"><a href="https://example.invalid">ref</a> <b>NEW</b> beta</p>"#
+            )
+        );
+        assert!(
+            build_replace_block_text_patch(&unique_detail, "p:test", "alpha", "alpha")
+                .unwrap()
+                .is_none()
+        );
+
+        // 4. Line breaks (<br />), paragraphs (<p>), and table cells (<td>) preserve boundaries:
+        //    - text across a boundary does NOT falsely concatenate into a duplicate match
+        //    - duplicate matches in separate lines/cells of the same target block ARE detected
+        let boundary_detail = parse_onenote_page_xhtml(
+            sample_summary("Boundaries"),
+            r#"<html><body>
+                <div id="div:1">
+                    <p id="p:br-unique">alpha beta / alpha <br />beta</p>
+                    <p id="p:br-dup">alpha beta<br />alpha <b>beta</b></p>
+                    <table id="table:unique">
+                        <tr><td>alpha </td><td>beta</td></tr>
+                        <tr><td>alpha beta</td><td>keep</td></tr>
+                    </table>
+                    <table id="table:dup">
+                        <tr><td>alpha beta</td><td>alpha <b>beta</b></td></tr>
+                    </table>
+                </div>
+            </body></html>"#,
+        );
+        let br_patch =
+            build_replace_block_text_patch(&boundary_detail, "p:br-unique", "alpha beta", "NEW")
+                .unwrap()
+                .expect("line break must not merge 'alpha ' + 'beta' into a duplicate");
+        assert!(br_patch.content.contains("NEW / alpha "));
+
+        let br_dup_err =
+            build_replace_block_text_patch(&boundary_detail, "p:br-dup", "alpha beta", "NEW")
+                .unwrap_err();
+        assert!(br_dup_err.to_string().contains("ambiguous"));
+
+        let tbl_patch =
+            build_replace_block_text_patch(&boundary_detail, "table:unique", "alpha beta", "NEW")
+                .unwrap()
+                .expect("table cell boundary must not merge adjacent cells");
+        assert!(tbl_patch.content.contains("<td>NEW</td>"));
+        assert!(tbl_patch.content.contains("<td>alpha </td>"));
+
+        let tbl_dup_err =
+            build_replace_block_text_patch(&boundary_detail, "table:dup", "alpha beta", "NEW")
+                .unwrap_err();
+        assert!(tbl_dup_err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn implicit_page_update_keeps_exact_node_alignment_while_explicit_block_replace_rejects_visible_duplicate() {
+        // Single-div page: explicit block replace rejects the visible duplicate across <b>,
+        // while implicit full-page Markdown update keeps exact-node replacement on p:test
+        // instead of falling back to replacing div:only structurally.
+        let single_div = parse_onenote_page_xhtml(
+            sample_summary("Single Div"),
+            r#"<html><body><div id="div:only"><p id="p:test" style="text-align:center">alpha beta / alpha <b>beta</b></p></div></body></html>"#,
+        );
+        assert!(
+            build_replace_block_text_patch(&single_div, "p:test", "alpha beta", "NEW")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        let single_edited_md = single_div.body_markdown.replacen("alpha beta", "NEW", 1);
+        let single_cmds =
+            build_replace_page_body_commands(&single_div, None, &single_edited_md).unwrap();
+        assert_eq!(single_cmds.len(), 1);
+        assert_eq!(
+            single_cmds[0].target, "p:test",
+            "implicit page update must target p:test surgically rather than replacing div:only"
+        );
+        assert_eq!(
+            Html::parse_fragment(&single_cmds[0].content),
+            Html::parse_fragment(
+                r#"<p id="p:test" style="text-align:center">NEW / alpha <b>beta</b></p>"#
+            )
+        );
+
+        // Multi-region page: implicit full-page Markdown update still edits p:test surgically
+        // and preserves the sibling region and inline bold formatting.
+        let multi_region = parse_onenote_page_xhtml(
+            sample_summary("Multi Region"),
+            r#"<html><body>
+                <div id="div:left" style="position:absolute;left:0">
+                    <p id="p:test">alpha beta / alpha <b>beta</b></p>
+                </div>
+                <div id="div:right" style="position:absolute;left:100px">
+                    <p id="p:side">untouched</p>
+                </div>
+            </body></html>"#,
+        );
+        assert!(
+            build_replace_block_text_patch(&multi_region, "p:test", "alpha beta", "NEW")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        let multi_edited_md = multi_region.body_markdown.replacen("alpha beta", "NEW", 1);
+        let multi_cmds =
+            build_replace_page_body_commands(&multi_region, None, &multi_edited_md).unwrap();
+        assert_eq!(multi_cmds.len(), 1);
+        assert_eq!(multi_cmds[0].target, "p:test");
+        assert_eq!(
+            Html::parse_fragment(&multi_cmds[0].content),
+            Html::parse_fragment(r#"<p id="p:test">NEW / alpha <b>beta</b></p>"#)
+        );
     }
 
     #[test]
