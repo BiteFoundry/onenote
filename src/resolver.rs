@@ -280,29 +280,59 @@ pub async fn resolve_section_with_refresh(
     resolve_section_from_slice(&scoped, section_query)
 }
 
-/// Resolves a OneNote page against an in-memory slice of `OnenotePageSummary`s.
-pub fn resolve_page_from_slice(
+/// Outcome of resolving a OneNote page query against cached summaries.
+#[derive(Debug, Clone)]
+pub enum PageResolution {
+    Found(OnenotePageSummary),
+    NotFound,
+    Ambiguous {
+        message: String,
+        candidates: Vec<OnenotePageSummary>,
+    },
+}
+
+impl PageResolution {
+    /// Converts `Found` into `Ok(Some(_))`, `NotFound` into `Ok(None)`,
+    /// and propagates `Ambiguous` as an error so callers never fall back to using
+    /// an ambiguous title/prefix as a raw remote page ID.
+    pub fn into_option(self) -> Result<Option<OnenotePageSummary>> {
+        match self {
+            Self::Found(page) => Ok(Some(page)),
+            Self::NotFound => Ok(None),
+            Self::Ambiguous { message, .. } => bail!("{message}"),
+        }
+    }
+}
+
+/// Resolves a OneNote page against an in-memory slice, distinguishing
+/// unique match, no match, and multiple ambiguous candidates.
+pub fn resolve_page_in_slice(
     pages: &[OnenotePageSummary],
     query: &str,
-) -> Result<OnenotePageSummary> {
+) -> Result<PageResolution> {
     let q = query.trim();
     if q.is_empty() {
         bail!("OneNote page ID or title is empty.");
     }
     if let Some(exact) = pages.iter().find(|p| p.page_key == q || p.id == q) {
-        return Ok(exact.clone());
+        return Ok(PageResolution::Found(exact.clone()));
     }
     let id_prefix: Vec<&OnenotePageSummary> = pages
         .iter()
         .filter(|p| p.id.starts_with(q) || p.page_key.starts_with(q))
         .collect();
     if id_prefix.len() == 1 {
-        return Ok(id_prefix[0].clone());
+        return Ok(PageResolution::Found(id_prefix[0].clone()));
     } else if id_prefix.len() > 1 {
-        bail!(
-            "Ambiguous page ID prefix '{q}' matches {} pages.",
-            id_prefix.len()
+        let message = format!(
+            "Ambiguous page ID prefix '{q}' matches {} pages:\n{}",
+            id_prefix.len(),
+            format_page_candidates(&id_prefix)
         );
+        return Ok(PageResolution::Ambiguous {
+            message,
+            candidates: id_prefix.into_iter().cloned().collect(),
+        });
     }
 
     let q_lower = q.to_lowercase();
@@ -311,13 +341,17 @@ pub fn resolve_page_from_slice(
         .filter(|p| p.title.trim().to_lowercase() == q_lower)
         .collect();
     if title_exact.len() == 1 {
-        return Ok(title_exact[0].clone());
+        return Ok(PageResolution::Found(title_exact[0].clone()));
     } else if title_exact.len() > 1 {
-        bail!(
+        let message = format!(
             "Ambiguous page title '{q}' matches {} pages:\n{}",
             title_exact.len(),
             format_page_candidates(&title_exact)
         );
+        return Ok(PageResolution::Ambiguous {
+            message,
+            candidates: title_exact.into_iter().cloned().collect(),
+        });
     }
 
     let title_prefix: Vec<&OnenotePageSummary> = pages
@@ -325,7 +359,17 @@ pub fn resolve_page_from_slice(
         .filter(|p| p.title.trim().to_lowercase().starts_with(&q_lower))
         .collect();
     if title_prefix.len() == 1 {
-        return Ok(title_prefix[0].clone());
+        return Ok(PageResolution::Found(title_prefix[0].clone()));
+    } else if title_prefix.len() > 1 {
+        let message = format!(
+            "Ambiguous page prefix '{q}' matches {} pages:\n{}",
+            title_prefix.len(),
+            format_page_candidates(&title_prefix)
+        );
+        return Ok(PageResolution::Ambiguous {
+            message,
+            candidates: title_prefix.into_iter().cloned().collect(),
+        });
     }
 
     let title_sub: Vec<&OnenotePageSummary> = pages
@@ -333,36 +377,57 @@ pub fn resolve_page_from_slice(
         .filter(|p| p.title.to_lowercase().contains(&q_lower))
         .collect();
     if title_sub.len() == 1 {
-        return Ok(title_sub[0].clone());
+        return Ok(PageResolution::Found(title_sub[0].clone()));
     } else if title_sub.len() > 1 {
-        bail!(
+        let message = format!(
             "Ambiguous page '{q}' matches {} pages:\n{}",
             title_sub.len(),
             format_page_candidates(&title_sub)
         );
+        return Ok(PageResolution::Ambiguous {
+            message,
+            candidates: title_sub.into_iter().cloned().collect(),
+        });
     }
 
-    bail!("OneNote page not found: {q}")
+    Ok(PageResolution::NotFound)
 }
 
-/// Resolves a OneNote page from cache (optionally scoped to a section) or falls back to treating `query` as a direct page key/ID.
+/// Resolves a OneNote page against an in-memory slice of `OnenotePageSummary`s.
+pub fn resolve_page_from_slice(
+    pages: &[OnenotePageSummary],
+    query: &str,
+) -> Result<OnenotePageSummary> {
+    let q = query.trim();
+    match resolve_page_in_slice(pages, q)? {
+        PageResolution::Found(page) => Ok(page),
+        PageResolution::Ambiguous { message, .. } => bail!("{message}"),
+        PageResolution::NotFound => bail!("OneNote page not found: {q}"),
+    }
+}
+
+/// Resolves a OneNote page from cache (optionally scoped to a section),
+/// distinguishing `Found`, `NotFound`, and `Ambiguous`.
 pub fn resolve_page_cached(
     storage: &Storage,
     query: &str,
     section_key: Option<&str>,
-) -> Option<OnenotePageSummary> {
+) -> Result<PageResolution> {
     let q = query.trim();
     if q.is_empty() {
-        return None;
+        return Ok(PageResolution::NotFound);
     }
-    if let Ok(Some(exact)) = storage.get_onenote_page_summary(q) {
-        return Some(exact);
+    let section_filter = section_key.map(str::trim).filter(|s| !s.is_empty());
+    if section_filter.is_none() {
+        if let Some(exact) = storage.get_onenote_page_summary(q)? {
+            return Ok(PageResolution::Found(exact));
+        }
     }
-    let candidates = match section_key {
-        Some(sk) if !sk.trim().is_empty() => storage.list_onenote_pages(sk).ok()?,
-        _ => storage.list_all_onenote_pages(500).ok()?,
+    let candidates = match section_filter {
+        Some(sk) => storage.list_onenote_pages(sk)?,
+        None => storage.list_all_onenote_pages(500)?,
     };
-    resolve_page_from_slice(&candidates, q).ok()
+    resolve_page_in_slice(&candidates, q)
 }
 
 fn format_notebook_candidates(candidates: &[&OnenoteNotebook]) -> String {
@@ -399,7 +464,25 @@ fn format_page_candidates(candidates: &[&OnenotePageSummary]) -> String {
     let mut lines: Vec<String> = candidates
         .iter()
         .take(MAX_LIST)
-        .map(|p| format!("  - {} ({})", p.title, p.page_key))
+        .map(|p| {
+            let section = p
+                .section_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let id = p.section_id.trim();
+                    if id.is_empty() {
+                        None
+                    } else {
+                        Some(id)
+                    }
+                });
+            match section {
+                Some(sec) => format!("  - {} [{}] ({})", p.title, sec, p.page_key),
+                None => format!("  - {} ({})", p.title, p.page_key),
+            }
+        })
         .collect();
     if candidates.len() > MAX_LIST {
         lines.push(format!("  ... and {} more", candidates.len() - MAX_LIST));
@@ -480,5 +563,70 @@ mod tests {
             "sec-1"
         );
         assert!(resolve_section_from_slice(&sections, "missing").is_err());
+    }
+
+    fn sample_page(id: &str, title: &str, sec_id: &str, sec_name: &str) -> OnenotePageSummary {
+        OnenotePageSummary {
+            page_key: format!("me|{id}"),
+            id: id.to_string(),
+            scope: OnenoteScope::Me,
+            section_id: sec_id.to_string(),
+            section_name: Some(sec_name.to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Engineering".to_string()),
+            title: title.to_string(),
+            level: 0,
+            order: 0,
+            created_at: None,
+            last_modified_at: None,
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        }
+    }
+
+    #[test]
+    fn regression_onenote_bug_08_resolve_page_in_slice_distinguishes_ambiguous_and_missing() {
+        let pages = vec![
+            sample_page("page-a", "Standup notes", "sec-1", "Alpha"),
+            sample_page("page-b", "Standup notes", "sec-2", "Beta"),
+            sample_page("page-u", "Quarterly Roadmap", "sec-1", "Alpha"),
+        ];
+
+        match resolve_page_in_slice(&pages, "Standup notes").unwrap() {
+            PageResolution::Ambiguous { message, candidates } => {
+                assert_eq!(candidates.len(), 2);
+                assert!(message.contains("Standup notes"));
+                assert!(message.contains("Alpha"));
+                assert!(message.contains("Beta"));
+                assert!(message.contains("me|page-a"));
+                assert!(message.contains("me|page-b"));
+            }
+            other => panic!("expected Ambiguous for exact duplicate title, got {other:?}"),
+        }
+
+        match resolve_page_in_slice(&pages, "Standup").unwrap() {
+            PageResolution::Ambiguous { message, candidates } => {
+                assert_eq!(candidates.len(), 2);
+                assert!(message.contains("me|page-a") && message.contains("me|page-b"));
+            }
+            other => panic!("expected Ambiguous for prefix duplicate, got {other:?}"),
+        }
+
+        match resolve_page_in_slice(&pages, "me|page-a").unwrap() {
+            PageResolution::Found(p) => assert_eq!(p.page_key, "me|page-a"),
+            other => panic!("expected Found for scoped key, got {other:?}"),
+        }
+
+        match resolve_page_in_slice(&pages, "Roadmap").unwrap() {
+            PageResolution::Found(p) => assert_eq!(p.page_key, "me|page-u"),
+            other => panic!("expected Found for unique substring, got {other:?}"),
+        }
+
+        assert!(matches!(
+            resolve_page_in_slice(&pages, "remote-only-id").unwrap(),
+            PageResolution::NotFound
+        ));
     }
 }

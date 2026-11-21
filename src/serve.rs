@@ -8,8 +8,8 @@
 //! - `GET/POST /v1/onenote/pages`
 //! - `GET/PATCH/DELETE /v1/onenote/pages/{page_key}`
 //! - `POST /v1/onenote/pages/{page_key}/append`
-//! - `POST /v1/onenote/pages/{page_key}/toggle-todo`
-//! - `POST /v1/onenote/pages/{page_key}/resources/download`
+//! - `POST /v1/onenote/pages/{page_key}/todo` (alias: `/toggle-todo`)
+//! - `POST /v1/onenote/resources/download` (alias: `/pages/{page_key}/resources/download`)
 //! - `GET /v1/onenote/search`
 //! (Also mounted under `/onenote/*` for ergonomic unversioned access.)
 
@@ -88,7 +88,9 @@ impl IntoResponse for ApiError {
 fn onenote_api_error(err: anyhow::Error) -> ApiError {
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("conflict:") || lower.contains("conflict") {
+    if lower.starts_with("ambiguous ") {
+        ApiError::bad_request(msg)
+    } else if lower.contains("conflict:") || lower.contains("conflict") {
         ApiError::conflict(msg)
     } else if lower.contains("not found") || lower.contains("404") {
         ApiError::not_found(msg)
@@ -96,6 +98,7 @@ fn onenote_api_error(err: anyhow::Error) -> ApiError {
         || lower.contains("ambiguous")
         || lower.contains("required")
         || lower.contains("out of range")
+        || lower.contains("does not match")
         || lower.contains("no onenote to-do")
         || lower.contains("no embedded")
         || lower.contains("cannot specify both")
@@ -193,7 +196,11 @@ pub struct AppendPageBody {
     #[serde(default)]
     pub markdown: String,
     #[serde(default)]
-    pub image_paths: Vec<String>,
+    pub image_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub images: Option<Vec<String>>,
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,10 +209,14 @@ pub struct ToggleTodoBody {
     pub block_id: Option<String>,
     #[serde(default)]
     pub index: Option<usize>,
+    #[serde(default)]
+    pub completed: Option<bool>,
     #[serde(default, alias = "base_content")]
     pub expected_content: Option<String>,
     #[serde(default)]
     pub force: bool,
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -213,7 +224,29 @@ pub struct DownloadResourceBody {
     #[serde(default)]
     pub index: Option<usize>,
     #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
     pub out_dir: Option<String>,
+    #[serde(default)]
+    pub out: Option<String>,
+    #[serde(default)]
+    pub section: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DownloadResourceByBody {
+    #[serde(default)]
+    pub page: String,
+    #[serde(default)]
+    pub section: Option<String>,
+    #[serde(default)]
+    pub index: Option<usize>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub out_dir: Option<String>,
+    #[serde(default)]
+    pub out: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,7 +296,9 @@ fn onenote_routes() -> Router<Arc<AppState>> {
             get(get_page).patch(patch_page).delete(delete_page),
         )
         .route("/pages/{page_key}/append", post(append_page))
+        .route("/pages/{page_key}/todo", post(toggle_todo))
         .route("/pages/{page_key}/toggle-todo", post(toggle_todo))
+        .route("/resources/download", post(download_resource_by_body))
         .route(
             "/pages/{page_key}/resources/download",
             post(download_resource),
@@ -540,6 +575,8 @@ async fn delete_page(
     AxumPath(page_key): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     let section_key = resolver::resolve_page_cached(&state.storage, &page_key, None)
+        .and_then(resolver::PageResolution::into_option)
+        .map_err(onenote_api_error)?
         .map(|s| s.scope.make_entity_key(&s.section_id));
     let deleted = cli::delete_onenote_page_helper(&state.storage, &state.graph, &page_key)
         .await
@@ -559,12 +596,27 @@ async fn append_page(
     AxumPath(page_key): AxumPath<String>,
     Json(body): Json<AppendPageBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths: Vec<PathBuf> = body.image_paths.iter().map(PathBuf::from).collect();
+    if body.image_paths.is_some() && body.images.is_some() {
+        return Err(ApiError::bad_request(
+            "Cannot specify both 'image_paths' and 'images'; provide only one.",
+        ));
+    }
+    let raw_image_paths = body.image_paths.or(body.images).unwrap_or_default();
+    let paths: Vec<PathBuf> = raw_image_paths.iter().map(PathBuf::from).collect();
     let inline_images = cli::load_inline_images_from_paths(&paths).map_err(onenote_api_error)?;
-    let updated = cli::append_onenote_page_helper(
+    let target_page = cli::resolve_page_query_in_section(
         &state.storage,
         &state.graph,
         &page_key,
+        body.section.as_deref(),
+        false,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    let updated = cli::append_onenote_page_helper(
+        &state.storage,
+        &state.graph,
+        &target_page,
         &body.markdown,
         &inline_images,
     )
@@ -586,12 +638,22 @@ async fn toggle_todo(
     AxumPath(page_key): AxumPath<String>,
     Json(body): Json<ToggleTodoBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let (updated, block_id, completed) = cli::toggle_onenote_todo_helper_with_guard(
+    let target_page = cli::resolve_page_query_in_section(
         &state.storage,
         &state.graph,
         &page_key,
+        body.section.as_deref(),
+        false,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    let (updated, block_id, completed) = cli::change_onenote_todo_helper_with_guard(
+        &state.storage,
+        &state.graph,
+        &target_page,
         body.block_id.as_deref(),
         body.index,
+        body.completed,
         body.expected_content.as_deref(),
         body.force,
     )
@@ -614,18 +676,60 @@ async fn toggle_todo(
     })))
 }
 
+fn resolve_out_dir_alias(
+    out_dir: Option<String>,
+    out: Option<String>,
+) -> Result<Option<PathBuf>, ApiError> {
+    if out_dir.is_some() && out.is_some() {
+        return Err(ApiError::bad_request(
+            "Cannot specify both 'out_dir' and 'out'; provide only one.",
+        ));
+    }
+    Ok(out_dir
+        .or(out)
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from))
+}
+
 async fn download_resource(
     State(state): State<Arc<AppState>>,
     AxumPath(page_key): AxumPath<String>,
     Json(body): Json<DownloadResourceBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let out_dir = body.out_dir.as_deref().map(PathBuf::from);
-    let (_detail, _idx, downloaded) = cli::download_onenote_resource_helper(
+    let out_dir = resolve_out_dir_alias(body.out_dir, body.out)?;
+    let (_detail, _idx, downloaded) = cli::download_onenote_resource_helper_with_options(
         &state.config,
         &state.storage,
         &state.graph,
         &page_key,
+        body.section.as_deref(),
         body.index,
+        body.url.as_deref(),
+        out_dir.as_deref(),
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    Ok(Json(serde_json::to_value(downloaded).unwrap_or_else(|_| json!({ "ok": true }))))
+}
+
+async fn download_resource_by_body(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DownloadResourceByBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.page.trim().is_empty() {
+        return Err(ApiError::bad_request("Page ID or title is required."));
+    }
+    let out_dir = resolve_out_dir_alias(body.out_dir, body.out)?;
+    let (_detail, _idx, downloaded) = cli::download_onenote_resource_helper_with_options(
+        &state.config,
+        &state.storage,
+        &state.graph,
+        &body.page,
+        body.section.as_deref(),
+        body.index,
+        body.url.as_deref(),
         out_dir.as_deref(),
     )
     .await

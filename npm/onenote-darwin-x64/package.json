@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/onenote-darwin-x64",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Prebuilt onenote binary for macOS x64",
   "repository": {
     "type": "git",

@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/onenote",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Microsoft OneNote terminal client & AI agent toolkit — Notebooks, Sections, Pages, XHTML/Markdown & Resources (CLI, TUI, HTTP API, MCP)",
   "repository": {
     "type": "git",
@@ -40,11 +40,11 @@
     "build:npm": "node scripts/build-npm.mjs"
   },
   "optionalDependencies": {
-    "@bitefoundry/onenote-win32-x64": "0.2.1",
-    "@bitefoundry/onenote-win32-arm64": "0.2.1",
-    "@bitefoundry/onenote-darwin-x64": "0.2.1",
-    "@bitefoundry/onenote-darwin-arm64": "0.2.1",
-    "@bitefoundry/onenote-linux-x64": "0.2.1",
-    "@bitefoundry/onenote-linux-arm64": "0.2.1"
+    "@bitefoundry/onenote-win32-x64": "0.2.2",
+    "@bitefoundry/onenote-win32-arm64": "0.2.2",
+    "@bitefoundry/onenote-darwin-x64": "0.2.2",
+    "@bitefoundry/onenote-darwin-arm64": "0.2.2",
+    "@bitefoundry/onenote-linux-x64": "0.2.2",
+    "@bitefoundry/onenote-linux-arm64": "0.2.2"
   }
 }

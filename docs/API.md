@@ -27,7 +27,7 @@ All OneNote endpoints are served under both `/v1/onenote/...` and the shorter `/
 | --- | --- | --- |
 | `GET` | `/health` | Health check (`{ ok, service, version }`) |
 | `GET` | `/v1/whoami` | Signed-in Microsoft 365 user profile |
-| `GET` | `/v1/onenote/notebooks` | List notebooks (`?include_teams=true&refresh=false&offline=false`) |
+| `GET` | `/v1/onenote/notebooks` | List notebooks (`?include_teams=false&refresh=false&offline=false`) |
 | `POST` | `/v1/onenote/notebooks` | Create notebook (`{ name, group_id?, site_id? }`) |
 | `GET` | `/v1/onenote/sections` | List sections (`?notebook=...&refresh=false&offline=false`) |
 | `POST` | `/v1/onenote/sections` | Create section (`{ notebook, name }`) |
@@ -36,10 +36,10 @@ All OneNote endpoints are served under both `/v1/onenote/...` and the shorter `/
 | `GET` | `/v1/onenote/pages/{page}` | Get structured page detail (`?section=...&refresh=false&offline=false`) |
 | `PATCH` | `/v1/onenote/pages/{page}` | Update block or page (`{ block_id?, title?, markdown?, section? }`) |
 | `DELETE` | `/v1/onenote/pages/{page}` | Delete page (`?section=...`) |
-| `POST` | `/v1/onenote/pages/{page}/append` | Append Markdown/images (`{ markdown, images?, section? }`) |
-| `POST` | `/v1/onenote/pages/{page}/todo` | Toggle checkbox (`{ block_id, completed?, section? }`) |
+| `POST` | `/v1/onenote/pages/{page}/append` | Append Markdown/images (`{ markdown, images? \| image_paths?, section? }`) |
+| `POST` | `/v1/onenote/pages/{page}/todo` | Set or toggle checkbox (`{ block_id?, index?, completed?, expected_content?, force?, section? }`; alias: `/pages/{page}/toggle-todo`) |
 | `GET` | `/v1/onenote/search` | Search local FTS5 cache (`?q=...&section=...&limit=20&refresh=false`) |
-| `POST` | `/v1/onenote/resources/download` | Download embedded resource (`{ page, index?, url?, out?, section? }`) |
+| `POST` | `/v1/onenote/resources/download` | Download embedded resource (`{ page, index?, url?, out? \| out_dir?, section? }`; alias: `/pages/{page}/resources/download`) |
 
 ### Resource Download Response
 

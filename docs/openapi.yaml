@@ -46,7 +46,7 @@ paths:
       parameters:
         - name: include_teams
           in: query
-          schema: { type: boolean, default: true }
+          schema: { type: boolean, default: false }
         - name: refresh
           in: query
           schema: { type: boolean, default: false }
@@ -237,13 +237,19 @@ paths:
                 images:
                   type: array
                   items: { type: string }
+                  description: Alias of `image_paths` (do not send both keys in the same request).
+                image_paths:
+                  type: array
+                  items: { type: string }
                 section: { type: string }
       responses:
         '200':
           description: Updated page detail
+        '400':
+          description: Invalid input, including specifying both `images` and `image_paths`
   /v1/onenote/pages/{page}/todo:
     post:
-      summary: Toggle or set a OneNote checkbox on a block
+      summary: Set or toggle a OneNote checkbox on a block (also served at `/pages/{page}/toggle-todo`)
       security:
         - bearerAuth: []
       parameters:
@@ -257,10 +263,12 @@ paths:
           application/json:
             schema:
               type: object
-              required: [block_id]
               properties:
                 block_id: { type: string }
+                index: { type: integer, minimum: 0 }
                 completed: { type: boolean }
+                expected_content: { type: string }
+                force: { type: boolean, default: false }
                 section: { type: string }
       responses:
         '200':
@@ -289,7 +297,7 @@ paths:
           description: Search hits
   /v1/onenote/resources/download:
     post:
-      summary: Download an embedded OneNote image or file attachment
+      summary: Download an embedded OneNote image or file attachment (also served at `/pages/{page}/resources/download`)
       security:
         - bearerAuth: []
       requestBody:
@@ -301,9 +309,10 @@ paths:
               required: [page]
               properties:
                 page: { type: string }
-                index: { type: integer }
+                index: { type: integer, minimum: 0 }
                 url: { type: string }
                 out: { type: string }
+                out_dir: { type: string }
                 section: { type: string }
       responses:
         '200':

@@ -1,6 +1,6 @@
 [package]
 name = "onenote-cli"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Microsoft OneNote terminal client & AI agent toolkit — Notebooks, Sections, Pages, XHTML/Markdown & Resources (CLI, TUI, HTTP API, MCP)"
 license = "MIT"

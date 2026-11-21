@@ -1446,7 +1446,12 @@ pub async fn load_onenote_page_detail_with_cache(
         if let Some(detail) = storage.get_onenote_page_detail(q)? {
             return Ok(detail);
         }
-        if let Some(summary) = resolver::resolve_page_cached(storage, q, None) {
+    }
+
+    let cached_summary = resolver::resolve_page_cached(storage, q, None)?.into_option()?;
+
+    if offline || cached {
+        if let Some(ref summary) = cached_summary {
             if let Some(detail) = storage.get_onenote_page_detail(&summary.page_key)? {
                 return Ok(detail);
             }
@@ -1456,7 +1461,6 @@ pub async fn load_onenote_page_detail_with_cache(
         }
     }
 
-    let cached_summary = resolver::resolve_page_cached(storage, q, None);
     let (scope, raw_id) = match cached_summary.as_ref() {
         Some(s) => (s.scope.clone(), s.id.clone()),
         None => split_onenote_entity_key(q),
@@ -1591,16 +1595,21 @@ pub enum GuardedTodoResult {
     },
 }
 
-fn load_cached_detail_for_query(storage: &Storage, page_query: &str) -> Option<OnenotePageDetail> {
+fn load_cached_detail_for_query(
+    storage: &Storage,
+    page_query: &str,
+) -> Result<Option<OnenotePageDetail>> {
     let q = page_query.trim();
     if q.is_empty() {
-        return None;
+        return Ok(None);
     }
-    if let Ok(Some(d)) = storage.get_onenote_page_detail(q) {
-        return Some(d);
+    if let Some(d) = storage.get_onenote_page_detail(q)? {
+        return Ok(Some(d));
     }
-    resolver::resolve_page_cached(storage, q, None)
-        .and_then(|s| storage.get_onenote_page_detail(&s.page_key).ok().flatten())
+    match resolver::resolve_page_cached(storage, q, None)?.into_option()? {
+        Some(s) => storage.get_onenote_page_detail(&s.page_key),
+        None => Ok(None),
+    }
 }
 
 fn normalize_text_for_compare(input: &str) -> String {
@@ -1737,7 +1746,7 @@ async fn update_onenote_content_guarded(
             "Specify --title, --body, --file, or --block-id with --replace-text and --with-text."
         );
     }
-    let cached_before = load_cached_detail_for_query(storage, page_query);
+    let cached_before = load_cached_detail_for_query(storage, page_query)?;
     let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
 
     if !force {
@@ -1972,11 +1981,11 @@ async fn change_onenote_todo_guarded(
     expected_content: Option<&str>,
     force: bool,
 ) -> Result<GuardedTodoResult> {
-    let cached_before = load_cached_detail_for_query(storage, page_query);
+    let cached_before = load_cached_detail_for_query(storage, page_query)?;
     let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
     let target_block: &OnenoteBlock =
         if let Some(bid) = block_id.map(str::trim).filter(|s| !s.is_empty()) {
-            match parser::find_block_by_element_id(&detail, bid) {
+            match parser::onenote::find_todo_block_by_element_id(&detail, bid) {
                 Some(blk) => blk,
                 None if expected_content.is_some() && !force => {
                     return Ok(GuardedTodoResult::Conflict {
@@ -2078,11 +2087,15 @@ pub async fn delete_onenote_page_helper(
     graph: &GraphClient,
     page_query: &str,
 ) -> Result<String> {
-    let cached = resolver::resolve_page_cached(storage, page_query, None);
+    let q = page_query.trim();
+    if q.is_empty() {
+        bail!("Page ID or title is empty.");
+    }
+    let cached = resolver::resolve_page_cached(storage, q, None)?.into_option()?;
     let (scope, raw_id, page_key) = match cached {
         Some(s) => (s.scope, s.id, s.page_key),
         None => {
-            let (s, id) = split_onenote_entity_key(page_query.trim());
+            let (s, id) = split_onenote_entity_key(q);
             let key = s.make_entity_key(&id);
             (s, id, key)
         }
@@ -2090,6 +2103,44 @@ pub async fn delete_onenote_page_helper(
     graph.delete_onenote_page(&scope, &raw_id).await?;
     let _ = storage.delete_onenote_page(&page_key);
     Ok(page_key)
+}
+
+pub async fn resolve_page_query_in_section(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    section_query: Option<&str>,
+    offline: bool,
+) -> Result<String> {
+    let q = page_query.trim();
+    if q.is_empty() {
+        bail!("Page ID or title is empty.");
+    }
+    let Some(sec_q) = section_query.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(q.to_string());
+    };
+    let sec = resolve_onenote_section_query(storage, graph, sec_q, offline).await?;
+    match resolver::resolve_page_cached(storage, q, Some(&sec.section_key))? {
+        resolver::PageResolution::Found(p) => return Ok(p.page_key),
+        resolver::PageResolution::Ambiguous { message, .. } => bail!("{message}"),
+        resolver::PageResolution::NotFound => {}
+    }
+    if offline {
+        bail!(
+            "OneNote page '{q}' not found in section '{}' offline cache.",
+            sec.display_name
+        );
+    }
+    let (_sec, pages) =
+        list_onenote_pages_helper(storage, graph, &sec.section_key, 100, false, false).await?;
+    match resolver::resolve_page_in_slice(&pages, q)? {
+        resolver::PageResolution::Found(p) => Ok(p.page_key),
+        resolver::PageResolution::Ambiguous { message, .. } => bail!("{message}"),
+        resolver::PageResolution::NotFound => bail!(
+            "OneNote page '{q}' not found in section '{}'.",
+            sec.display_name
+        ),
+    }
 }
 
 pub fn select_onenote_resource<'a>(
@@ -2117,6 +2168,52 @@ pub fn select_onenote_resource<'a>(
     Ok((0, &detail.resources[0]))
 }
 
+pub fn select_onenote_resource_by_index_or_url<'a>(
+    detail: &'a OnenotePageDetail,
+    index: Option<usize>,
+    url: Option<&str>,
+    prefer_image: bool,
+) -> Result<(usize, &'a OnenoteResource)> {
+    let trimmed_url = url.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(u) = trimmed_url {
+        if detail.resources.is_empty() {
+            bail!(
+                "Resource URL '{u}' not found on page '{}' (page has no embedded resources).",
+                detail.summary.title
+            );
+        }
+        let matches: Vec<(usize, &'a OnenoteResource)> = detail
+            .resources
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.resource_url == u || r.fullres_url.as_deref() == Some(u))
+            .collect();
+        if matches.is_empty() {
+            bail!(
+                "Resource URL '{u}' not found on page '{}'.",
+                detail.summary.title
+            );
+        }
+        if let Some(idx) = index {
+            if let Some(&(matched_idx, res)) = matches.iter().find(|(i, _)| *i == idx) {
+                return Ok((matched_idx, res));
+            }
+            if idx >= detail.resources.len() {
+                bail!(
+                    "Resource index {idx} out of range (page has {} resource(s)).",
+                    detail.resources.len()
+                );
+            }
+            bail!(
+                "Resource index {idx} does not match requested url '{u}' on page '{}'.",
+                detail.summary.title
+            );
+        }
+        return Ok(matches[0]);
+    }
+    select_onenote_resource(detail, index, prefer_image)
+}
+
 pub async fn download_onenote_resource_helper(
     cfg: &AppConfig,
     storage: &Storage,
@@ -2125,8 +2222,28 @@ pub async fn download_onenote_resource_helper(
     index: Option<usize>,
     out_dir: Option<&Path>,
 ) -> Result<(OnenotePageDetail, usize, DownloadedResource)> {
-    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
-    let (resolved_idx, res) = select_onenote_resource(&detail, index, false)?;
+    download_onenote_resource_helper_with_options(
+        cfg, storage, graph, page_query, None, index, None, out_dir,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn download_onenote_resource_helper_with_options(
+    cfg: &AppConfig,
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    section_query: Option<&str>,
+    index: Option<usize>,
+    url: Option<&str>,
+    out_dir: Option<&Path>,
+) -> Result<(OnenotePageDetail, usize, DownloadedResource)> {
+    let resolved_page =
+        resolve_page_query_in_section(storage, graph, page_query, section_query, false).await?;
+    let detail = load_onenote_page_detail(storage, graph, &resolved_page, false).await?;
+    let (resolved_idx, res) =
+        select_onenote_resource_by_index_or_url(&detail, index, url, false)?;
     let dest_dir = out_dir
         .map(PathBuf::from)
         .unwrap_or_else(|| cfg.resolved_download_dir());
@@ -2878,7 +2995,8 @@ async fn cmd_delete(cfg: &AppConfig, page: &str, yes: bool, json_out: bool) -> R
         }
     }
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let section_key = resolver::resolve_page_cached(&storage, page, None)
+    let section_key = resolver::resolve_page_cached(&storage, page, None)?
+        .into_option()?
         .map(|s| s.scope.make_entity_key(&s.section_id));
     let deleted_key = delete_onenote_page_helper(&storage, &graph, page).await?;
     let nudge_cmd = match section_key {

@@ -626,6 +626,49 @@ impl OnenoteXhtmlParser {
         }
     }
 
+    fn resolve_list_item_tag_and_target(
+        li_el: ElementRef<'_>,
+    ) -> (Option<String>, Option<OnenoteTagKind>, Option<String>) {
+        let li_id = non_empty_attr(li_el, "id");
+        if let Some(tag) = parse_data_tag(li_el.value().attr("data-tag")) {
+            return (li_id, Some(tag), Some(li_el.html()));
+        }
+
+        // Microsoft Graph outputs list note tags on direct child `<span>` elements,
+        // and some producers wrap tagged list content in a direct child `<p>`.
+        // Prefer a to-do tag if multiple direct children carry tags.
+        let mut fallback_tagged: Option<(ElementRef<'_>, OnenoteTagKind)> = None;
+        let mut todo_tagged: Option<(ElementRef<'_>, OnenoteTagKind)> = None;
+        for child in li_el.children() {
+            let Some(child_el) = ElementRef::wrap(child) else {
+                continue;
+            };
+            if !matches!(child_el.value().name(), "span" | "p") {
+                continue;
+            }
+            let Some(tag) = parse_data_tag(child_el.value().attr("data-tag")) else {
+                continue;
+            };
+            if tag.is_todo() && todo_tagged.is_none() {
+                todo_tagged = Some((child_el, tag));
+                break;
+            } else if fallback_tagged.is_none() {
+                fallback_tagged = Some((child_el, tag));
+            }
+        }
+
+        if let Some((tagged_el, tag)) = todo_tagged.or(fallback_tagged) {
+            if can_replace_element(tagged_el) {
+                if let Some(child_id) = non_empty_attr(tagged_el, "id") {
+                    return (Some(child_id), Some(tag), Some(tagged_el.html()));
+                }
+            }
+            return (li_id, Some(tag), Some(li_el.html()));
+        }
+
+        (li_id, None, Some(li_el.html()))
+    }
+
     fn handle_list_item(
         &mut self,
         li_el: ElementRef<'_>,
@@ -635,9 +678,7 @@ impl OnenoteXhtmlParser {
         style: &TextStyleFlags,
     ) {
         let li_style = apply_css_style(style, li_el.value().attr("style"));
-        let element_id = non_empty_attr(li_el, "id");
-        let block_tag = parse_data_tag(li_el.value().attr("data-tag"));
-        let raw_html = Some(li_el.html());
+        let (element_id, block_tag, raw_html) = Self::resolve_list_item_tag_and_target(li_el);
         let res = self.collect_inline(li_el, &li_style, true);
 
         if !spans_are_blank(&res.spans) || block_tag.is_some() {
@@ -804,6 +845,179 @@ impl OnenoteXhtmlParser {
         }
     }
 
+    fn format_cell_media_span(block: &OnenoteBlock) -> Option<RichSpan> {
+        match &block.kind {
+            OnenoteBlockKind::Image {
+                resource_index,
+                src,
+                alt,
+                ..
+            } => {
+                let label = alt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("image-{}", resource_index + 1));
+                Some(RichSpan::plain(format!("![{label}]({src})")))
+            }
+            OnenoteBlockKind::Attachment { name, src, .. } => {
+                let text = if src.trim().is_empty() {
+                    format!("[첨부: {name}]")
+                } else {
+                    format!("[📎 {name}]({src})")
+                };
+                Some(RichSpan::plain(text))
+            }
+            _ => None,
+        }
+    }
+
+    fn flush_cell_inline_buf(inline_buf: &mut Vec<RichSpan>, segments: &mut Vec<Vec<RichSpan>>) {
+        if !spans_are_blank(inline_buf) {
+            segments.push(trim_spans(std::mem::take(inline_buf)));
+        } else {
+            inline_buf.clear();
+        }
+    }
+
+    fn walk_table_cell_children(
+        &mut self,
+        parent: ElementRef<'_>,
+        style: &TextStyleFlags,
+        segments: &mut Vec<Vec<RichSpan>>,
+        inline_buf: &mut Vec<RichSpan>,
+    ) {
+        for child in parent.children() {
+            match child.value() {
+                Node::Text(t) => {
+                    push_inline_text(inline_buf, t.text.as_ref(), style);
+                }
+                Node::Element(el) => {
+                    let Some(child_el) = ElementRef::wrap(child) else {
+                        continue;
+                    };
+                    let tag_name = el.name();
+                    if matches!(tag_name, "script" | "style" | "head" | "meta" | "title") {
+                        continue;
+                    }
+                    let mut next = apply_css_style(style, el.attr("style"));
+                    match tag_name {
+                        "p" | "div" | "li" | "ul" | "ol" => {
+                            Self::flush_cell_inline_buf(inline_buf, segments);
+                            self.walk_table_cell_children(child_el, &next, segments, inline_buf);
+                            Self::flush_cell_inline_buf(inline_buf, segments);
+                        }
+                        "table" => {
+                            Self::flush_cell_inline_buf(inline_buf, segments);
+                            self.collect_nested_table_segments(child_el, &next, segments);
+                        }
+                        "img" => {
+                            if let Some(img_block) = self.build_image_block(child_el) {
+                                Self::flush_cell_inline_buf(inline_buf, segments);
+                                if let Some(span) = Self::format_cell_media_span(&img_block) {
+                                    segments.push(vec![span]);
+                                }
+                            }
+                        }
+                        "object" => {
+                            if let Some(att_block) = self.build_attachment_block(child_el) {
+                                Self::flush_cell_inline_buf(inline_buf, segments);
+                                if let Some(span) = Self::format_cell_media_span(&att_block) {
+                                    segments.push(vec![span]);
+                                }
+                            }
+                        }
+                        "br" => {
+                            push_raw_span(inline_buf, "\n", &TextStyleFlags::default());
+                        }
+                        "b" | "strong" => {
+                            next.bold = true;
+                            self.walk_table_cell_children(child_el, &next, segments, inline_buf);
+                        }
+                        "i" | "em" => {
+                            next.italic = true;
+                            self.walk_table_cell_children(child_el, &next, segments, inline_buf);
+                        }
+                        "u" => {
+                            next.underline = true;
+                            self.walk_table_cell_children(child_el, &next, segments, inline_buf);
+                        }
+                        "s" | "del" | "strike" => {
+                            next.strike = true;
+                            self.walk_table_cell_children(child_el, &next, segments, inline_buf);
+                        }
+                        "code" => {
+                            next.code = true;
+                            let raw = collect_raw_text(child_el);
+                            if !raw.is_empty() {
+                                push_raw_span(inline_buf, &raw, &next);
+                            }
+                        }
+                        "a" => {
+                            if let Some(href) = non_empty_attr(child_el, "href") {
+                                next.link_url = Some(href);
+                            }
+                            self.walk_table_cell_children(child_el, &next, segments, inline_buf);
+                        }
+                        _ => {
+                            self.walk_table_cell_children(child_el, &next, segments, inline_buf);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_nested_table_segments(
+        &mut self,
+        table_el: ElementRef<'_>,
+        style: &TextStyleFlags,
+        segments: &mut Vec<Vec<RichSpan>>,
+    ) {
+        let mut collect_row = |this: &mut Self, tr_el: ElementRef<'_>| {
+            if let Some((cells, _)) = this.parse_table_row(tr_el, style) {
+                let mut row_spans: Vec<RichSpan> = Vec::new();
+                for cell in cells {
+                    if spans_are_blank(&cell) {
+                        continue;
+                    }
+                    if !row_spans.is_empty() {
+                        push_raw_span(&mut row_spans, " ", &TextStyleFlags::default());
+                    }
+                    for sp in cell {
+                        push_raw_span(&mut row_spans, &sp.text, &sp.style);
+                    }
+                }
+                if !spans_are_blank(&row_spans) {
+                    segments.push(trim_spans(row_spans));
+                }
+            }
+        };
+
+        for child in table_el.children() {
+            let Some(child_el) = ElementRef::wrap(child) else {
+                continue;
+            };
+            match child_el.value().name() {
+                "thead" | "tbody" | "tfoot" => {
+                    for tr_node in child_el.children() {
+                        if let Some(tr_el) = ElementRef::wrap(tr_node) {
+                            if tr_el.value().name() == "tr" {
+                                collect_row(self, tr_el);
+                            }
+                        }
+                    }
+                }
+                "tr" => {
+                    collect_row(self, child_el);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn parse_table_cell(
         &mut self,
         cell_el: ElementRef<'_>,
@@ -811,68 +1025,8 @@ impl OnenoteXhtmlParser {
     ) -> Vec<RichSpan> {
         let mut segments: Vec<Vec<RichSpan>> = Vec::new();
         let mut inline_buf: Vec<RichSpan> = Vec::new();
-        let mut media_blocks: Vec<OnenoteBlock> = Vec::new();
-
-        for child in cell_el.children() {
-            match child.value() {
-                Node::Text(t) => {
-                    push_inline_text(&mut inline_buf, t.text.as_ref(), style);
-                }
-                Node::Element(el) => {
-                    let Some(child_el) = ElementRef::wrap(child) else {
-                        continue;
-                    };
-                    match el.name() {
-                        "p" | "div" | "li" | "ul" | "ol" => {
-                            if !spans_are_blank(&inline_buf) {
-                                segments.push(trim_spans(std::mem::take(&mut inline_buf)));
-                            } else {
-                                inline_buf.clear();
-                            }
-                            if matches!(el.name(), "ul" | "ol") {
-                                for li_node in child_el.children() {
-                                    if let Some(li_el) = ElementRef::wrap(li_node) {
-                                        if li_el.value().name() == "li" {
-                                            let li_style =
-                                                apply_css_style(style, li_el.value().attr("style"));
-                                            let res = self.collect_inline(li_el, &li_style, false);
-                                            if !spans_are_blank(&res.spans) {
-                                                segments.push(trim_spans(res.spans));
-                                            }
-                                            media_blocks.extend(res.media_blocks);
-                                        }
-                                    }
-                                }
-                            } else {
-                                let p_style = apply_css_style(style, el.attr("style"));
-                                let res = self.collect_inline(child_el, &p_style, false);
-                                if !spans_are_blank(&res.spans) {
-                                    segments.push(trim_spans(res.spans));
-                                }
-                                media_blocks.extend(res.media_blocks);
-                            }
-                        }
-                        _ => {
-                            self.walk_inline_element(
-                                child_el,
-                                style,
-                                false,
-                                &mut inline_buf,
-                                &mut media_blocks,
-                            );
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if !spans_are_blank(&inline_buf) {
-            segments.push(trim_spans(inline_buf));
-        }
-
-        // Preserve any images/attachments embedded inside table cells in resources & blocks.
-        self.blocks.extend(media_blocks);
+        self.walk_table_cell_children(cell_el, style, &mut segments, &mut inline_buf);
+        Self::flush_cell_inline_buf(&mut inline_buf, &mut segments);
 
         let mut joined: Vec<RichSpan> = Vec::new();
         for (idx, seg) in segments.into_iter().enumerate() {
@@ -2527,7 +2681,7 @@ pub fn build_todo_state_patch(
     let updated_html = block
         .raw_html
         .as_deref()
-        .and_then(|raw| rewrite_opening_tag_data_tag(raw, TagRewriteMode::ToggleTodo { completed }))
+        .and_then(|raw| rewrite_todo_raw_html(raw, completed))
         .unwrap_or_else(|| {
             reconstruct_block_xhtml_with_tag(
                 block,
@@ -2616,6 +2770,53 @@ pub fn find_block_by_element_id<'a>(
             .as_deref()
             .is_some_and(|eid| eid.trim().trim_start_matches('#') == clean)
     })
+}
+
+/// Finds a to-do block by `element_id`, also resolving an enclosing `<li>` ID when
+/// a replaceable child `<p>` carries the `data-tag`, or a child `<span>`/`<p>` ID when
+/// the enclosing `<li>` is the Graph-replaceable target.
+pub fn find_todo_block_by_element_id<'a>(
+    detail: &'a OnenotePageDetail,
+    element_id: &str,
+) -> Option<&'a OnenoteBlock> {
+    if let Some(blk) = find_block_by_element_id(detail, element_id) {
+        return Some(blk);
+    }
+    let clean = element_id.trim().trim_start_matches('#');
+    if clean.is_empty() {
+        return None;
+    }
+    let doc = Html::parse_document(&normalize_xhtml_for_html5ever(&detail.raw_xhtml));
+    let body = page_body(&doc)?;
+    let el = body
+        .descendent_elements()
+        .find(|e| non_empty_attr(*e, "id").as_deref() == Some(clean))?;
+    if el.value().name() == "li" {
+        for child in el.children().filter_map(ElementRef::wrap) {
+            if matches!(child.value().name(), "span" | "p")
+                && parse_data_tag(child.value().attr("data-tag")).is_some()
+            {
+                if let Some(child_id) = non_empty_attr(child, "id") {
+                    if let Some(blk) = find_block_by_element_id(detail, &child_id) {
+                        return Some(blk);
+                    }
+                }
+            }
+        }
+    } else if matches!(el.value().name(), "span" | "p")
+        && parse_data_tag(el.value().attr("data-tag")).is_some()
+    {
+        if let Some(parent_li) = el.parent().and_then(ElementRef::wrap) {
+            if parent_li.value().name() == "li" {
+                if let Some(li_id) = non_empty_attr(parent_li, "id") {
+                    if let Some(blk) = find_block_by_element_id(detail, &li_id) {
+                        return Some(blk);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn normalize_compare_text(input: &str) -> String {
@@ -2963,19 +3164,105 @@ fn replace_element_text(
     Ok(id)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextNodeMatch {
+    None,
+    Unique,
+    Ambiguous,
+}
+
+fn find_single_text_node_match(el: ElementRef<'_>, needle: &str) -> TextNodeMatch {
+    let Some(first_char) = needle.chars().next() else {
+        return TextNodeMatch::Ambiguous;
+    };
+    let step = first_char.len_utf8();
+    let mut found = false;
+    for node in el.descendants() {
+        let Some(text) = node.value().as_text() else {
+            continue;
+        };
+        let Some(offset) = text.find(needle) else {
+            continue;
+        };
+        if text[offset + step..].contains(needle) {
+            return TextNodeMatch::Ambiguous;
+        }
+        if found {
+            return TextNodeMatch::Ambiguous;
+        }
+        found = true;
+    }
+    if found {
+        TextNodeMatch::Unique
+    } else {
+        TextNodeMatch::None
+    }
+}
+
+fn block_markdown_prefix_len(block: &OnenoteBlock, baseline: &str) -> usize {
+    let raw_len = match &block.kind {
+        OnenoteBlockKind::Heading { level, .. } => {
+            let hashes = (*level).clamp(1, 6) as usize;
+            let tag_len = block
+                .tag
+                .as_ref()
+                .map(|t| tag_inline_prefix_md(t).len())
+                .unwrap_or(0);
+            hashes + 1 + tag_len
+        }
+        OnenoteBlockKind::Paragraph { .. } => match &block.tag {
+            Some(OnenoteTagKind::Todo { .. }) => 6,
+            Some(other) => tag_inline_prefix_md(other).len(),
+            None => 0,
+        },
+        OnenoteBlockKind::ListItem {
+            ordered,
+            index,
+            depth,
+            ..
+        } => {
+            let indent = (*depth as usize) * 2;
+            let marker_len = if *ordered {
+                format!("{}.", index.unwrap_or(1)).len()
+            } else {
+                1
+            };
+            let tag_len = match &block.tag {
+                Some(OnenoteTagKind::Todo { .. }) => 4,
+                Some(other) => tag_inline_prefix_md(other).len(),
+                None => 0,
+            };
+            indent + marker_len + 1 + tag_len
+        }
+        _ => 0,
+    };
+    let capped = raw_len.min(baseline.len());
+    if baseline.is_char_boundary(capped) {
+        capped
+    } else {
+        0
+    }
+}
+
+enum AlignedTextOutcome {
+    NotApplicable,
+    Patched(Vec<OnenotePatchCommand>),
+    Failed(anyhow::Error),
+}
+
 /// Limit implicit layout edits to text changes aligned with the live Markdown
 /// blocks. Verify the round trip before emitting any replacements.
 fn aligned_text_replacements(
     detail: &OnenotePageDetail,
     doc: &Html,
     markdown: &str,
-) -> Option<Vec<OnenotePatchCommand>> {
+) -> AlignedTextOutcome {
     let old = normalize_compare_text(&detail.body_markdown);
     let offsets: Vec<usize> = std::iter::once(0)
         .chain(markdown.match_indices('\n').map(|(offset, _)| offset + 1))
         .collect();
     if old.lines().count() != offsets.len() {
-        return None;
+        return AlignedTextOutcome::NotApplicable;
     }
     let mut doc = doc.clone();
     let mut remaining = old.as_str();
@@ -2988,75 +3275,176 @@ fn aligned_text_replacements(
         }
         let following = remaining.trim_start_matches('\n');
         line += remaining.len() - following.len();
-        remaining = following.strip_prefix(&baseline)?;
-        let start = *offsets.get(line)?;
+        let Some(rest) = following.strip_prefix(&baseline) else {
+            return AlignedTextOutcome::NotApplicable;
+        };
+        remaining = rest;
+        let Some(&start) = offsets.get(line) else {
+            return AlignedTextOutcome::NotApplicable;
+        };
         line += baseline.bytes().filter(|&b| b == b'\n').count();
         let end = offsets
             .get(line + 1)
             .map_or(markdown.len(), |offset| offset - 1);
-        let edited = markdown.get(start..end)?;
+        let Some(edited) = markdown.get(start..end) else {
+            return AlignedTextOutcome::NotApplicable;
+        };
         if edited == baseline {
             continue;
         }
-        let target = block.element_id.as_deref()?;
-        let (from, to) = changed_text(&baseline, edited)?;
-        let id = replace_element_text(&mut doc, target, from, to, false).ok()?;
+        let Some(target) = block.element_id.as_deref() else {
+            return AlignedTextOutcome::NotApplicable;
+        };
+        let min_start = block_markdown_prefix_len(block, &baseline);
+        let (from, to) = {
+            let (el, _) = match find_replace_element(&doc, target) {
+                Ok(found) => found,
+                Err(err) => return AlignedTextOutcome::Failed(err),
+            };
+            let Some((from, to)) = changed_text_for_element(el, &baseline, edited, min_start)
+            else {
+                return AlignedTextOutcome::Failed(anyhow::anyhow!(
+                    "Cannot uniquely map text edit within a single text node of '{target}'."
+                ));
+            };
+            (from.to_owned(), to.to_owned())
+        };
+        let id = match replace_element_text(&mut doc, target, &from, &to, false) {
+            Ok(id) => id,
+            Err(err) => return AlignedTextOutcome::Failed(err),
+        };
         if ids.contains(&id) {
-            return None;
+            return AlignedTextOutcome::Failed(anyhow::anyhow!(
+                "Multiple aligned edits targeted the same element '{id}'."
+            ));
         }
         ids.push(id);
     }
-    if !remaining.is_empty()
-        || ids.is_empty()
-        || normalize_compare_text(
-            &parse_onenote_page_xhtml(detail.summary.clone(), &doc.html()).body_markdown,
-        ) != markdown
-    {
-        return None;
+    if !remaining.is_empty() || ids.is_empty() {
+        return AlignedTextOutcome::NotApplicable;
     }
-    ids.iter()
-        .map(|id| {
-            let (el, _) = find_replace_element(&doc, id).ok()?;
-            // Replacing an ancestor and its descendant would reuse a stale target.
-            if el
-                .ancestors()
-                .filter_map(ElementRef::wrap)
-                .filter_map(|parent| parent.attr("id"))
-                .any(|parent| ids.iter().any(|target| target == parent))
-            {
-                return None;
-            }
-            Some(replace_element(id, el.html()))
-        })
-        .collect()
+    if normalize_compare_text(
+        &parse_onenote_page_xhtml(detail.summary.clone(), &doc.html()).body_markdown,
+    ) != markdown
+    {
+        return AlignedTextOutcome::Failed(anyhow::anyhow!(
+            "Cannot map text edit cleanly without changing element structure."
+        ));
+    }
+    let mut commands = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let (el, _) = match find_replace_element(&doc, id) {
+            Ok(found) => found,
+            Err(err) => return AlignedTextOutcome::Failed(err),
+        };
+        // Replacing an ancestor and its descendant would reuse a stale target.
+        if el
+            .ancestors()
+            .filter_map(ElementRef::wrap)
+            .filter_map(|parent| parent.attr("id"))
+            .any(|parent| ids.iter().any(|target| target == parent))
+        {
+            return AlignedTextOutcome::Failed(anyhow::anyhow!(
+                "Aligned edits target nested elements around '{id}'."
+            ));
+        }
+        commands.push(replace_element(id, el.html()));
+    }
+    AlignedTextOutcome::Patched(commands)
 }
 
-fn changed_text<'a>(before: &'a str, after: &'a str) -> Option<(&'a str, &'a str)> {
-    let mut start = before
+fn changed_text_for_element<'a>(
+    el: ElementRef<'_>,
+    before: &'a str,
+    after: &'a str,
+    min_start: usize,
+) -> Option<(&'a str, &'a str)> {
+    let start = before
         .chars()
         .zip(after.chars())
         .take_while(|(a, b)| a == b)
         .map(|(c, _)| c.len_utf8())
         .sum::<usize>();
-    let mut tail = before[start..]
+    if start < min_start {
+        return None;
+    }
+    let tail = before[start..]
         .chars()
         .rev()
         .zip(after[start..].chars().rev())
         .take_while(|(a, b)| a == b)
         .map(|(c, _)| c.len_utf8())
         .sum::<usize>();
-    if start + tail == before.len() {
-        // Anchor a pure insertion to adjacent text in the original node.
-        if let Some(c) = before[..start].chars().next_back() {
-            start -= c.len_utf8();
-        } else {
-            tail -= before.chars().next()?.len_utf8();
+
+    let mut s = start;
+    let mut t = tail;
+    if s + t < before.len() {
+        let initial = &before[s..before.len() - t];
+        match find_single_text_node_match(el, initial) {
+            TextNodeMatch::Unique => return Some((initial, &after[s..after.len() - t])),
+            TextNodeMatch::None => return None,
+            TextNodeMatch::Ambiguous => {}
         }
     }
-    Some((
-        &before[start..before.len() - tail],
-        &after[start..after.len() - tail],
-    ))
+
+    let mut can_left = s > min_start;
+    let mut can_right = t > 0;
+    let mut prefer_left = true;
+    while can_left || can_right {
+        let sides = if (prefer_left && can_left) || !can_right {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        let mut progressed = false;
+        for expand_left in sides {
+            if (expand_left && !can_left) || (!expand_left && !can_right) {
+                continue;
+            }
+            let (next_s, next_t) = if expand_left {
+                let Some(ch) = before[min_start..s].chars().next_back() else {
+                    can_left = false;
+                    continue;
+                };
+                (s - ch.len_utf8(), t)
+            } else {
+                let Some(ch) = before[before.len() - t..].chars().next() else {
+                    can_right = false;
+                    continue;
+                };
+                (s, t - ch.len_utf8())
+            };
+            let candidate = &before[next_s..before.len() - next_t];
+            match find_single_text_node_match(el, candidate) {
+                TextNodeMatch::Unique => {
+                    return Some((candidate, &after[next_s..after.len() - next_t]));
+                }
+                TextNodeMatch::Ambiguous => {
+                    s = next_s;
+                    t = next_t;
+                    if expand_left {
+                        can_left = s > min_start;
+                    } else {
+                        can_right = t > 0;
+                    }
+                    prefer_left = !expand_left;
+                    progressed = true;
+                    break;
+                }
+                TextNodeMatch::None => {
+                    if expand_left {
+                        can_left = false;
+                    } else {
+                        can_right = false;
+                    }
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    None
 }
 
 /// Replace a changed page body without flattening distinct OneNote regions.
@@ -3074,12 +3462,18 @@ pub fn build_replace_page_body_commands(
         return Ok(cmds);
     }
 
-    let doc = Html::parse_document(&normalize_xhtml_for_html5ever(&detail.raw_xhtml));
-    if let Some(edits) = aligned_text_replacements(detail, &doc, &normalized) {
-        cmds.extend(edits);
-        return Ok(cmds);
-    }
     let guidance = "Use read --format blocks to find an element for update --block-id, or append to add content.";
+    let doc = Html::parse_document(&normalize_xhtml_for_html5ever(&detail.raw_xhtml));
+    match aligned_text_replacements(detail, &doc, &normalized) {
+        AlignedTextOutcome::Patched(edits) => {
+            cmds.extend(edits);
+            return Ok(cmds);
+        }
+        AlignedTextOutcome::Failed(err) => {
+            bail!("{err} {guidance}");
+        }
+        AlignedTextOutcome::NotApplicable => {}
+    }
     let body = page_body(&doc).context("Page XHTML has no body.")?;
     let elements: Vec<_> = body.child_elements().collect();
     if body.children().any(|node| {
@@ -3206,6 +3600,229 @@ struct OpeningAttrSpan {
     name_end: usize,
     attr_end: usize,
     raw_value: Option<String>,
+}
+
+struct ParsedOpeningTag {
+    name_start: usize,
+    name_end: usize,
+    tag_end: usize,
+    self_closing: bool,
+    attrs: Vec<OpeningAttrSpan>,
+}
+
+fn parse_opening_tag_at(raw: &str, lt_idx: usize) -> Option<ParsedOpeningTag> {
+    let bytes = raw.as_bytes();
+    if lt_idx >= bytes.len() || bytes[lt_idx] != b'<' {
+        return None;
+    }
+    let mut pos = lt_idx + 1;
+    if pos >= bytes.len() || !bytes[pos].is_ascii_alphabetic() {
+        return None;
+    }
+    let name_start = pos;
+    while pos < bytes.len()
+        && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'-' || bytes[pos] == b':')
+    {
+        pos += 1;
+    }
+    let name_end = pos;
+
+    let mut attrs = Vec::new();
+    let (tag_end, self_closing) = loop {
+        let ws_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        if bytes[pos] == b'>' {
+            break (pos + 1, false);
+        }
+        if bytes[pos] == b'/' && pos + 1 < bytes.len() && bytes[pos + 1] == b'>' {
+            break (pos + 2, true);
+        }
+
+        let attr_name_start = pos;
+        while pos < bytes.len()
+            && !bytes[pos].is_ascii_whitespace()
+            && !matches!(bytes[pos], b'=' | b'>' | b'/')
+        {
+            pos += 1;
+        }
+        if pos == attr_name_start {
+            return None;
+        }
+        let attr_name_end = pos;
+
+        let mut temp = pos;
+        while temp < bytes.len() && bytes[temp].is_ascii_whitespace() {
+            temp += 1;
+        }
+
+        let (attr_end, raw_value) = if temp < bytes.len() && bytes[temp] == b'=' {
+            pos = temp + 1;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos >= bytes.len() {
+                return None;
+            }
+            if bytes[pos] == b'"' || bytes[pos] == b'\'' {
+                let quote = bytes[pos];
+                pos += 1;
+                let val_start = pos;
+                while pos < bytes.len() && bytes[pos] != quote {
+                    pos += 1;
+                }
+                if pos >= bytes.len() {
+                    return None;
+                }
+                let val = unescape_basic_xml_entities(&raw[val_start..pos]);
+                pos += 1;
+                (pos, Some(val))
+            } else {
+                let val_start = pos;
+                while pos < bytes.len()
+                    && !bytes[pos].is_ascii_whitespace()
+                    && bytes[pos] != b'>'
+                    && !(bytes[pos] == b'/' && pos + 1 < bytes.len() && bytes[pos + 1] == b'>')
+                {
+                    pos += 1;
+                }
+                let val = unescape_basic_xml_entities(&raw[val_start..pos]);
+                (pos, Some(val))
+            }
+        } else {
+            (attr_name_end, None)
+        };
+
+        attrs.push(OpeningAttrSpan {
+            ws_start,
+            name_start: attr_name_start,
+            name_end: attr_name_end,
+            attr_end,
+            raw_value,
+        });
+    };
+
+    Some(ParsedOpeningTag {
+        name_start,
+        name_end,
+        tag_end,
+        self_closing,
+        attrs,
+    })
+}
+
+fn toggle_todo_tag_list(prev: &str, completed: bool) -> String {
+    let todo_token = if completed {
+        "to-do:completed"
+    } else {
+        "to-do"
+    };
+    let mut updated_parts = Vec::new();
+    let mut replaced_todo = false;
+    for part in prev.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if part.eq_ignore_ascii_case("to-do") || part.eq_ignore_ascii_case("to-do:completed") {
+            if !replaced_todo {
+                updated_parts.push(todo_token.to_string());
+                replaced_todo = true;
+            }
+        } else {
+            updated_parts.push(part.to_string());
+        }
+    }
+    if !replaced_todo {
+        updated_parts.insert(0, todo_token.to_string());
+    }
+    updated_parts.join(",")
+}
+
+/// Rewrites the to-do `data-tag` on `raw`. When `raw` is a `<li>` whose `data-tag`
+/// was emitted by Graph on a direct child `<span>` or `<p>` (without a `data-tag` on `<li>`),
+/// moves the updated `data-tag` onto the `<li>` opening tag (Graph's input HTML contract)
+/// and removes the stale `data-tag` from that direct child.
+fn rewrite_todo_raw_html(raw: &str, completed: bool) -> Option<String> {
+    let lt_idx = raw.find('<')?;
+    if !raw[..lt_idx].trim().is_empty() {
+        return None;
+    }
+    let root = parse_opening_tag_at(raw, lt_idx)?;
+    let root_has_data_tag = root
+        .attrs
+        .iter()
+        .any(|a| raw[a.name_start..a.name_end].eq_ignore_ascii_case("data-tag"));
+    if root_has_data_tag || !raw[root.name_start..root.name_end].eq_ignore_ascii_case("li") {
+        return rewrite_opening_tag_data_tag(raw, TagRewriteMode::ToggleTodo { completed });
+    }
+
+    let bytes = raw.as_bytes();
+    let mut pos = root.tag_end;
+    let mut depth: usize = 0;
+    while pos < bytes.len() {
+        let Some(rel_lt) = raw[pos..].find('<') else {
+            break;
+        };
+        let tag_start = pos + rel_lt;
+        if raw[tag_start..].starts_with("<!--") {
+            if let Some(end_c) = raw[tag_start + 4..].find("-->") {
+                pos = tag_start + 4 + end_c + 3;
+                continue;
+            } else {
+                break;
+            }
+        }
+        if raw[tag_start..].starts_with("</") {
+            let Some(rel_gt) = raw[tag_start + 2..].find('>') else {
+                break;
+            };
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+            pos = tag_start + 2 + rel_gt + 1;
+            continue;
+        }
+        if let Some(child_tag) = parse_opening_tag_at(raw, tag_start) {
+            let child_name = &raw[child_tag.name_start..child_tag.name_end];
+            if depth == 0 && (child_name.eq_ignore_ascii_case("span") || child_name.eq_ignore_ascii_case("p")) {
+                if let Some(dt_attr) = child_tag
+                    .attrs
+                    .iter()
+                    .find(|a| raw[a.name_start..a.name_end].eq_ignore_ascii_case("data-tag"))
+                {
+                    let prev_val = dt_attr.raw_value.as_deref().unwrap_or("");
+                    if parse_data_tag(Some(prev_val)).is_some_and(|t| t.is_todo()) {
+                        let desired_val = toggle_todo_tag_list(prev_val, completed);
+                        let stripped_child_open = rewrite_opening_tag_data_tag(
+                            &raw[tag_start..child_tag.tag_end],
+                            TagRewriteMode::Set(None),
+                        )?;
+                        let spliced = format!(
+                            "{}{}{}",
+                            &raw[..tag_start],
+                            stripped_child_open,
+                            &raw[child_tag.tag_end..]
+                        );
+                        let desired_tag = OnenoteTagKind::Custom(desired_val);
+                        return rewrite_opening_tag_data_tag(
+                            &spliced,
+                            TagRewriteMode::Set(Some(&desired_tag)),
+                        );
+                    }
+                }
+            }
+            if !child_tag.self_closing && !is_html5_void_tag(child_name) {
+                depth += 1;
+            }
+            pos = child_tag.tag_end;
+        } else {
+            pos = tag_start + 1;
+        }
+    }
+
+    rewrite_opening_tag_data_tag(raw, TagRewriteMode::ToggleTodo { completed })
 }
 
 fn rewrite_opening_tag_data_tag(raw: &str, mode: TagRewriteMode<'_>) -> Option<String> {
@@ -4122,6 +4739,120 @@ let ok = 1 < 2 && 3 > 1;
         assert_eq!(
             page_cmds[1].content,
             r#"<div id="div:{main}{1}"><h2>새 섹션</h2><p>내용</p></div>"#
+        );
+    }
+
+    #[test]
+    fn regression_onenote_bug_01_widens_anchor_in_node_and_refuses_ambiguous_div_fallback() {
+        // UTF-8 repeated-char insertion & repeated-zero replacement inside plain and absolute divs
+        for container in [
+            r#"<div id="div:abs" style="position:absolute;left:10px">"#,
+            r#"<div id="div:plain">"#,
+        ] {
+            let xhtml = format!(
+                r#"<html><body>{container}<p id="p:ko" data-id="ko-1" style="color:navy">안건 안건</p><p id="p:n" data-id="n-1" style="margin:0">000 400 40 400</p><p id="p:sib">유지</p></div></body></html>"#
+            );
+            let detail = parse_onenote_page_xhtml(sample_summary("UTF8"), &xhtml);
+            let edited = detail
+                .body_markdown
+                .replace("안건 안건", "안건 안건들")
+                .replace("400 40 400", "400 45 400");
+            let cmds = build_replace_page_body_commands(&detail, None, &edited).unwrap();
+            assert_eq!(cmds.len(), 2);
+            assert_eq!(cmds[0].target, "p:ko");
+            assert_eq!(
+                Html::parse_fragment(&cmds[0].content),
+                Html::parse_fragment(
+                    r#"<p id="p:ko" data-id="ko-1" style="color:navy">안건 안건들</p>"#
+                )
+            );
+            assert_eq!(cmds[1].target, "p:n");
+            assert_eq!(
+                Html::parse_fragment(&cmds[1].content),
+                Html::parse_fragment(
+                    r#"<p id="p:n" data-id="n-1" style="margin:0">000 400 45 400</p>"#
+                )
+            );
+        }
+
+        // Insertion right after heading prefix "# " with repeated char must not latch onto "# "
+        let heading_detail = parse_onenote_page_xhtml(
+            sample_summary("H"),
+            r#"<html><body><div id="div:h"><h1 id="h1:1">a a</h1></div></body></html>"#,
+        );
+        let h_cmds = build_replace_page_body_commands(&heading_detail, None, "# x a a").unwrap();
+        assert_eq!(h_cmds.len(), 1);
+        assert_eq!(h_cmds[0].target, "h1:1");
+        assert_eq!(
+            Html::parse_fragment(&h_cmds[0].content),
+            Html::parse_fragment(r#"<h1 id="h1:1">x a a</h1>"#)
+        );
+    }
+
+    #[test]
+    fn regression_onenote_bug_05_cell_order_nested_table_and_li_child_todos() {
+        let xhtml = r#"<html><body>
+            <div id="div:1">
+                <table id="table:outer">
+                    <tr>
+                        <td>앞<img id="img:1" alt="Diagram" src="https://example.invalid/r1" /><table id="table:inner"><tr><td>INNERCELLZEBRA</td><td>77</td></tr><tr><td>Deep</td><td>Row</td></tr></table>뒤</td>
+                    </tr>
+                </table>
+                <ul id="ul:1">
+                    <li id="li:s"><span style="color:blue" data-tag="to-do,important">Span item</span><ul><li id="li:sub"><span data-tag="to-do">Sub item</span></li></ul></li>
+                    <li id="li:p_noid"><p data-tag="to-do">No-id p item</p></li>
+                    <li id="li:p_id"><p id="p:inner" data-tag="to-do:completed">Id p item</p></li>
+                </ul>
+            </div>
+        </body></html>"#;
+
+        let detail = parse_onenote_page_xhtml(sample_summary("B05"), xhtml);
+        assert_eq!(detail.blocks[0].element_id.as_deref(), Some("table:outer"));
+        if let OnenoteBlockKind::Table { rows, .. } = &detail.blocks[0].kind {
+            assert_eq!(rows.len(), 1, "outer table must not collect inner table rows");
+        } else {
+            panic!("expected outer table first");
+        }
+        let md = &detail.body_markdown;
+        assert!(md.find("앞").unwrap() < md.find("![Diagram](https://example.invalid/r1)").unwrap());
+        assert!(md.find("![Diagram](https://example.invalid/r1)").unwrap() < md.find("INNERCELLZEBRA 77").unwrap());
+        assert!(md.find("INNERCELLZEBRA 77").unwrap() < md.find("Deep Row").unwrap());
+        assert!(md.find("Deep Row").unwrap() < md.find("뒤").unwrap());
+        assert_eq!(md.matches("INNERCELLZEBRA").count(), 1);
+        assert_eq!(detail.body_plain.matches("INNERCELLZEBRA").count(), 1);
+
+        // li>span with nested ul preserves nested ul & important tag while targeting li:s
+        let span_blk = find_block_by_element_id(&detail, "li:s").unwrap();
+        assert_eq!(span_blk.tag, Some(OnenoteTagKind::Todo { completed: false }));
+        let patch_s = build_todo_state_patch(span_blk, true).unwrap();
+        assert_eq!(patch_s.target, "li:s");
+        assert_eq!(
+            Html::parse_fragment(&patch_s.content),
+            Html::parse_fragment(
+                r#"<li id="li:s" data-tag="to-do:completed,important"><span style="color:blue">Span item</span><ul><li id="li:sub"><span data-tag="to-do">Sub item</span></li></ul></li>"#
+            )
+        );
+
+        // li>p without id falls back to li:p_noid
+        let p_noid_blk = find_block_by_element_id(&detail, "li:p_noid").unwrap();
+        assert_eq!(p_noid_blk.tag, Some(OnenoteTagKind::Todo { completed: false }));
+        let patch_pn = build_todo_state_patch(p_noid_blk, true).unwrap();
+        assert_eq!(patch_pn.target, "li:p_noid");
+        assert_eq!(
+            Html::parse_fragment(&patch_pn.content),
+            Html::parse_fragment(
+                r#"<li id="li:p_noid" data-tag="to-do:completed"><p>No-id p item</p></li>"#
+            )
+        );
+
+        // li>p with id targets p:inner directly
+        let p_id_blk = find_block_by_element_id(&detail, "p:inner").unwrap();
+        assert_eq!(p_id_blk.tag, Some(OnenoteTagKind::Todo { completed: true }));
+        let patch_pi = build_todo_state_patch(p_id_blk, false).unwrap();
+        assert_eq!(patch_pi.target, "p:inner");
+        assert_eq!(
+            Html::parse_fragment(&patch_pi.content),
+            Html::parse_fragment(r#"<p id="p:inner" data-tag="to-do">Id p item</p>"#)
         );
     }
 }

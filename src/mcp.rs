@@ -654,7 +654,8 @@ async fn dispatch_tool(
             if !confirm {
                 bail!("Refusing to delete OneNote page without `confirm: true`.");
             }
-            let section_key = resolver::resolve_page_cached(storage, page, None)
+            let section_key = resolver::resolve_page_cached(storage, page, None)?
+                .into_option()?
                 .map(|s| s.scope.make_entity_key(&s.section_id));
             let deleted = cli::delete_onenote_page_helper(storage, graph, page).await?;
             let nudge_cmd = match section_key {
