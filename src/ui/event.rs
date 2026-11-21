@@ -43,7 +43,6 @@ pub fn key_to_action(
             KeyCommand::NewNotebook => Action::OpenOnenoteCreateNotebook,
             KeyCommand::NewSection => Action::OpenOnenoteCreateSection,
             KeyCommand::NewPage => Action::OpenOnenoteCreatePage { level: 0 },
-            KeyCommand::NewSubpage => Action::OpenOnenoteCreatePage { level: 1 },
             KeyCommand::AppendMarkdown => Action::OpenOnenoteAppend,
             KeyCommand::EditBlock => Action::OpenOnenoteEditBlock,
             KeyCommand::ToggleTodo => Action::OnenoteToggleTodo(None),

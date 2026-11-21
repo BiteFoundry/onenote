@@ -1,6 +1,7 @@
 //! Microsoft Graph v1.0 client for OneNote notebooks, section groups, sections, pages, and resources.
 
 pub mod client;
+pub mod copy;
 pub mod media;
 pub mod onenote;
 
@@ -74,6 +75,7 @@ pub struct GraphClient {
     auth: AuthManager,
     config: AppConfig,
     http: reqwest::Client,
+    operation_http: reqwest::Client,
     my_user_id: Option<String>,
     cached_my_user_id: Arc<OnceLock<String>>,
     resolve_user_mutex: Arc<tokio::sync::Mutex<()>>,
@@ -86,19 +88,26 @@ pub struct GraphClient {
 
 impl GraphClient {
     pub fn new(config: AppConfig, auth: AuthManager) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("onenote-cli/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .tcp_nodelay(true)
-            .pool_max_idle_per_host(16)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(30))
+        let http_builder = || {
+            reqwest::Client::builder()
+                .user_agent(concat!("onenote-cli/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .tcp_nodelay(true)
+                .pool_max_idle_per_host(16)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(30))
+        };
+        let http = http_builder().build()?;
+        let operation_http = http_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()?;
         Ok(Self {
             auth,
             config,
             http,
+            operation_http,
             my_user_id: None,
             cached_my_user_id: Arc::new(OnceLock::new()),
             resolve_user_mutex: Arc::new(tokio::sync::Mutex::new(())),

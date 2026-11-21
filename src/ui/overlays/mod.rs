@@ -307,7 +307,7 @@ impl HelpOverlay {
             Line::from("  /                     Search OneNote pages (SQLite FTS5)"),
             Line::from(""),
             Line::from(Span::styled("OneNote Authoring & Actions", theme.title(true))),
-            Line::from("  n / N                 Create new page / subpage (Markdown + Ctrl+V image)"),
+            Line::from("  n                     Create new page (Markdown + Ctrl+V image)"),
             Line::from("  a                     Append Markdown block (Ctrl+V image · Ctrl+F file)"),
             Line::from("  e / Enter             Edit selected block surgically"),
             Line::from("  Space / x             Toggle selected to-do checkbox"),

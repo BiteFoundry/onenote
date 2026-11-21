@@ -346,9 +346,8 @@ fn draw_action_toolbar(
     theme: &Theme,
     hitmap: &mut HitMap,
 ) {
-    let buttons: [(&str, ButtonId); 12] = [
+    let buttons: [(&str, ButtonId); 11] = [
         ("[+Pg n]", ButtonId::OnenoteNewPage),
-        ("[Sub N]", ButtonId::OnenoteNewSubpage),
         ("[Add a]", ButtonId::OnenoteAppend),
         ("[Edit e]", ButtonId::OnenoteEditBlock),
         ("[Todo x]", ButtonId::OnenoteToggleTodo),

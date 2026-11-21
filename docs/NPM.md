@@ -34,14 +34,29 @@ terminal image preview (`Kitty` / `iTerm2` / `Sixel` / `Halfblock` via `onenote 
 and the interactive TUI).
 
 - `onenote login`, `onenote logout`, `onenote whoami`, `onenote doctor --online`
-- `onenote notebooks`, `onenote sections [notebook]`, `onenote pages <section>`, `onenote read <page>`
+- `onenote notebooks`, `onenote sections [notebook]`, `onenote pages <section>`, `onenote read <page> [--json [--compact]]`
 - `onenote create-notebook <name>`, `onenote create-section <notebook> <name>`
-- `onenote create <section> <title> [--body ...] [--image ...] [--level 0|1|2]`
-- `onenote append <page> [--body ...] [--image ...]`
-- `onenote update <page> [--block-id <id> --body ...] [--title ...] [--body ...]`
-- `onenote check <page> <block-id> [--done | --undone]`, `onenote delete <page>`
-- `onenote search <query>`, `onenote resource <page> [index] [--out ...]`
+- `onenote rename-section <section-id> --name <new-name> [--json]`
+- `onenote rename-notebook --drive-id <drive-id> --item-id <item-id> --name <name> [--json]`
+- Windows `onenote desktop-set-page-level <desktop-page-id> --level <0|1|2> [--json]` and `onenote desktop-rename-section <desktop-section-id> --name <name> [--json]`
+- `onenote create <section> --title <title> [markdown] [--file <file>] [--image <path>] [--level 0]`
+- `onenote append <page> [markdown] [--file <file>] [--image <path>]`
+- `onenote update <page> [--title <title>] [--body <markdown> | --file <file>] [--block-id <id>]`
+- `onenote check <page> [--block-id <id> | --index <n>] [--done | --undone]`, `onenote delete <page> --yes`
+- `onenote search <query>`, `onenote resource <page> [--index <n>] [--out <directory>]`
 - `onenote sync`, `onenote daemon <start|status|stop|restart|run>`, `onenote tui`, `onenote serve`, `onenote mcp`, `onenote preview-file <path>`, `onenote self-update`
+
+```sh
+onenote append 'me|PAGE_ID' 'Evidence' --json
+onenote resource 'me|PAGE_ID' --index 0 --out ./downloads --json
+onenote read 'me|PAGE_ID' --format blocks
+onenote update 'me|PAGE_ID' --block-id 'p:{ELEMENT_ID}' --replace-text READY --with-text APPROVED
+onenote update 'me|PAGE_ID' --block-id 'p:{ELEMENT_ID}' --body '**Approval complete**'
+```
+
+Use `--replace-text` and `--with-text` to change one exact substring in a block's text while keeping its XHTML markup. Use `--body` with `--block-id` to replace the entire block with Markdown. Page-wide `--body` updates on pages with multiple regions require text changes that can be matched to current elements. Use `append` to add content to the primary region.
+
+Graph creates a top-level page. Windows desktop commands can promote or indent an existing page. Use the OneNote app's **Move** command to move a page. [Hierarchy operations and permissions](API.md#hierarchy-operations)
 
 ## Supported platforms
 

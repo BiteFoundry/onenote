@@ -1,7 +1,7 @@
 //! Microsoft OneNote modal forms (`src/ui/overlays/onenote_form.rs`):
 //! - `B`: Create Notebook (`CreateNotebook`)
 //! - `S`: Create Section (`CreateSection`)
-//! - `n` / `N`: Create Page / Subpage (`CreatePage`, supports Markdown + `Ctrl+V` clipboard image paste + `Ctrl+F` File Picker)
+//! - `n`: Create Page (`CreatePage`, supports Markdown + `Ctrl+V` clipboard image paste + `Ctrl+F` File Picker)
 //! - `a`: Append Markdown block (`AppendMarkdown`, supports `- [ ]` tasks + `Ctrl+V` clipboard image paste + `Ctrl+F` File Picker)
 //! - `e`: Surgically edit selected block (`EditBlock`, pre-filled with selected block's Markdown)
 
@@ -861,9 +861,9 @@ mod tests {
     }
 
     #[test]
-    fn create_subpage_and_append_markdown_with_inline_image() {
+    fn create_page_with_markdown_and_inline_image() {
         let mut page_form =
-            OnenoteFormOverlay::create_page("me|sec-1".to_string(), "Meeting Notes".to_string(), 1);
+            OnenoteFormOverlay::create_page("me|sec-1".to_string(), "Meeting Notes".to_string(), 0);
         page_form.handle(&Action::Paste("Sprint Retro".to_string()));
         page_form.handle(&Action::Tab);
         page_form.handle(&Action::Paste("- [ ] Review action items".to_string()));
@@ -885,7 +885,7 @@ mod tests {
                     bytes: png,
                     file_name: Some("clip.png".to_string()),
                 }],
-                level: 1,
+                level: 0,
             })
         );
     }

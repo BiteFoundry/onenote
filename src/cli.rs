@@ -7,14 +7,17 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::json;
 
 use crate::{
     auth::{diagnose_access_token_scopes, AuthManager, LoginOptions},
     config::{self, AppConfig, ImageProtocolPreference, Persona, DEFAULT_SERVE_PORT},
     daemon,
-    graph::{media, GraphClient},
+    graph::{
+        copy::{DEFAULT_COPY_WAIT_SECONDS, MAX_COPY_WAIT_SECONDS},
+        media, GraphClient,
+    },
     img_preview,
     models::{
         split_onenote_entity_key, DownloadedResource, InlineImageUpload, OnenoteBlock,
@@ -131,6 +134,17 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Rename a OneNote notebook's OneDrive or SharePoint package by storage ID
+    RenameNotebook {
+        #[arg(long)]
+        drive_id: String,
+        #[arg(long)]
+        item_id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// List OneNote sections (all or within a specific notebook)
     #[command(visible_alias = "sec")]
     Sections {
@@ -148,6 +162,35 @@ pub enum Command {
     #[command(name = "create-section")]
     CreateSection {
         notebook: String,
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename an existing section by ID on the signed-in user's Graph OneNote route
+    RenameSection {
+        /// Section ID or me|ID from onenote sections
+        section: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change an existing page's indentation in OneNote for Windows
+    #[cfg(windows)]
+    DesktopSetPageLevel {
+        /// Full OneNote desktop Page ID from GetHierarchy
+        page_id: String,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..=2))]
+        level: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename an existing section in OneNote for Windows
+    #[cfg(windows)]
+    DesktopRenameSection {
+        /// Full OneNote desktop Section ID from GetHierarchy
+        section_id: String,
+        #[arg(long)]
         name: String,
         #[arg(long)]
         json: bool,
@@ -181,6 +224,9 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
+        /// Return page ID, title, modification time and Markdown with --json
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Create a new OneNote page from Markdown and optional inline images
     Create {
@@ -192,8 +238,25 @@ pub enum Command {
         file: Option<PathBuf>,
         #[arg(long = "image", value_name = "img_path")]
         image: Vec<PathBuf>,
+        /// Page level (0 or omitted). Change indentation in OneNote for Windows.
         #[arg(long, value_parser = clap::value_parser!(i32).range(0..=2))]
         level: Option<i32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Copy an existing page to a section through Microsoft Graph
+    CopyPage {
+        /// Source page ID or scoped page key
+        page: String,
+        /// Destination section ID or scoped section key
+        #[arg(long)]
+        section: String,
+        /// Resume the existing operation using its returned operation_url
+        #[arg(long)]
+        operation: Option<String>,
+        /// Seconds to poll (0 returns the operation handle immediately)
+        #[arg(long, default_value_t = DEFAULT_COPY_WAIT_SECONDS, value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_COPY_WAIT_SECONDS)))]
+        wait_seconds: u32,
         #[arg(long)]
         json: bool,
     },
@@ -209,6 +272,9 @@ pub enum Command {
         json: bool,
     },
     /// Update a OneNote page/block (`onenote update <page> ...`), or self-update when called without `<page>` (`onenote update --check`)
+    #[command(
+        after_help = "Examples:\n  onenote update PAGE --block-id 'p:{id}' --replace-text READY --with-text APPROVED\n  onenote update PAGE --block-id 'p:{id}' --body '**New block**'\n  onenote append PAGE 'New paragraph'"
+    )]
     Update {
         /// Page key/ID/title to update. Omit to run the GitHub Releases self-updater.
         page: Option<String>,
@@ -220,6 +286,12 @@ pub enum Command {
         file: Option<PathBuf>,
         #[arg(long = "block-id")]
         block_id: Option<String>,
+        /// Exact text to replace within a block while preserving its formatting
+        #[arg(long, requires_all = ["block_id", "with_text"], conflicts_with_all = ["body", "file"])]
+        replace_text: Option<String>,
+        /// Replacement text for --replace-text
+        #[arg(long, requires = "replace_text")]
+        with_text: Option<String>,
         /// Expected baseline content of the target block/page from your prior read; aborts with conflict if remote changed
         #[arg(long = "expected-content", visible_alias = "base-content", allow_hyphen_values = true)]
         expected_content: Option<String>,
@@ -254,6 +326,12 @@ pub enum Command {
         block_id: Option<String>,
         #[arg(long)]
         index: Option<usize>,
+        /// Set the checkbox to completed. Omit both state flags to toggle.
+        #[arg(long, conflicts_with = "undone")]
+        done: bool,
+        /// Set the checkbox to incomplete
+        #[arg(long)]
+        undone: bool,
         /// Expected baseline content of the target to-do block from your prior read; aborts with conflict if remote changed
         #[arg(long = "expected-content", visible_alias = "base-content", allow_hyphen_values = true)]
         expected_content: Option<String>,
@@ -341,40 +419,6 @@ pub enum Command {
     Mcp,
 }
 
-const FAST_HELP_TEXT: &str = concat!(
-    "onenote ",
-    env!("CARGO_PKG_VERSION"),
-    "\nMicrosoft OneNote terminal client & AI agent toolkit (CLI · TUI · HTTP API · MCP)\n\n",
-    "Usage: onenote [COMMAND]\n\n",
-    "Commands:\n",
-    "  login            Sign in with Microsoft Entra ID (PKCE, Device Code, or token)\n",
-    "  logout           Remove stored credentials\n",
-    "  whoami           Show signed-in user profile, token expiry, and scopes\n",
-    "  doctor           Inspect config/DB/keyring paths, scopes, and connectivity\n",
-    "  notebooks        List OneNote notebooks\n",
-    "  create-notebook  Create a new OneNote notebook\n",
-    "  sections         List OneNote sections\n",
-    "  create-section   Create a new OneNote section\n",
-    "  pages            List pages in a section\n",
-    "  read             Read a OneNote page (md, plain, blocks, xhtml)\n",
-    "  create           Create a new OneNote page from Markdown + images\n",
-    "  append           Append Markdown + images to a OneNote page\n",
-    "  update           Update a OneNote page/block (or self-update with --check)\n",
-    "  check            Toggle a OneNote to-do checkbox block\n",
-    "  delete           Delete a OneNote page\n",
-    "  search           Search cached OneNote pages (SQLite FTS5)\n",
-    "  resource         Download or preview an embedded page image/attachment\n",
-    "  sync             Sync OneNote hierarchy and pages to SQLite cache\n",
-    "  daemon           Manage the background sync daemon (start|status|stop|restart)\n",
-    "  tui              Launch the interactive OneNote TUI (default)\n",
-    "  serve            Start the local HTTP JSON API server (default :8788)\n",
-    "  mcp              Start the stdio MCP (JSON-RPC 2.0) server\n",
-    "  self-update      Check GitHub Releases and self-update\n\n",
-    "Options:\n",
-    "  -h, --help       Print help\n",
-    "  -V, --version    Print version\n"
-);
-
 /// Fast-path for `--version` / `-V` / `--help` / `-h` before Tokio runtime spin-up (<1ms).
 pub fn try_fast_help_or_version() -> Option<Result<()>> {
     let mut args = std::env::args_os();
@@ -389,11 +433,7 @@ pub fn try_fast_help_or_version() -> Option<Result<()>> {
             let res = writeln!(out, "onenote {}", env!("CARGO_PKG_VERSION"));
             Some(res.map_err(Into::into))
         }
-        "-h" | "--help" => {
-            let mut out = io::stdout().lock();
-            let res = out.write_all(FAST_HELP_TEXT.as_bytes());
-            Some(res.map_err(Into::into))
-        }
+        "-h" | "--help" => Some(Cli::command().print_long_help().map_err(Into::into)),
         _ => None,
     }
 }
@@ -446,6 +486,21 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             site,
             json,
         }) => cmd_create_notebook(cfg, &name, group.as_deref(), site.as_deref(), json).await,
+        Some(Command::RenameNotebook {
+            drive_id,
+            item_id,
+            name,
+            json,
+        }) => {
+            let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
+            let item = graph.rename_notebook_storage(&drive_id, &item_id, &name).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&json!({ "ok": true, "drive_item": item }))?);
+            } else {
+                println!("Notebook storage item '{}' is named '{}'.", item.item_id, item.name);
+            }
+            Ok(())
+        }
         Some(Command::Sections {
             notebook,
             refresh,
@@ -458,6 +513,33 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             name,
             json,
         }) => cmd_create_section(cfg, &notebook, &name, json).await,
+        Some(Command::RenameSection {
+            section,
+            name,
+            json,
+        }) => {
+            cmd_rename_section(cfg, &section, &name, json).await
+        }
+        #[cfg(windows)]
+        Some(Command::DesktopSetPageLevel { page_id, level, json }) => {
+            let result = crate::desktop::set_page_level(&page_id, level).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("OneNote desktop page '{page_id}' is at level {level}.");
+            }
+            Ok(())
+        }
+        #[cfg(windows)]
+        Some(Command::DesktopRenameSection { section_id, name, json }) => {
+            let result = crate::desktop::rename_section(&section_id, &name).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("OneNote desktop section '{section_id}' is named '{}'.", name.trim());
+            }
+            Ok(())
+        }
         Some(Command::Pages {
             section,
             limit,
@@ -473,7 +555,20 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             offline,
             cached,
             json,
-        }) => cmd_read(cfg, &page, &format, preview_images, offline, cached, json).await,
+            compact,
+        }) => {
+            cmd_read(
+                cfg,
+                &page,
+                &format,
+                preview_images,
+                offline,
+                cached,
+                json,
+                compact,
+            )
+            .await
+        }
         Some(Command::Create {
             section,
             title,
@@ -495,6 +590,37 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             )
             .await
         }
+        Some(Command::CopyPage {
+            page,
+            section,
+            operation,
+            wait_seconds,
+            json,
+        }) => {
+            let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
+            let outcome = graph
+                .copy_onenote_page(&page, &section, operation.as_deref(), wait_seconds)
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            }
+            if !outcome.ok {
+                let detail = outcome.error.as_deref().unwrap_or("Graph has not confirmed completion");
+                bail!(
+                    "Copy {:?} ({}): {detail}. Check the existing operation with --operation '{}'.",
+                    outcome.status, outcome.operation_id, outcome.operation_url
+                );
+            }
+            if !json {
+                println!(
+                    "Copied {} to {} as {}",
+                    outcome.source_page_key,
+                    outcome.destination_section_key,
+                    outcome.new_page_key.as_deref().unwrap_or_default(),
+                );
+            }
+            Ok(())
+        }
         Some(Command::Append {
             page,
             markdown_body,
@@ -508,7 +634,6 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
                 markdown_body.as_deref(),
                 file.as_deref(),
                 &image,
-                &image,
                 json,
             )
             .await
@@ -519,6 +644,8 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             body,
             file,
             block_id,
+            replace_text,
+            with_text,
             expected_content,
             check,
             force,
@@ -533,6 +660,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
                     body.as_deref(),
                     file.as_deref(),
                     block_id.as_deref(),
+                    replace_text.as_deref().zip(with_text.as_deref()),
                     expected_content.as_deref(),
                     force,
                     json,
@@ -552,6 +680,8 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             page,
             block_id,
             index,
+            done,
+            undone,
             expected_content,
             force,
             json,
@@ -561,6 +691,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
                 &page,
                 block_id.as_deref(),
                 index,
+                (done || undone).then_some(done),
                 expected_content.as_deref(),
                 force,
                 json,
@@ -1109,6 +1240,18 @@ pub async fn create_onenote_page_helper(
     Ok((sec, created))
 }
 
+pub async fn rename_onenote_section_helper(
+    storage: &Storage,
+    graph: &GraphClient,
+    section_key: &str,
+    name: &str,
+) -> Result<OnenoteSection> {
+    let (scope, id) = split_onenote_entity_key(section_key.trim());
+    let section = graph.rename_onenote_section(&scope, &id, name).await?;
+    storage.upsert_onenote_sections(std::slice::from_ref(&section))?;
+    Ok(section)
+}
+
 pub async fn append_onenote_page_helper(
     storage: &Storage,
     graph: &GraphClient,
@@ -1209,13 +1352,40 @@ pub async fn update_onenote_page_helper_with_guard(
     expected_content: Option<&str>,
     force: bool,
 ) -> Result<OnenotePageDetail> {
-    match update_onenote_page_guarded(
+    update_onenote_content_helper_with_guard(
         storage,
         graph,
         page_query,
         title,
         body_markdown,
         block_id,
+        None,
+        expected_content,
+        force,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_onenote_content_helper_with_guard(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    title: Option<&str>,
+    body_markdown: Option<&str>,
+    block_id: Option<&str>,
+    replace_text: Option<(&str, &str)>,
+    expected_content: Option<&str>,
+    force: bool,
+) -> Result<OnenotePageDetail> {
+    match update_onenote_content_guarded(
+        storage,
+        graph,
+        page_query,
+        title,
+        body_markdown,
+        block_id,
+        replace_text,
         expected_content,
         force,
     )
@@ -1241,11 +1411,47 @@ pub async fn update_onenote_page_guarded(
     expected_content: Option<&str>,
     force: bool,
 ) -> Result<GuardedUpdateResult> {
-    let cached_before = load_cached_detail_for_query(storage, page_query);
-    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
-    let mut commands = Vec::new();
+    update_onenote_content_guarded(
+        storage,
+        graph,
+        page_query,
+        title,
+        body_markdown,
+        block_id,
+        None,
+        expected_content,
+        force,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_onenote_content_guarded(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    title: Option<&str>,
+    body_markdown: Option<&str>,
+    block_id: Option<&str>,
+    replace_text: Option<(&str, &str)>,
+    expected_content: Option<&str>,
+    force: bool,
+) -> Result<GuardedUpdateResult> {
     let trimmed_bid = block_id.map(str::trim).filter(|s| !s.is_empty());
     let trimmed_title = title.map(str::trim).filter(|s| !s.is_empty());
+    if replace_text.is_some() && (trimmed_bid.is_none() || body_markdown.is_some()) {
+        bail!("Provide a block ID and either Markdown or a text replacement.");
+    }
+    if trimmed_bid.is_some() && body_markdown.is_none() && replace_text.is_none() {
+        bail!("A block update requires Markdown or a text replacement.");
+    }
+    if trimmed_title.is_none() && body_markdown.is_none() && replace_text.is_none() {
+        bail!(
+            "Specify --title, --body, --file, or --block-id with --replace-text and --with-text."
+        );
+    }
+    let cached_before = load_cached_detail_for_query(storage, page_query);
+    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
 
     if !force {
         if let Some(bid) = trimmed_bid {
@@ -1331,31 +1537,32 @@ pub async fn update_onenote_page_guarded(
         }
     }
 
-    if let Some(bid) = trimmed_bid {
-        let md = body_markdown
-            .ok_or_else(|| anyhow::anyhow!("--body (or markdown) is required when updating a block."))?;
-        if let Some(new_title) = trimmed_title {
-            commands.push(crate::models::OnenotePatchCommand {
-                target: "title".to_string(),
-                action: "replace".to_string(),
-                position: None,
-                content: new_title.to_string(),
-            });
+    let commands = if let Some(bid) = trimmed_bid {
+        let mut commands: Vec<_> = trimmed_title
+            .and_then(|title| parser::onenote::build_replace_title_patch(&detail, title))
+            .into_iter()
+            .collect();
+        if let Some((from, to)) = replace_text {
+            commands.extend(parser::onenote::build_replace_block_text_patch(
+                &detail, bid, from, to,
+            )?);
+        } else if let Some(md) = body_markdown {
+            commands.push(parser::onenote::build_checked_block_replacement(
+                &detail, bid, md,
+            )?);
         }
-        commands.push(parser::build_replace_block_patch(bid, md));
+        commands
     } else if let Some(md) = body_markdown {
-        commands.extend(parser::build_replace_page_body_commands(&detail, trimmed_title, md));
-    } else if let Some(new_title) = trimmed_title {
-        commands.push(crate::models::OnenotePatchCommand {
-            target: "title".to_string(),
-            action: "replace".to_string(),
-            position: None,
-            content: new_title.to_string(),
-        });
-    }
+        parser::build_replace_page_body_commands(&detail, trimmed_title, md)?
+    } else {
+        trimmed_title
+            .and_then(|title| parser::onenote::build_replace_title_patch(&detail, title))
+            .into_iter()
+            .collect()
+    };
 
     if commands.is_empty() {
-        bail!("Specify --block-id with --body, or --title / --body to update.");
+        return Ok(GuardedUpdateResult::Updated(detail));
     }
 
     graph
@@ -1400,12 +1607,37 @@ pub async fn toggle_onenote_todo_helper_with_guard(
     expected_content: Option<&str>,
     force: bool,
 ) -> Result<(OnenotePageDetail, String, bool)> {
-    match toggle_onenote_todo_guarded(
+    change_onenote_todo_helper_with_guard(
         storage,
         graph,
         page_query,
         block_id,
         todo_index,
+        None,
+        expected_content,
+        force,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn change_onenote_todo_helper_with_guard(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    block_id: Option<&str>,
+    todo_index: Option<usize>,
+    completed: Option<bool>,
+    expected_content: Option<&str>,
+    force: bool,
+) -> Result<(OnenotePageDetail, String, bool)> {
+    match change_onenote_todo_guarded(
+        storage,
+        graph,
+        page_query,
+        block_id,
+        todo_index,
+        completed,
         expected_content,
         force,
     )
@@ -1426,6 +1658,30 @@ pub async fn toggle_onenote_todo_guarded(
     page_query: &str,
     block_id: Option<&str>,
     todo_index: Option<usize>,
+    expected_content: Option<&str>,
+    force: bool,
+) -> Result<GuardedTodoResult> {
+    change_onenote_todo_guarded(
+        storage,
+        graph,
+        page_query,
+        block_id,
+        todo_index,
+        None,
+        expected_content,
+        force,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn change_onenote_todo_guarded(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    block_id: Option<&str>,
+    todo_index: Option<usize>,
+    requested_completed: Option<bool>,
     expected_content: Option<&str>,
     force: bool,
 ) -> Result<GuardedTodoResult> {
@@ -1494,8 +1750,23 @@ pub async fn toggle_onenote_todo_guarded(
         }
     }
 
-    let (cmd, completed) = parser::build_toggle_todo_patch(target_block)
-        .context("Selected block is not a OneNote to-do item or lacks an element_id.")?;
+    let Some(OnenoteTagKind::Todo { completed: current }) = target_block.tag else {
+        bail!("Selected block is not a OneNote to-do item.");
+    };
+    let completed = requested_completed.unwrap_or(!current);
+    if completed == current {
+        let block_id = target_block
+            .element_id
+            .clone()
+            .context("Selected to-do item lacks an element_id.")?;
+        return Ok(GuardedTodoResult::Updated {
+            detail,
+            block_id,
+            completed,
+        });
+    }
+    let cmd = parser::onenote::build_todo_state_patch(target_block, completed)
+        .context("Selected to-do item lacks an element_id.")?;
     let target_id = cmd.target.clone();
     graph
         .patch_onenote_page_commands(&detail.summary.scope, &detail.summary.id, &[cmd])
@@ -1954,6 +2225,29 @@ async fn cmd_create_section(
     Ok(())
 }
 
+async fn cmd_rename_section(
+    cfg: &AppConfig,
+    section_id: &str,
+    name: &str,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let section = rename_onenote_section_helper(&storage, &graph, section_id, name).await?;
+    nudge_live_daemon(cfg, &graph, sync::SyncCommand::RefreshHierarchy).await;
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": true, "section": section }))?
+        );
+    } else {
+        println!(
+            "Renamed section to '{}' ({})",
+            section.display_name, section.section_key
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_pages(
     cfg: &AppConfig,
     section_query: &str,
@@ -1991,6 +2285,20 @@ async fn cmd_pages(
     Ok(())
 }
 
+pub(crate) fn page_content_json(detail: &OnenotePageDetail, compact: bool) -> serde_json::Value {
+    if compact {
+        json!({
+            "id": detail.summary.id,
+            "title": detail.summary.title,
+            "last_modified_at": detail.summary.last_modified_at,
+            "body_markdown": detail.body_markdown,
+        })
+    } else {
+        json!(detail)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cmd_read(
     cfg: &AppConfig,
     page: &str,
@@ -1999,11 +2307,16 @@ async fn cmd_read(
     offline: bool,
     cached: bool,
     json_out: bool,
+    compact: bool,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, offline).await?;
     let detail = load_onenote_page_detail_with_cache(&storage, &graph, page, offline, cached).await?;
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "page": detail }))?);
+        let page = page_content_json(&detail, compact);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "page": page }))?
+        );
         return Ok(());
     }
 
@@ -2062,6 +2375,7 @@ async fn cmd_create(
     level: Option<i32>,
     json_out: bool,
 ) -> Result<()> {
+    crate::graph::onenote::validate_page_creation_level(level)?;
     let body = resolve_markdown_input(markdown_body, file)?;
     let inline_images = load_inline_images_from_paths(images)?;
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
@@ -2090,14 +2404,12 @@ async fn cmd_create(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn cmd_append(
     cfg: &AppConfig,
     page: &str,
     markdown_body: Option<&str>,
     file: Option<&Path>,
     images: &[PathBuf],
-    _unused: &[PathBuf],
     json_out: bool,
 ) -> Result<()> {
     let body = resolve_markdown_input(markdown_body, file)?;
@@ -2145,6 +2457,7 @@ async fn cmd_update_page(
     body: Option<&str>,
     file: Option<&Path>,
     block_id: Option<&str>,
+    replace_text: Option<(&str, &str)>,
     expected_content: Option<&str>,
     force: bool,
     json_out: bool,
@@ -2158,13 +2471,14 @@ async fn cmd_update_page(
         (None, None) => None,
     };
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let updated = update_onenote_page_helper_with_guard(
+    let updated = update_onenote_content_helper_with_guard(
         &storage,
         &graph,
         page,
         title,
         loaded_body.as_deref(),
         block_id,
+        replace_text,
         expected_content,
         force,
     )
@@ -2206,17 +2520,19 @@ async fn cmd_check(
     page: &str,
     block_id: Option<&str>,
     index: Option<usize>,
+    completed: Option<bool>,
     expected_content: Option<&str>,
     force: bool,
     json_out: bool,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let (updated, target_id, completed) = toggle_onenote_todo_helper_with_guard(
+    let (updated, target_id, completed) = change_onenote_todo_helper_with_guard(
         &storage,
         &graph,
         page,
         block_id,
         index,
+        completed,
         expected_content,
         force,
     )

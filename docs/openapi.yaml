@@ -132,7 +132,7 @@ paths:
         '200':
           description: Page summaries
     post:
-      summary: Create a OneNote page from Markdown
+      summary: Create a top-level OneNote page from Markdown
       security:
         - bearerAuth: []
       requestBody:
@@ -146,13 +146,15 @@ paths:
                 section: { type: string }
                 title: { type: string }
                 markdown: { type: string }
-                level: { type: integer, minimum: 0, maximum: 2, default: 0 }
-                images:
+                level: { type: integer, minimum: 0, maximum: 0, default: 0 }
+                image_paths:
                   type: array
                   items: { type: string }
       responses:
-        '201':
+        '200':
           description: Created page summary
+        '400':
+          description: Invalid input, including a nonzero page level
   /v1/onenote/pages/{page}:
     get:
       summary: Read a OneNote page detail (blocks, Markdown, resources)

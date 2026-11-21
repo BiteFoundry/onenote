@@ -17,7 +17,6 @@ pub enum ButtonId {
     OnenoteNewNotebook,
     OnenoteNewSection,
     OnenoteNewPage,
-    OnenoteNewSubpage,
     OnenoteAppend,
     OnenoteEditBlock,
     OnenoteToggleTodo,

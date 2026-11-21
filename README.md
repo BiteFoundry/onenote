@@ -6,12 +6,12 @@
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fonenote?style=flat-square&color=7719AA&label=npm)](https://www.npmjs.com/package/@bitefoundry/onenote)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-2b3137?style=flat-square)](docs/NPM.md)
-[![Built with Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-dea584?style=flat-square)](Cargo.toml)
+[![Built with Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-dea584?style=flat-square)](https://github.com/BiteFoundry/onenote/blob/master/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](package.json)
 
 <br />
 
-![Microsoft OneNote TUI Demo](assets/demo.gif)
+![Microsoft OneNote TUI Demo](https://raw.githubusercontent.com/BiteFoundry/onenote/master/assets/demo.gif)
 
 </div>
 
@@ -24,7 +24,7 @@
 | **Minimal-Chrome 3-Pane TUI** | Personal, Teams/Group & SharePoint notebooks, colored section ribbon, nested subpages (`level 0/1/2`), bidirectional XHTML ↔ Markdown canvas, surgical `data-id` `PATCH` edits, `0ms` optimistic to-do toggles, Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), and 6 themes. |
 | **High-Res Terminal Images** | Inline thumbnails & fullscreen HD previews (`v` / `Alt+v`) with 80ms protocol probing for **Kitty**, **iTerm2**, **Sixel** (Floyd-Steinberg dithering), and **24-bit Unicode Half-Blocks** + `Ctrl+V` clipboard PNG upload. |
 | **Local SQLite FTS5 + IPC Daemon** | WAL-mode SQLite cache with 4-reader pool, trigram full-text search (`/`), persistent `DraftStore`, and a shared background sync daemon (`onenote daemon start`). |
-| **4-in-1 Agent Interface** | Interactive **TUI** (`onenote` / `note`), scriptable `--json` **CLI**, local **HTTP JSON API** (`onenote serve`, port `8788`), and stdio **MCP Server** (`onenote mcp`, 14 tools). |
+| **4-in-1 Agent Interface** | Interactive **TUI** (`onenote` / `note`), scriptable `--json` **CLI**, local **HTTP JSON API** (`onenote serve`, port `8788`), and stdio **MCP Server** (`onenote mcp`). |
 
 ---
 
@@ -53,7 +53,7 @@ onenote
 | `Tab` / `Shift+Tab` | Cycle focus (Notebooks → Pages → Note Canvas) |
 | `j` / `k` · `↑` / `↓` | Navigate notebooks, pages, subpages, or blocks |
 | `[` / `]` | Switch to previous / next section tab |
-| `n` / `N` | Create new page / subpage (Markdown + `Ctrl+V` PNG) |
+| `n` | Create a page (Markdown + `Ctrl+V` PNG) |
 | `a` / `e` | Append Markdown block / surgically edit selected block |
 | `Space` / `x` | Toggle selected To-Do checkbox (`data-tag="to-do:completed"`) |
 | `B` / `S` / `D` | Create notebook / create section / delete page |
@@ -69,16 +69,27 @@ onenote
 
 ## CLI, HTTP API & MCP
 
-### CLI (`--json` on every command)
+### CLI
 
 ```sh
 onenote notebooks --json
 onenote pages "Acme Engineering/Architecture" --json
+onenote rename-section 'me|SECTION_ID' --name 'Architecture Notes' --json
+onenote rename-notebook --drive-id DRIVE_ID --item-id ITEM_ID --name 'Engineering Notes' --json
 onenote read "Q4 Architecture RFC" --json
-onenote create "Architecture" "Release Notes" --body "## Shipped\n- [x] WAL pool" --json
-onenote check "Migration Cutover" "p:m3" --done --json
+onenote read "Q4 Architecture RFC" --json --compact
+onenote copy-page 'me|PAGE_ID' --section 'me|SECTION_ID' --json
+onenote create "Architecture" --title "Release Notes" '## Shipped
+- [x] WAL pool' --json
+onenote check "Migration Cutover" --block-id 'p:m3' --done --json
 onenote search "canary" --json
 ```
+
+Use `onenote read PAGE --format blocks` to find a checkbox or text block's current element ID. Use `--done` or `--undone` to set a checkbox state. Omit both flags to toggle it.
+
+`copy-page` uses Microsoft Graph to create a new page in the destination section and preserves the original page and its links. If the copy is still pending, pass its `operation_url` with `--operation` to check the same copy. [Copy a page](docs/API.md#copy-a-page)
+
+On Windows, `desktop-set-page-level` and `desktop-rename-section` work on existing objects in an open notebook. Use the OneNote app's **Move** command to move a page between sections. [Hierarchy operations and permissions](docs/API.md#hierarchy-operations)
 
 ### Local HTTP API (`onenote serve`)
 
@@ -95,7 +106,7 @@ Full route reference & OpenAPI 3.1 spec: [docs/API.md](docs/API.md) · [docs/ope
 
 ### Model Context Protocol (`onenote mcp`)
 
-Add to Claude Desktop, Claude Code, Cursor, or Codex (`14` tools over stdio JSON-RPC 2.0):
+Add to Claude Desktop, Claude Code, Cursor, or Codex over stdio JSON-RPC 2.0.
 
 ```json
 {
@@ -116,11 +127,11 @@ Full tool catalog & schemas: [docs/MCP.md](docs/MCP.md).
 
 | Package | Commands | Workspace Coverage |
 | --- | --- | --- |
-| [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams`, `tm` | Microsoft Teams chats, channels, threads & meetings |
-| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook`, `mail`, `cal` | Microsoft Outlook mail, calendar & contacts |
+| [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams` | Microsoft Teams chats, channels, threads & meetings |
+| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook` | Microsoft Outlook mail, calendar & contacts |
 | **`@bitefoundry/onenote`** | `onenote`, `note` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
 | [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `sp`, `onedrive`, `od` | Microsoft SharePoint sites, document libraries & OneDrive files |
-| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence` | Atlassian Jira issues, boards, sprints & Confluence pages |
+| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira issues, boards, sprints & Confluence pages |
 | [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion`, `nt` | Notion pages, databases, blocks & Markdown sync |
 
 ---

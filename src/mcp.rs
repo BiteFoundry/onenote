@@ -1,8 +1,8 @@
 //! Standalone Microsoft OneNote stdio MCP (Model Context Protocol, JSON-RPC 2.0) server (`onenote mcp`).
 //!
-//! Exposes 14 tools (whoami + 13 OneNote tools):
+//! Exposes these tools:
 //! `whoami`, `list_notebooks`, `list_sections`, `list_pages`, `get_page`,
-//! `create_notebook`, `create_section`, `create_page`, `append_page`, `update_block`,
+//! `create_notebook`, `create_section`, `rename_section`, `create_page`, `copy_page`, `append_page`, `update_block`, `update_page`,
 //! `toggle_todo`, `delete_page`, `search_pages`, `download_resource`.
 
 use std::{
@@ -10,10 +10,19 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::{cli, config::AppConfig, graph::GraphClient, resolver, storage::Storage};
+use crate::{
+    cli,
+    config::AppConfig,
+    graph::{
+        copy::{DEFAULT_COPY_WAIT_SECONDS, MAX_COPY_WAIT_SECONDS},
+        GraphClient,
+    },
+    resolver,
+    storage::Storage,
+};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -102,6 +111,7 @@ pub async fn handle_request_value(
                 .unwrap_or_else(|| json!({}));
             match dispatch_tool(config, graph, storage, tool_name, &args).await {
                 Ok(result_val) => {
+                    let is_error = tool_name == "copy_page" && result_val["ok"] == false;
                     let text = serde_json::to_string_pretty(&result_val)
                         .unwrap_or_else(|_| result_val.to_string());
                     Some(json!({
@@ -110,7 +120,7 @@ pub async fn handle_request_value(
                         "result": {
                             "content": [{ "type": "text", "text": text }],
                             "structuredContent": result_val,
-                            "isError": false,
+                            "isError": is_error,
                         }
                     }))
                 }
@@ -136,6 +146,27 @@ pub async fn handle_request_value(
 }
 
 pub fn tool_definitions() -> Vec<Value> {
+    let update_block = json!({
+        "name": "update_block",
+        "description": "Replace a block with Markdown, edit a block text substring, or update the page title/body. Get current Graph element IDs and baseline content from get_page.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["page"],
+            "properties": {
+                "page": { "type": "string" },
+                "block_id": { "type": "string", "description": "Graph element ID from get_page (e.g. `p:{...}`)" },
+                "title": { "type": "string" },
+                "markdown": { "type": "string" },
+                "replace_text": { "type": "string", "description": "Exact text to replace in block_id; provide with_text and omit markdown" },
+                "with_text": { "type": "string", "description": "New text for replace_text" },
+                "expected_content": { "type": "string", "description": "Baseline block/page content from prior read; aborts with conflict if remote changed" },
+                "force": { "type": "boolean", "description": "Override conflict check when true" }
+            }
+        }
+    });
+    let mut update_page = update_block.clone();
+    update_page["name"] = json!("update_page");
+    update_page["description"] = json!("Alias for update_block. Update a page title or body, replace a block, or edit text within a block.");
     vec![
         json!({
             "name": "whoami",
@@ -188,7 +219,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string", "description": "Page key, ID, or title" },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean" },
+                    "compact": { "type": "boolean", "description": "Return ID, title, modification time and Markdown" }
                 }
             }
         }),
@@ -206,6 +238,19 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "rename_notebook",
+            "description": "Rename an existing OneDrive or SharePoint OneNote package by explicit storage IDs. Supply a token with file write permission. The returned ID is the drive item's ID.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["drive_id", "item_id", "name"],
+                "properties": {
+                    "drive_id": { "type": "string" },
+                    "item_id": { "type": "string", "description": "DriveItem ID with package.type oneNote" },
+                    "name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
             "name": "create_section",
             "description": "Create a new OneNote section inside a notebook.",
             "inputSchema": {
@@ -213,6 +258,44 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["notebook", "name"],
                 "properties": {
                     "notebook": { "type": "string" },
+                    "name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "rename_section",
+            "description": "Rename an existing section under /me/onenote and verify its ID and parent after the write.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["section", "name"],
+                "properties": {
+                    "section": { "type": "string", "description": "Section ID or me|ID from list_sections" },
+                    "name": { "type": "string", "description": "New section display name" }
+                }
+            }
+        }),
+        #[cfg(windows)]
+        json!({
+            "name": "desktop_set_page_level",
+            "description": "Set the indentation of an existing page in OneNote for Windows using its full desktop ID. The notebook must be open in the desktop app.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["page_id", "level"],
+                "properties": {
+                    "page_id": { "type": "string", "description": "Full Page ID from desktop GetHierarchy" },
+                    "level": { "type": "integer", "minimum": 0, "maximum": 2 }
+                }
+            }
+        }),
+        #[cfg(windows)]
+        json!({
+            "name": "desktop_rename_section",
+            "description": "Rename an existing section in OneNote for Windows using its full desktop ID. The notebook must be open in the desktop app.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["section_id", "name"],
+                "properties": {
+                    "section_id": { "type": "string", "description": "Full Section ID from desktop GetHierarchy" },
                     "name": { "type": "string" }
                 }
             }
@@ -228,7 +311,21 @@ pub fn tool_definitions() -> Vec<Value> {
                     "title": { "type": "string" },
                     "markdown": { "type": "string" },
                     "image_paths": { "type": "array", "items": { "type": "string" } },
-                    "level": { "type": "integer", "minimum": 0, "maximum": 2 }
+                    "level": { "type": "integer", "minimum": 0, "maximum": 0, "description": "Top-level page (0 or omitted)" }
+                }
+            }
+        }),
+        json!({
+            "name": "copy_page",
+            "description": "Copy a page via Microsoft Graph and verify its new ID and section. The original page and its links stay in place. To check a pending or interrupted copy, pass its operation_url with the original page and section.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["page", "section"],
+                "properties": {
+                    "page": { "type": "string", "description": "Source page ID or scoped page key" },
+                    "section": { "type": "string", "description": "Destination section ID or scoped section key" },
+                    "operation_url": { "type": "string", "description": "Existing Graph operation URL to poll instead of submitting a new copy" },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": MAX_COPY_WAIT_SECONDS, "default": DEFAULT_COPY_WAIT_SECONDS, "description": "Seconds to poll; 0 returns the operation handle immediately" }
                 }
             }
         }),
@@ -245,25 +342,11 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-        json!({
-            "name": "update_block",
-            "description": "Surgically update a specific block (`block_id`) or replace page title/body on a OneNote page. Pass `expected_content` from a prior `get_page` read to guard against overwriting concurrent remote edits.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["page"],
-                "properties": {
-                    "page": { "type": "string" },
-                    "block_id": { "type": "string", "description": "Graph element ID from get_page (e.g. `p:{...}`)" },
-                    "title": { "type": "string" },
-                    "markdown": { "type": "string" },
-                    "expected_content": { "type": "string", "description": "Baseline block/page content from prior read; aborts with conflict if remote changed" },
-                    "force": { "type": "boolean", "description": "Override conflict check when true" }
-                }
-            }
-        }),
+        update_block,
+        update_page,
         json!({
             "name": "toggle_todo",
-            "description": "Toggle a OneNote `to-do` checkbox block by `block_id` or zero-based `todo_index`.",
+            "description": "Set or toggle a OneNote checkbox by block_id or zero-based todo_index.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -271,6 +354,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "page": { "type": "string" },
                     "block_id": { "type": "string" },
                     "todo_index": { "type": "integer", "minimum": 0 },
+                    "completed": { "type": "boolean", "description": "Set this state; omit to toggle" },
                     "expected_content": { "type": "string", "description": "Baseline to-do block content from prior read; aborts with conflict if remote changed" },
                     "force": { "type": "boolean", "description": "Override conflict check when true" }
                 }
@@ -364,7 +448,11 @@ async fn dispatch_tool(
             let page = required_str(args, "page")?;
             let offline = args.get("offline").and_then(Value::as_bool).unwrap_or(false);
             let detail = cli::load_onenote_page_detail(storage, graph, page, offline).await?;
-            Ok(json!({ "ok": true, "page": detail }))
+            let compact = args
+                .get("compact")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Ok(json!({ "ok": true, "page": cli::page_content_json(&detail, compact) }))
         }
         "create_notebook" | "onenote_create_notebook" => {
             let nb_name = required_str(args, "name")?;
@@ -374,6 +462,13 @@ async fn dispatch_tool(
             let created = graph.create_onenote_notebook(&scope, nb_name).await?;
             storage.upsert_onenote_notebooks(std::slice::from_ref(&created))?;
             Ok(json!({ "ok": true, "notebook": created }))
+        }
+        "rename_notebook" => {
+            let drive = required_str(args, "drive_id")?;
+            let item = required_str(args, "item_id")?;
+            let name = required_str(args, "name")?;
+            let updated = graph.rename_notebook_storage(drive, item, name).await?;
+            Ok(json!({ "ok": true, "drive_item": updated }))
         }
         "create_section" | "onenote_create_section" => {
             let notebook = required_str(args, "notebook")?;
@@ -385,11 +480,39 @@ async fn dispatch_tool(
             storage.upsert_onenote_sections(std::slice::from_ref(&created))?;
             Ok(json!({ "ok": true, "notebook": nb, "section": created }))
         }
+        "rename_section" => {
+            let section_id = required_str(args, "section")?;
+            let name = required_str(args, "name")?;
+            let section = cli::rename_onenote_section_helper(storage, graph, section_id, name).await?;
+            cli::nudge_live_daemon(config, graph, crate::sync::SyncCommand::RefreshHierarchy).await;
+            Ok(json!({ "ok": true, "section": section }))
+        }
+        #[cfg(windows)]
+        "desktop_set_page_level" => {
+            let page_id = required_str(args, "page_id")?;
+            let level = args.get("level").and_then(Value::as_i64).context("level must be an integer")?;
+            crate::desktop::set_page_level(page_id, level).await
+        }
+        #[cfg(windows)]
+        "desktop_rename_section" => {
+            let section_id = required_str(args, "section_id")?;
+            let name = required_str(args, "name")?;
+            crate::desktop::rename_section(section_id, name).await
+        }
         "create_page" | "onenote_create_page" => {
             let section = required_str(args, "section")?;
             let title = required_str(args, "title")?;
             let markdown = args.get("markdown").and_then(Value::as_str).unwrap_or("");
-            let level = args.get("level").and_then(Value::as_i64).map(|v| v as i32);
+            let level = args
+                .get("level")
+                .map(|value| {
+                    value
+                        .as_i64()
+                        .and_then(|n| i32::try_from(n).ok())
+                        .context("level must be the integer 0 when supplied")
+                })
+                .transpose()?;
+            crate::graph::onenote::validate_page_creation_level(level)?;
             let paths = string_array(args, "image_paths")
                 .into_iter()
                 .map(PathBuf::from)
@@ -406,6 +529,24 @@ async fn dispatch_tool(
             )
             .await?;
             Ok(json!({ "ok": true, "section": sec, "page": page }))
+        }
+        "copy_page" => {
+            let page = required_str(args, "page")?;
+            let section = required_str(args, "section")?;
+            let operation_url = args
+                .get("operation_url")
+                .map(|value| value.as_str().context("operation_url must be a string"))
+                .transpose()?;
+            let wait = args
+                .get("wait_seconds")
+                .map(|value| {
+                    value.as_u64().and_then(|n| u32::try_from(n).ok())
+                        .context("wait_seconds must be a non-negative integer")
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_COPY_WAIT_SECONDS);
+            let outcome = graph.copy_onenote_page(page, section, operation_url, wait).await?;
+            Ok(serde_json::to_value(outcome)?)
         }
         "append_page" | "onenote_append_page" => {
             let page = required_str(args, "page")?;
@@ -428,18 +569,27 @@ async fn dispatch_tool(
                 .get("markdown")
                 .or_else(|| args.get("body"))
                 .and_then(Value::as_str);
+            let text_edit = match (args.get("replace_text"), args.get("with_text")) {
+                (None, None) => None,
+                (Some(from), Some(to)) => Some((
+                    from.as_str().context("replace_text must be a string")?,
+                    to.as_str().context("with_text must be a string")?,
+                )),
+                _ => bail!("Provide both replace_text and with_text."),
+            };
             let expected_content = args
                 .get("expected_content")
                 .or_else(|| args.get("base_content"))
                 .and_then(Value::as_str);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-            let updated = cli::update_onenote_page_helper_with_guard(
+            let updated = cli::update_onenote_content_helper_with_guard(
                 storage,
                 graph,
                 page,
                 title,
                 markdown,
                 block_id,
+                text_edit,
                 expected_content,
                 force,
             )
@@ -467,12 +617,17 @@ async fn dispatch_tool(
                 .or_else(|| args.get("base_content"))
                 .and_then(Value::as_str);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-            let (updated, target_id, completed) = cli::toggle_onenote_todo_helper_with_guard(
+            let requested_completed = args
+                .get("completed")
+                .map(|value| value.as_bool().context("completed must be a boolean"))
+                .transpose()?;
+            let (updated, target_id, completed) = cli::change_onenote_todo_helper_with_guard(
                 storage,
                 graph,
                 page,
                 block_id,
                 todo_index,
+                requested_completed,
                 expected_content,
                 force,
             )

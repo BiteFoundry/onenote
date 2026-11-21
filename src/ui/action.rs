@@ -1146,9 +1146,6 @@ fn handle_mouse_click(
                 ButtonId::OnenoteNewPage => {
                     dispatch(Action::OpenOnenoteCreatePage { level: 0 }, app, ui)
                 }
-                ButtonId::OnenoteNewSubpage => {
-                    dispatch(Action::OpenOnenoteCreatePage { level: 1 }, app, ui)
-                }
                 ButtonId::OnenoteAppend => dispatch(Action::OpenOnenoteAppend, app, ui),
                 ButtonId::OnenoteEditBlock => dispatch(Action::OpenOnenoteEditBlock, app, ui),
                 ButtonId::OnenoteToggleTodo => dispatch(Action::OnenoteToggleTodo(None), app, ui),
@@ -1284,7 +1281,6 @@ mod tests {
             ButtonId::OnenoteNewNotebook,
             ButtonId::OnenoteNewSection,
             ButtonId::OnenoteNewPage,
-            ButtonId::OnenoteNewSubpage,
             ButtonId::OnenoteAppend,
             ButtonId::OnenoteEditBlock,
             ButtonId::OnenoteToggleTodo,

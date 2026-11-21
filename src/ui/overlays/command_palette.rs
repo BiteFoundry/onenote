@@ -32,7 +32,6 @@ pub struct PaletteItem {
 fn palette_commands() -> Vec<PaletteItem> {
     let cmds = [
         ("New OneNote Page", "n", Action::OpenOnenoteCreatePage { level: 0 }),
-        ("New OneNote Subpage", "N", Action::OpenOnenoteCreatePage { level: 1 }),
         ("Append Markdown Block", "a", Action::OpenOnenoteAppend),
         ("Edit Selected Block", "e", Action::OpenOnenoteEditBlock),
         ("Toggle Selected To-Do Checkbox", "Space / x", Action::OnenoteToggleTodo(None)),

@@ -376,18 +376,82 @@ impl GraphClient {
         Ok(())
     }
 
+    pub(super) async fn start_operation(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<reqwest::header::HeaderMap> {
+        let url = self.resolve_url(path);
+        let (response, _request) = self
+            .execute(
+                Method::POST,
+                &url,
+                RequestBody::Json(body),
+                &[],
+                true,
+                STANDARD_REQUEST_TIMEOUT,
+                false,
+            )
+            .await?;
+        anyhow::ensure!(
+            response.status() == StatusCode::ACCEPTED,
+            "Expected Graph HTTP 202, received {}",
+            response.status()
+        );
+        Ok(response.headers().clone())
+    }
+
+    pub(super) async fn get_operation_json<T: DeserializeOwned>(
+        &self,
+        path_or_url: &str,
+    ) -> Result<(T, reqwest::header::HeaderMap)> {
+        let url = self.resolve_url(path_or_url);
+        let (response, _request) = self
+            .execute(
+                Method::GET,
+                &url,
+                RequestBody::Empty,
+                &[("Accept", "application/json".to_owned())],
+                true,
+                STANDARD_REQUEST_TIMEOUT,
+                false,
+            )
+            .await?;
+        anyhow::ensure!(
+            response.status() == StatusCode::OK,
+            "Expected Graph HTTP 200, received {}",
+            response.status()
+        );
+        let headers = response.headers().clone();
+        let data = response.json().await.context("Failed to read Graph JSON")?;
+        Ok((data, headers))
+    }
+
     pub async fn patch_json<B: Serialize + ?Sized>(
         &self,
         path_or_url: &str,
         body: &B,
     ) -> Result<()> {
+        self.patch_json_with_etag(path_or_url, body, None).await
+    }
+
+    pub(crate) async fn patch_json_with_etag<B: Serialize + ?Sized>(
+        &self,
+        path_or_url: &str,
+        body: &B,
+        etag: Option<&str>,
+    ) -> Result<()> {
         let url = self.resolve_url(path_or_url);
         let json_val = serde_json::to_value(body)?;
+        let headers: Vec<_> = etag
+            .map(|value| ("If-Match", value.to_owned()))
+            .into_iter()
+            .collect();
         self.execute_with_retry(
             Method::PATCH,
             &url,
             RequestBody::Json(json_val),
-            &[],
+            &headers,
             true,
             STANDARD_REQUEST_TIMEOUT,
         )
@@ -717,13 +781,34 @@ impl GraphClient {
         use_bearer: bool,
         timeout: Duration,
     ) -> Result<(reqwest::Response, ActiveRequest<'_>)> {
+        self.execute(method, url, body, extra_headers, use_bearer, timeout, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute(
+        &self,
+        method: Method,
+        url: &str,
+        body: RequestBody,
+        extra_headers: &[(&str, String)],
+        use_bearer: bool,
+        timeout: Duration,
+        follow_redirects: bool,
+    ) -> Result<(reqwest::Response, ActiveRequest<'_>)> {
+        let http = if follow_redirects {
+            &self.http
+        } else {
+            &self.operation_http
+        };
+        let retry = follow_redirects || method == Method::GET;
         let mut unauthorized_retried = false;
         let mut throttle_attempt = 0usize;
         let mut transport_retried = false;
 
         loop {
             let mut token_used = None;
-            let mut req = self.http.request(method.clone(), url).timeout(timeout);
+            let mut req = http.request(method.clone(), url).timeout(timeout);
 
             if use_bearer {
                 let token = self.auth.valid_access_token().await?;
@@ -782,7 +867,7 @@ impl GraphClient {
             };
             let status = resp.status();
 
-            if status == StatusCode::UNAUTHORIZED && use_bearer && !unauthorized_retried {
+            if retry && status == StatusCode::UNAUTHORIZED && use_bearer && !unauthorized_retried {
                 unauthorized_retried = true;
                 if let Some(failed_tok) = token_used.as_deref() {
                     if self.auth.is_refreshable().await {
@@ -796,13 +881,15 @@ impl GraphClient {
                 }
             }
 
-            if matches!(
-                status,
-                StatusCode::TOO_MANY_REQUESTS
-                    | StatusCode::SERVICE_UNAVAILABLE
-                    | StatusCode::BAD_GATEWAY
-                    | StatusCode::GATEWAY_TIMEOUT
-            ) && throttle_attempt < MAX_THROTTLE_RETRIES
+            if retry
+                && matches!(
+                    status,
+                    StatusCode::TOO_MANY_REQUESTS
+                        | StatusCode::SERVICE_UNAVAILABLE
+                        | StatusCode::BAD_GATEWAY
+                        | StatusCode::GATEWAY_TIMEOUT
+                )
+                && throttle_attempt < MAX_THROTTLE_RETRIES
             {
                 let delay_secs = parse_retry_after_secs(resp.headers(), throttle_attempt);
                 throttle_attempt += 1;

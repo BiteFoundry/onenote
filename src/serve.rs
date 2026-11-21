@@ -461,6 +461,8 @@ async fn create_page(
     if body.title.trim().is_empty() {
         return Err(ApiError::bad_request("Page title is required."));
     }
+    crate::graph::onenote::validate_page_creation_level(body.level)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let paths: Vec<PathBuf> = body.image_paths.iter().map(PathBuf::from).collect();
     let inline_images = cli::load_inline_images_from_paths(&paths).map_err(onenote_api_error)?;
     let (section, page) = cli::create_onenote_page_helper(

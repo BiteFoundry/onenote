@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{bail, Result};
 use futures::future::join_all;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     client::{GraphIdentitySet, GraphListPage},
@@ -209,6 +209,39 @@ struct GraphOnenoteSection {
     parent_section_group: Option<GraphParentEntity>,
     #[serde(default)]
     links: Option<GraphOnenoteLinks>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotebookDriveItem {
+    id: String,
+    name: String,
+    #[serde(rename = "eTag")]
+    etag: Option<String>,
+    package: Option<DriveItemPackage>,
+    parent_reference: Option<DriveItemParent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DriveItemPackage {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DriveItemParent {
+    drive_id: String,
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RenamedNotebookStorage {
+    pub drive_id: String,
+    pub item_id: String,
+    pub parent_id: String,
+    pub name: String,
+    pub changed: bool,
 }
 
 impl GraphOnenoteSection {
@@ -600,6 +633,14 @@ fn merge_duplicate_notebook(existing: &mut OnenoteNotebook, mut candidate: Oneno
         existing.is_default |= candidate.is_default;
         existing.is_shared |= candidate.is_shared;
     }
+}
+
+pub(crate) fn validate_page_creation_level(level: Option<i32>) -> Result<()> {
+    // Graph exposes page level through GET metadata. Creation accepts XHTML.
+    if level.is_some_and(|level| level != 0) {
+        bail!("Microsoft Graph supports creating top-level OneNote pages. Omit the level or use 0, then change indentation in OneNote for Windows.");
+    }
+    Ok(())
 }
 
 impl GraphClient {
@@ -1326,6 +1367,112 @@ impl GraphClient {
         Ok(raw.into_section(scope, Some(&nb_id)))
     }
 
+    /// Rename a section addressed by the signed-in user's OneNote route.
+    pub async fn rename_onenote_section(
+        &self,
+        scope: &OnenoteScope,
+        section_id: &str,
+        display_name: &str,
+    ) -> Result<OnenoteSection> {
+        if !scope.is_personal() {
+            bail!("Section rename accepts a section ID under /me/onenote. Use OneNote for Windows for group or site routes.");
+        }
+        let id = section_id.trim();
+        let name = display_name.trim();
+        if id.is_empty() || name.is_empty() {
+            bail!("Section ID and new name are required.");
+        }
+        let path = format!(
+            "{}/sections/{}",
+            scope.graph_base_path(),
+            urlencoding::encode(id)
+        );
+        let expand_path = format!("{path}?$expand=parentNotebook,parentSectionGroup");
+        let before: GraphOnenoteSection = self.get_json(&expand_path).await?;
+        if before.id != id || before.display_name.is_none() {
+            bail!("Graph did not return the requested section identity and name.");
+        }
+        let before = before.into_section(scope, None);
+        if before.notebook_id.is_none() {
+            bail!("Graph did not return the section's parent notebook.");
+        }
+        if before.display_name == name {
+            return Ok(before);
+        }
+        self.patch_json(&path, &serde_json::json!({ "displayName": name }))
+            .await?;
+        let after = self
+            .get_json::<GraphOnenoteSection>(&expand_path)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("Graph accepted section rename for '{id}', but read-back failed: {err}")
+            })?;
+        let name_matches = after.display_name.as_deref() == Some(name);
+        let after = after.into_section(scope, None);
+        if after.id != before.id
+            || after.notebook_id != before.notebook_id
+            || after.parent_section_group_id != before.parent_section_group_id
+            || !name_matches
+        {
+            bail!("Graph accepted section rename for '{id}', but the read-back did not confirm the name and unchanged identity and parents.");
+        }
+        Ok(after)
+    }
+
+    /// Rename the existing drive item's OneNote package by its Files API identity.
+    pub async fn rename_notebook_storage(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        name: &str,
+    ) -> Result<RenamedNotebookStorage> {
+        let (drive_id, item_id, name) = (drive_id.trim(), item_id.trim(), name.trim());
+        if drive_id.is_empty() || item_id.is_empty() || name.is_empty() {
+            bail!("Drive ID, item ID and new notebook name are required.");
+        }
+        let path = format!(
+            "/drives/{}/items/{}",
+            urlencoding::encode(drive_id),
+            urlencoding::encode(item_id)
+        );
+        let before: NotebookDriveItem = self.get_json(&path).await?;
+        let is_notebook = |item: &NotebookDriveItem| {
+            item.id == item_id && item.package.as_ref().is_some_and(|pkg| pkg.kind == "oneNote")
+        };
+        if !is_notebook(&before) {
+            bail!("The requested drive item is not a verified OneNote notebook package.");
+        }
+        let parent = before
+            .parent_reference
+            .filter(|parent| parent.drive_id == drive_id && !parent.id.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Graph did not confirm the notebook's parent in the requested drive."))?;
+        let changed = name != before.name;
+        if changed {
+            self.patch_json_with_etag(
+                &path,
+                &serde_json::json!({ "name": name }),
+                before.etag.as_deref(),
+            )
+            .await?;
+            let after: NotebookDriveItem = self.get_json(&path).await.map_err(|err| {
+                anyhow::anyhow!("Graph accepted the notebook storage rename for '{item_id}', but read-back failed: {err}")
+            })?;
+            if !is_notebook(&after)
+                || after.parent_reference.as_ref() != Some(&parent)
+                || after.name != name
+            {
+                bail!("Graph accepted the notebook storage rename for '{item_id}', but read-back did not confirm the name, drive item ID, and parent.");
+            }
+        }
+        Ok(RenamedNotebookStorage {
+            drive_id: drive_id.to_owned(),
+            item_id: item_id.to_owned(),
+            parent_id: parent.id,
+            name: name.to_owned(),
+            changed,
+        })
+    }
+
     pub async fn list_onenote_pages(
         &self,
         scope: &OnenoteScope,
@@ -1483,6 +1630,7 @@ impl GraphClient {
         section_id: &str,
         outgoing: &OutgoingOnenotePage,
     ) -> Result<OnenotePageSummary> {
+        validate_page_creation_level(outgoing.level)?;
         let sec_id = clean_raw_onenote_id(section_id);
         if sec_id.is_empty() {
             bail!("OneNote 섹션 ID를 지정해야 합니다.");
@@ -1505,23 +1653,6 @@ impl GraphClient {
         }
         if summary.section_id.is_empty() {
             summary.section_id = sec_id;
-        }
-        if let Some(l) = outgoing.level.filter(|&l| l > 0) {
-            if !summary.id.is_empty()
-                && self
-                    .patch_json(
-                        &format!(
-                            "{}/pages/{}",
-                            scope.graph_base_path(),
-                            urlencoding::encode(&summary.id)
-                        ),
-                        &serde_json::json!({ "level": l }),
-                    )
-                    .await
-                    .is_ok()
-            {
-                summary.level = l;
-            }
         }
         Ok(summary)
     }
@@ -1638,10 +1769,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn section_rename_requires_read_back_of_name_and_parent() {
+        let writes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/sections/sec-1",
+                get(
+                    |State(writes): State<Arc<Mutex<Vec<String>>>>,
+                     Query(params): Query<HashMap<String, String>>| async move {
+                        assert_eq!(params["$expand"], "parentNotebook,parentSectionGroup");
+                        let writes = writes.lock().unwrap();
+                        let name = writes.last().map(String::as_str).unwrap_or("Original");
+                        Json(serde_json::json!({
+                            "id": "sec-1",
+                            "displayName": name,
+                            "parentNotebook": { "id": "nb-1", "displayName": "Notebook" },
+                            "parentSectionGroup": { "id": if name == "Wrong parent" { "group-other" } else { "group-1" } }
+                        }))
+                    },
+                )
+                .patch(
+                    |State(writes): State<Arc<Mutex<Vec<String>>>>,
+                     Json(body): Json<serde_json::Value>| async move {
+                        let name = body["displayName"].as_str().unwrap();
+                        assert_eq!(body, serde_json::json!({ "displayName": name }));
+                        writes.lock().unwrap().push(name.to_string());
+                        StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(writes.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = test_graph_client(format!("http://{}/v1.0", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for _ in 0..2 {
+            let section = client
+                .rename_onenote_section(&OnenoteScope::Me, "sec-1", "Renamed")
+                .await
+                .unwrap();
+            assert_eq!(section.section_key, "me|sec-1");
+            assert_eq!(section.notebook_id.as_deref(), Some("nb-1"));
+            assert_eq!(section.parent_section_group_id.as_deref(), Some("group-1"));
+            assert_eq!(section.display_name, "Renamed");
+        }
+        assert_eq!(*writes.lock().unwrap(), ["Renamed"]);
+        let err = client
+            .rename_onenote_section(&OnenoteScope::Me, "sec-1", "Wrong parent")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("did not confirm"));
+        assert_eq!(*writes.lock().unwrap(), ["Renamed", "Wrong parent"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn storage_rename_checks_package_identity_and_etag() {
+        let writes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new()
+            .route(
+                "/v1.0/drives/drive-1/items/{id}",
+                get(
+                    |State(writes): State<Arc<Mutex<Vec<String>>>>,
+                     AxumPath(id): AxumPath<String>| async move {
+                        let writes = writes.lock().unwrap();
+                        let name = writes.last().map(String::as_str).unwrap_or("Original");
+                        Json(serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "eTag": "\"fixture-etag\"",
+                            "package": (id == "notebook-1").then(|| serde_json::json!({ "type": "oneNote" })),
+                            "parentReference": { "driveId": "drive-1", "id": "folder-1" }
+                        }))
+                    },
+                )
+                .patch(
+                    |State(writes): State<Arc<Mutex<Vec<String>>>>,
+                     AxumPath(id): AxumPath<String>,
+                     headers: HeaderMap,
+                     Json(body): Json<serde_json::Value>| async move {
+                        assert_eq!(id, "notebook-1");
+                        assert_eq!(headers["if-match"], "\"fixture-etag\"");
+                        let name = body["name"].as_str().unwrap();
+                        assert_eq!(body, serde_json::json!({ "name": name }));
+                        writes.lock().unwrap().push(name.to_string());
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(writes.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = test_graph_client(format!("http://{}/v1.0", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let err = client
+            .rename_notebook_storage("drive-1", "ordinary-file", "New name")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("verified OneNote notebook package"));
+        assert!(writes.lock().unwrap().is_empty());
+
+        for changed in [true, false] {
+            let renamed = client
+                .rename_notebook_storage("drive-1", "notebook-1", "New name")
+                .await
+                .unwrap();
+            assert_eq!(renamed.item_id, "notebook-1");
+            assert_eq!(renamed.drive_id, "drive-1");
+            assert_eq!(renamed.parent_id, "folder-1");
+            assert_eq!(renamed.name, "New name");
+            assert_eq!(renamed.changed, changed);
+        }
+        assert_eq!(*writes.lock().unwrap(), ["New name"]);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn test_onenote_hierarchy_pages_fallback_and_mutations() {
         #[derive(Clone, Default)]
         struct MockState {
-            patched_levels: Arc<Mutex<Vec<(String, i32)>>>,
+            created_pages: Arc<Mutex<Vec<String>>>,
             content_patches: Arc<Mutex<Vec<(String, String)>>>,
             deleted_pages: Arc<Mutex<Vec<String>>>,
         }
@@ -1816,15 +2063,19 @@ mod tests {
                     },
                 )
                 .post(
-                    |AxumPath(sec_id): AxumPath<String>, headers: HeaderMap, body: Bytes| async move {
+                    |State(st): State<MockState>,
+                     AxumPath(sec_id): AxumPath<String>,
+                     headers: HeaderMap,
+                     body: Bytes| async move {
                         assert_eq!(sec_id, "sec-1");
                         assert!(!body.is_empty());
                         assert!(headers.contains_key("content-type"));
+                        st.created_pages.lock().unwrap().push(sec_id);
                         (
                             StatusCode::CREATED,
                             Json(serde_json::json!({
                                 "id": "pg-new",
-                                "title": "하위 페이지"
+                                "title": "새 페이지"
                             })),
                         )
                     },
@@ -1841,15 +2092,6 @@ mod tests {
                         "parentSection": { "id": "sec-1", "displayName": "주간 회의" }
                     }))
                 })
-                .patch(
-                    |State(st): State<MockState>,
-                     AxumPath(page_id): AxumPath<String>,
-                     Json(body): Json<serde_json::Value>| async move {
-                        let lvl = body["level"].as_i64().unwrap_or(0) as i32;
-                        st.patched_levels.lock().unwrap().push((page_id, lvl));
-                        StatusCode::NO_CONTENT
-                    },
-                )
                 .delete(
                     |State(st): State<MockState>, AxumPath(page_id): AxumPath<String>| async move {
                         st.deleted_pages.lock().unwrap().push(page_id);
@@ -1948,27 +2190,34 @@ mod tests {
         assert!(detail.body_plain.contains("마이그레이션 점검"));
         assert!(detail.synced_at.is_some());
 
-        // 6. Create subpage (triggers level PATCH) + patch commands + append markdown + resource + delete
+        // 6. Reject unsupported subpage creation before the POST.
+        let mut outgoing = OutgoingOnenotePage {
+            title: "새 페이지".into(),
+            markdown_body: "내용입니다".into(),
+            inline_images: Vec::new(),
+            level: Some(1),
+        };
+        let err = client
+            .create_onenote_page(&OnenoteScope::Me, "sec-1", &outgoing)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("top-level"));
+        assert!(state_check.created_pages.lock().unwrap().is_empty());
+        assert_eq!(detail.summary.level, 1);
+
+        outgoing.level = Some(0);
         let new_page = client
             .create_onenote_page(
                 &OnenoteScope::Me,
                 "sec-1",
-                &OutgoingOnenotePage {
-                    title: "하위 페이지".into(),
-                    markdown_body: "내용입니다".into(),
-                    inline_images: Vec::new(),
-                    level: Some(1),
-                },
+                &outgoing,
             )
             .await
             .unwrap();
         assert_eq!(new_page.page_key, "me|pg-new");
         assert_eq!(new_page.section_id, "sec-1");
-        assert_eq!(new_page.level, 1);
-        assert_eq!(
-            *state_check.patched_levels.lock().unwrap(),
-            vec![("pg-new".to_string(), 1)]
-        );
+        assert_eq!(new_page.level, 0);
+        assert_eq!(*state_check.created_pages.lock().unwrap(), ["sec-1"]);
 
         client
             .patch_onenote_page_commands(

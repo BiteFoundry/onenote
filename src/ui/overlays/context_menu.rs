@@ -52,7 +52,6 @@ impl ContextMenu {
         let mut items = match target {
             ContextTarget::PageItem => vec![
                 MenuItem::new("New Page", Some("n"), Action::OpenOnenoteCreatePage { level: 0 }),
-                MenuItem::new("New Subpage", Some("N"), Action::OpenOnenoteCreatePage { level: 1 }),
                 MenuItem::new("Append Markdown", Some("a"), Action::OpenOnenoteAppend),
                 MenuItem::new("Extract Links", Some("u"), Action::OpenLinkExtractor),
                 MenuItem::new("Inspect Page HTML", Some("H"), Action::OpenHtmlPreview),

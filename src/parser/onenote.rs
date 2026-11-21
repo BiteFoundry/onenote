@@ -1,7 +1,8 @@
 //! Microsoft OneNote XHTML <-> Rich AST / GFM Markdown parser and surgical Graph `PATCH` compiler.
 
-use std::{borrow::Cow, collections::HashSet};
+use std::borrow::Cow;
 
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use scraper::{ElementRef, Html, Node, Selector};
 use uuid::Uuid;
@@ -2507,44 +2508,40 @@ pub fn compile_new_page_payload(outgoing: &OutgoingOnenotePage) -> (Vec<u8>, Str
 /// completed (`to-do:completed`), preserving all inner links/styles in `raw_html`.
 /// Returns `None` if `block.element_id` is absent or `block.tag` is not a `Todo`.
 pub fn build_toggle_todo_patch(block: &OnenoteBlock) -> Option<(OnenotePatchCommand, bool)> {
+    let Some(OnenoteTagKind::Todo { completed }) = block.tag else {
+        return None;
+    };
+    Some((build_todo_state_patch(block, !completed)?, !completed))
+}
+
+/// Set the to-do state while preserving other note tags and inline markup.
+pub fn build_todo_state_patch(
+    block: &OnenoteBlock,
+    completed: bool,
+) -> Option<OnenotePatchCommand> {
     let target_id = block.element_id.as_deref()?.trim();
-    if target_id.is_empty() {
+    if target_id.is_empty() || !block.tag.as_ref().is_some_and(OnenoteTagKind::is_todo) {
         return None;
     }
-
-    let new_completed = match &block.tag {
-        Some(OnenoteTagKind::Todo { completed }) => !completed,
-        _ => return None,
-    };
 
     let updated_html = block
         .raw_html
         .as_deref()
-        .and_then(|raw| {
-            rewrite_opening_tag_data_tag(
-                raw,
-                TagRewriteMode::ToggleTodo {
-                    completed: new_completed,
-                },
-            )
-        })
+        .and_then(|raw| rewrite_opening_tag_data_tag(raw, TagRewriteMode::ToggleTodo { completed }))
         .unwrap_or_else(|| {
             reconstruct_block_xhtml_with_tag(
                 block,
                 target_id,
-                Some(&OnenoteTagKind::Todo {
-                    completed: new_completed,
-                }),
+                Some(&OnenoteTagKind::Todo { completed }),
             )
         });
 
-    let cmd = OnenotePatchCommand {
+    Some(OnenotePatchCommand {
         target: target_id.to_string(),
         action: "replace".to_string(),
         position: None,
         content: updated_html,
-    };
-    Some((cmd, new_completed))
+    })
 }
 
 /// Sets or clears any `OnenoteTagKind` on a block that has a valid `element_id`,
@@ -2671,90 +2668,288 @@ pub fn build_replace_block_patch(target_element_id: &str, markdown: &str) -> One
     }
 }
 
-/// Builds surgical `PATCH` commands to update page title (if changed) and replace the page body.
+/// Build a title replacement when the supplied title differs from the live title.
+pub fn build_replace_title_patch(
+    detail: &OnenotePageDetail,
+    title: &str,
+) -> Option<OnenotePatchCommand> {
+    let title = title.trim();
+    if title.is_empty() || title == detail.summary.title {
+        return None;
+    }
+    Some(replace_element("title", escape_xml(title)))
+}
+
+fn replace_element(target: &str, content: String) -> OnenotePatchCommand {
+    OnenotePatchCommand {
+        target: target.to_owned(),
+        action: "replace".to_owned(),
+        position: None,
+        content,
+    }
+}
+
+fn page_body(doc: &Html) -> Option<ElementRef<'_>> {
+    doc.select(&Selector::parse("body").expect("valid body selector"))
+        .next()
+}
+
+fn can_replace_element(el: ElementRef<'_>) -> bool {
+    match el.value().name() {
+        "div" => !el.attr("style").is_some_and(|style| {
+            style.split(';').any(|declaration| {
+                declaration.split_once(':').is_some_and(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("position")
+                        && value.trim().to_ascii_lowercase().starts_with("absolute")
+                })
+            })
+        }),
+        "img" | "object" => el
+            .ancestors()
+            .filter_map(ElementRef::wrap)
+            .any(|p| p.value().name() == "div"),
+        "p" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ol" | "ul" | "table" => true,
+        _ => false,
+    }
+}
+
+fn find_replace_element<'a>(doc: &'a Html, target: &str) -> Result<(ElementRef<'a>, String)> {
+    let target = target.trim();
+    let body = page_body(doc).context("Page XHTML has no body.")?;
+    let mut matches = body.descendent_elements().filter(|el| {
+        if let Some(id) = target.strip_prefix('#') {
+            el.attr("data-id") == Some(id) || el.attr("id") == Some(id)
+        } else {
+            el.attr("id") == Some(target)
+        }
+    });
+    let el = matches
+        .next()
+        .with_context(|| format!("Element '{target}' not found in current page XHTML."))?;
+    if matches.next().is_some() {
+        bail!("Element target '{target}' is ambiguous in current page XHTML.");
+    }
+    if !can_replace_element(el) {
+        bail!(
+            "Graph does not support replacing element '{target}' ({}).",
+            el.value().name()
+        );
+    }
+    let id = non_empty_attr(el, "id")
+        .or_else(|| {
+            if matches!(el.value().name(), "img" | "object") {
+                return non_empty_attr(el, "data-id").map(|id| format!("#{id}"));
+            }
+            None
+        })
+        .with_context(|| {
+            format!("Element '{target}' has no generated Graph ID for replacement.")
+        })?;
+    Ok((el, id))
+}
+
+pub fn build_checked_block_replacement(
+    detail: &OnenotePageDetail,
+    target: &str,
+    markdown: &str,
+) -> Result<OnenotePatchCommand> {
+    let doc = Html::parse_document(&normalize_xhtml_for_html5ever(&detail.raw_xhtml));
+    let (_, id) = find_replace_element(&doc, target)?;
+    Ok(build_replace_block_patch(&id, markdown))
+}
+
+/// Replace one unambiguous occurrence in a single text node of the live element.
+pub fn build_replace_block_text_patch(
+    detail: &OnenotePageDetail,
+    target: &str,
+    from: &str,
+    to: &str,
+) -> Result<Option<OnenotePatchCommand>> {
+    let mut doc = Html::parse_document(&normalize_xhtml_for_html5ever(&detail.raw_xhtml));
+    let id = replace_element_text(&mut doc, target, from, to)?;
+    if from == to {
+        return Ok(None);
+    }
+    let (el, _) = find_replace_element(&doc, &id)?;
+    Ok(Some(replace_element(&id, el.html())))
+}
+
+fn replace_element_text(doc: &mut Html, target: &str, from: &str, to: &str) -> Result<String> {
+    let first_char = from
+        .chars()
+        .next()
+        .context("The text to replace must be nonempty.")?;
+    let (el, id) = find_replace_element(doc, target)?;
+    let mut matches = el.descendants().filter_map(|node| {
+        let text = node.value().as_text()?;
+        let offset = text.find(from)?;
+        // Overlapping occurrences are ambiguous too.
+        let unique = !text[offset + first_char.len_utf8()..].contains(from);
+        Some((node.id(), unique, text.replacen(from, to, 1)))
+    });
+    let (node_id, unique, updated) = matches.next().with_context(|| {
+        format!("Text to replace was not found in a single text node of '{target}'.")
+    })?;
+    if !unique || matches.next().is_some() {
+        bail!("Text to replace is ambiguous in '{target}'. Use a longer exact substring.");
+    }
+    let mut text_node = doc.tree.get_mut(node_id).expect("text node exists");
+    if let Node::Text(text) = text_node.value() {
+        text.text = updated.into();
+    }
+    Ok(id)
+}
+
+/// Limit implicit layout edits to text changes aligned with the live Markdown
+/// blocks. Verify the round trip before emitting any replacements.
+fn aligned_text_replacements(
+    detail: &OnenotePageDetail,
+    doc: &Html,
+    markdown: &str,
+) -> Option<Vec<OnenotePatchCommand>> {
+    let old = normalize_compare_text(&detail.body_markdown);
+    let offsets: Vec<usize> = std::iter::once(0)
+        .chain(markdown.match_indices('\n').map(|(offset, _)| offset + 1))
+        .collect();
+    if old.lines().count() != offsets.len() {
+        return None;
+    }
+    let mut doc = doc.clone();
+    let mut remaining = old.as_str();
+    let mut line = 0;
+    let mut ids = Vec::new();
+    for block in &detail.blocks {
+        let baseline = block_baseline_content(block);
+        if baseline.is_empty() {
+            continue;
+        }
+        let following = remaining.trim_start_matches('\n');
+        line += remaining.len() - following.len();
+        remaining = following.strip_prefix(&baseline)?;
+        let start = *offsets.get(line)?;
+        line += baseline.bytes().filter(|&b| b == b'\n').count();
+        let end = offsets
+            .get(line + 1)
+            .map_or(markdown.len(), |offset| offset - 1);
+        let edited = markdown.get(start..end)?;
+        if edited == baseline {
+            continue;
+        }
+        let target = block.element_id.as_deref()?;
+        let (from, to) = changed_text(&baseline, edited)?;
+        let id = replace_element_text(&mut doc, target, from, to).ok()?;
+        if ids.contains(&id) {
+            return None;
+        }
+        ids.push(id);
+    }
+    if !remaining.is_empty()
+        || ids.is_empty()
+        || normalize_compare_text(
+            &parse_onenote_page_xhtml(detail.summary.clone(), &doc.html()).body_markdown,
+        ) != markdown
+    {
+        return None;
+    }
+    ids.iter()
+        .map(|id| {
+            let (el, _) = find_replace_element(&doc, id).ok()?;
+            // Replacing an ancestor and its descendant would reuse a stale target.
+            if el
+                .ancestors()
+                .filter_map(ElementRef::wrap)
+                .filter_map(|parent| parent.attr("id"))
+                .any(|parent| ids.iter().any(|target| target == parent))
+            {
+                return None;
+            }
+            Some(replace_element(id, el.html()))
+        })
+        .collect()
+}
+
+fn changed_text<'a>(before: &'a str, after: &'a str) -> Option<(&'a str, &'a str)> {
+    let mut start = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum::<usize>();
+    let mut tail = before[start..]
+        .chars()
+        .rev()
+        .zip(after[start..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum::<usize>();
+    if start + tail == before.len() {
+        // Anchor a pure insertion to adjacent text in the original node.
+        if let Some(c) = before[..start].chars().next_back() {
+            start -= c.len_utf8();
+        } else {
+            tail -= before.chars().next()?.len_utf8();
+        }
+    }
+    Some((
+        &before[start..before.len() - tail],
+        &after[start..after.len() - tail],
+    ))
+}
+
+/// Replace a changed page body without flattening distinct OneNote regions.
 pub fn build_replace_page_body_commands(
     detail: &OnenotePageDetail,
     new_title: Option<&str>,
     new_markdown: &str,
-) -> Vec<OnenotePatchCommand> {
+) -> Result<Vec<OnenotePatchCommand>> {
     let mut cmds = Vec::new();
-
-    if let Some(t) = new_title {
-        let trimmed_title = t.trim();
-        if !trimmed_title.is_empty() && trimmed_title != detail.summary.title {
-            cmds.push(OnenotePatchCommand {
-                target: "title".to_string(),
-                action: "replace".to_string(),
-                position: None,
-                content: escape_xml(trimmed_title),
-            });
-        }
+    if let Some(title) = new_title {
+        cmds.extend(build_replace_title_patch(detail, title));
+    }
+    let normalized = normalize_compare_text(new_markdown);
+    if normalized == normalize_compare_text(&detail.body_markdown) {
+        return Ok(cmds);
     }
 
+    let doc = Html::parse_document(&normalize_xhtml_for_html5ever(&detail.raw_xhtml));
+    if let Some(edits) = aligned_text_replacements(detail, &doc, &normalized) {
+        cmds.extend(edits);
+        return Ok(cmds);
+    }
+    let guidance = "Use read --format blocks to find an element for update --block-id, or append to add content.";
+    let body = page_body(&doc).context("Page XHTML has no body.")?;
+    let elements: Vec<_> = body.child_elements().collect();
+    if body.children().any(|node| {
+        node.value()
+            .as_text()
+            .is_some_and(|text| !text.trim().is_empty())
+    }) {
+        bail!("The page contains text outside identified elements. {guidance}");
+    }
+    if elements.len() != 1 && elements.iter().any(|el| el.value().name() == "div") {
+        bail!("Cannot map these body changes to individual elements across the page's regions. {guidance}");
+    }
+    if elements.is_empty() {
+        bail!("No replaceable body elements were returned by Graph. {guidance}");
+    }
     let fragment = markdown_to_onenote_html_fragment(new_markdown, &[]);
-
-    if let Some(div_id) = detail
-        .primary_div_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        cmds.push(OnenotePatchCommand {
-            target: div_id.to_string(),
-            action: "replace".to_string(),
-            position: None,
-            content: format!("<div>{fragment}</div>"),
-        });
-    } else {
-        let mut seen = HashSet::new();
-        let mut block_ids = Vec::new();
-        for b in &detail.blocks {
-            if let Some(id) = b
-                .element_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                if seen.insert(id) {
-                    block_ids.push(id);
-                }
-            }
-        }
-
-        if let Some((first_id, rest_ids)) = block_ids.split_first() {
-            cmds.push(OnenotePatchCommand {
-                target: (*first_id).to_string(),
-                action: "replace".to_string(),
-                position: None,
-                content: if fragment.is_empty() {
-                    "<p></p>".to_string()
-                } else {
-                    fragment
-                },
-            });
-            for rem_id in rest_ids {
-                cmds.push(OnenotePatchCommand {
-                    target: (*rem_id).to_string(),
-                    action: "replace".to_string(),
-                    position: None,
-                    content: "<p></p>".to_string(),
-                });
-            }
+    for (index, el) in elements.into_iter().enumerate() {
+        let id = non_empty_attr(el, "id").with_context(|| {
+            format!("Graph returned no generated ID for a body element. {guidance}")
+        })?;
+        find_replace_element(&doc, &id).map_err(|err| anyhow::anyhow!("{err} {guidance}"))?;
+        let content = if el.value().name() == "div" {
+            let outer = el.html();
+            let end_of_opening = outer.len() - "</div>".len() - el.inner_html().len();
+            format!("{}{fragment}</div>", &outer[..end_of_opening])
+        } else if index == 0 && !fragment.is_empty() {
+            fragment.clone()
         } else {
-            cmds.push(OnenotePatchCommand {
-                target: "body".to_string(),
-                action: "append".to_string(),
-                position: None,
-                content: if fragment.is_empty() {
-                    "<p></p>".to_string()
-                } else {
-                    fragment
-                },
-            });
-        }
+            "<p></p>".to_owned()
+        };
+        cmds.push(replace_element(&id, content));
     }
-
-    cmds
+    Ok(cmds)
 }
 
 // ---------------------------------------------------------------------------
@@ -3441,6 +3636,77 @@ let ok = 1 < 2 && 3 > 1;
     }
 
     #[test]
+    fn page_updates_target_existing_text_without_replacing_layout() {
+        let detail = parse_onenote_page_xhtml(
+            sample_summary("Status"),
+            r#"<html><body>
+                <div id="div:left" style="position:absolute;left:0">
+                    <p id="p:status" data-id="status" style="text-align:center"><span style="color:#008800">READY</span> <a href="https://example.invalid">Evidence</a><img src="https://example.invalid/image" alt="Chart" width="48"></p>
+                    <table id="table:keep"><tr><td>Canary</td></tr></table>
+                </div>
+                <div id="div:right" style="position:absolute;left:100px"><p id="p:keep">Side panel sentinel</p></div>
+            </body></html>"#,
+        );
+        assert!(
+            build_replace_page_body_commands(&detail, None, &detail.body_markdown)
+                .unwrap()
+                .is_empty()
+        );
+        let title = build_replace_page_body_commands(
+            &detail,
+            Some("Updated & verified"),
+            &detail.body_markdown,
+        )
+        .unwrap();
+        assert_eq!(
+            title,
+            [replace_element("title", "Updated &amp; verified".into())]
+        );
+
+        let markdown = detail.body_markdown.replace("READY", "APPROVED");
+        let commands = build_replace_page_body_commands(&detail, None, &markdown).unwrap();
+        let explicit = build_replace_block_text_patch(&detail, "p:status", "READY", "APPROVED")
+            .unwrap()
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, explicit.target);
+        assert_eq!(commands[0].action, explicit.action);
+        assert_eq!(
+            Html::parse_fragment(&commands[0].content),
+            Html::parse_fragment(&explicit.content)
+        );
+        let expected = find_block_by_element_id(&detail, "p:status")
+            .unwrap()
+            .raw_html
+            .as_ref()
+            .unwrap()
+            .replace("READY", "APPROVED");
+        assert_eq!(commands[0].target, "p:status");
+        assert_eq!(
+            Html::parse_fragment(&commands[0].content),
+            Html::parse_fragment(&expected)
+        );
+
+        let error =
+            build_replace_page_body_commands(&detail, None, "Flatten the page").unwrap_err();
+        assert!(error.to_string().contains("--block-id"));
+        let error = build_checked_block_replacement(&detail, "div:left", "No layout").unwrap_err();
+        assert!(error.to_string().contains("Graph does not support"));
+    }
+
+    #[test]
+    fn changed_body_without_generated_ids_rejects_replacement() {
+        let detail = parse_onenote_page_xhtml(
+            sample_summary("No IDs"),
+            "<html><body><div><p>Before replacement</p></div></body></html>",
+        );
+        let error =
+            build_replace_page_body_commands(&detail, None, "After replacement").unwrap_err();
+        assert!(error.to_string().contains("no generated ID"));
+        assert!(error.to_string().contains("append"));
+    }
+
+    #[test]
     fn test_multipart_new_page_and_append_payloads_and_page_replace() {
         // 1. Single-part new page (no images)
         let simple_page = OutgoingOnenotePage {
@@ -3511,7 +3777,8 @@ let ok = 1 < 2 && 3 > 1;
             r#"<html><head><title>기존 제목</title></head><body><div id="div:{main}{1}"><p id="p:1">예전 본문</p></div></body></html>"#,
         );
         let page_cmds =
-            build_replace_page_body_commands(&detail, Some("새 제목 & v2"), "## 새 섹션\n\n내용");
+            build_replace_page_body_commands(&detail, Some("새 제목 & v2"), "## 새 섹션\n\n내용")
+                .unwrap();
         assert_eq!(page_cmds.len(), 2);
         assert_eq!(page_cmds[0].target, "title");
         assert_eq!(page_cmds[0].content, "새 제목 &amp; v2");
@@ -3519,7 +3786,7 @@ let ok = 1 < 2 && 3 > 1;
         assert_eq!(page_cmds[1].action, "replace");
         assert_eq!(
             page_cmds[1].content,
-            "<div><h2>새 섹션</h2><p>내용</p></div>"
+            r#"<div id="div:{main}{1}"><h2>새 섹션</h2><p>내용</p></div>"#
         );
     }
 }
