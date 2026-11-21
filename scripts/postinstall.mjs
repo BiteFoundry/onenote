@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Zero-Node-Process npm native binary linker.
 //
-// On Unix (linux/darwin): replaces installed `bin/onenote.js` and `bin/note.js` with
+// On Unix (linux/darwin): replaces installed `bin/onenote.js` with
 // hardlinks/symlinks directly to `@bitefoundry/onenote-<platform>-<arch>/bin/onenote` so npm's
 // bin symlink execve's the native Rust binary directly (0ms Node startup, 0MB Node RSS).
 //
-// On Windows (win32): creates NTFS hardlinks (fallback copy) `bin/onenote.exe` & `bin/note.exe`
-// and rewrites npm's `.bin/{onenote,note}[.cmd|.ps1]` shims when present to invoke
+// On Windows (win32): creates a native `bin/onenote.exe` hardlink (fallback copy)
+// and rewrites npm's `onenote[.cmd|.ps1]` shims when present to invoke
 // the native executable directly without spawning `node.exe`.
 
 import fs from 'node:fs';
@@ -14,7 +14,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-const BIN_NAMES = ['onenote', 'note'];
+const BIN_NAMES = ['onenote'];
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function linkOrCopyFile(source, destination) {
@@ -95,10 +95,7 @@ function collectWindowsShimDirs(pkgRoot, env = process.env) {
 
 function shimReferencesLauncher(content, name) {
   const normalized = content.replace(/\\/g, '/').toLowerCase();
-  return (
-    normalized.includes('@bitefoundry/onenote') &&
-    normalized.includes(`bin/${name}.js`)
-  );
+  return normalized.includes(`/@bitefoundry/onenote/bin/${name}.js"`);
 }
 
 function rewriteWindowsShims(shimDir, pkgRoot) {
@@ -135,11 +132,10 @@ function rewriteWindowsShims(shimDir, pkgRoot) {
           const ps1Body = [
             '#!/usr/bin/env pwsh',
             '$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent',
-            `$exePath = Join-Path $basedir '${relWin.replace(/'/g, "''")}'`,
             'if ($MyInvocation.ExpectingInput) {',
-            '  $input | & $exePath @args',
+            `  $input | & "$basedir/${relPosix}" $args`,
             '} else {',
-            '  & $exePath @args',
+            `  & "$basedir/${relPosix}" $args`,
             '}',
             'exit $LASTEXITCODE',
             '',

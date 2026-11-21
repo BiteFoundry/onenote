@@ -103,12 +103,13 @@ jobs:
           name="onenote-${version}-${{ matrix.target }}"
           mkdir -p release-staging
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/onenote.exe"
+            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/onenote.exe" LICENSE
             if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+              cp LICENSE release-staging/LICENSE
               cp "target/${{ matrix.target }}/release/onenote.exe" "release-staging/onenote.exe"
             fi
           else
-            tar -czf "release-staging/${name}.tar.gz" -C "target/${{ matrix.target }}/release" onenote
+            tar -czf "release-staging/${name}.tar.gz" LICENSE -C "target/${{ matrix.target }}/release" onenote
           fi
 
       - name: Stage npm artifact directory
@@ -183,7 +184,6 @@ jobs:
           done
 
           test -f bin/onenote.js
-          test -f bin/note.js
           test -f scripts/postinstall.mjs
           test -f dist/onenote-win32-x64/bin/onenote.exe
           test -f dist/onenote-win32-arm64/bin/onenote.exe
@@ -234,7 +234,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo 'Prebuilt standalone Microsoft OneNote binary (`onenote` / `note`) — CLI, TUI, HTTP API, and MCP server.'
+            echo 'Prebuilt standalone Microsoft OneNote binary (`onenote`) — CLI, TUI, HTTP API, and MCP server.'
             if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
               echo ""
               cat "release-notes/${GITHUB_REF_NAME}.md"

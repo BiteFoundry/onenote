@@ -22,7 +22,7 @@ pub const DEFAULT_AUTH_BASE_URL: &str = "https://login.microsoftonline.com";
 pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
 pub const DEFAULT_TENANT_ID: &str = "common";
 pub const DEFAULT_GITHUB_REPO: &str = "BiteFoundry/onenote";
-pub const DEFAULT_SERVE_PORT: u16 = 8788;
+pub const DEFAULT_SERVE_PORT: u16 = 8793;
 
 /// List density mode in TUI (`Cozy` default vs `Compact`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
@@ -883,7 +883,7 @@ mod tests {
         }
         assert_eq!(Persona::detect(), Persona::Onenote);
         assert_eq!(Persona::Onenote.bin_name(), "onenote");
-        assert_eq!(DEFAULT_SERVE_PORT, 8788);
+        assert_eq!(DEFAULT_SERVE_PORT, 8793);
         assert_eq!(
             default_download_dir().file_name().and_then(|n| n.to_str()),
             Some("onenote")

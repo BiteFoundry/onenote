@@ -404,7 +404,7 @@ pub enum Command {
     },
     /// Launch the interactive OneNote TUI
     Tui,
-    /// Start the local HTTP JSON API server (default `127.0.0.1:8788`)
+    /// Start the local HTTP JSON API server (default `127.0.0.1:8793`)
     #[command(visible_alias = "api")]
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
@@ -2915,6 +2915,12 @@ mod tests {
         ));
 
         let cli = Cli::try_parse_from(["onenote", "serve"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Serve { port: 8793, .. }
+        ));
+
+        let cli = Cli::try_parse_from(["onenote", "serve", "--port", "8788"]).unwrap();
         assert!(matches!(
             cli.command.unwrap(),
             Command::Serve { port: 8788, .. }

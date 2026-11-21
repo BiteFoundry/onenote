@@ -7,8 +7,7 @@ into `bin/` and Windows shims for zero-Node-startup execution), so there is no
 compiler, Node native addon, or network download during install.
 
 The Rust crate is named `onenote-cli` and produces the standalone **Microsoft OneNote**
-binary (`onenote` / `onenote.exe`). The npm package is scoped as `@bitefoundry/onenote`
-and installs both **`onenote`** and the short alias **`note`**.
+binary (`onenote` / `onenote.exe`). The npm package `@bitefoundry/onenote` installs the `onenote` command.
 
 ## Install and run
 
@@ -16,10 +15,9 @@ and installs both **`onenote`** and the short alias **`note`**.
 # one-off
 npx @bitefoundry/onenote --version
 
-# global install (installs `onenote` and `note`)
+# global install
 npm install -g @bitefoundry/onenote
 onenote --version
-note --version
 
 # project-local
 npm install @bitefoundry/onenote
@@ -29,7 +27,7 @@ npx onenote notebooks
 All workflows share the same Microsoft Entra ID login (or automatic M365 shared-session
 bootstrap from `teams-cli` / `outlook-cli`), SQLite WAL + FTS5 cache (`cache.db`),
 background sync daemon (`onenote daemon start | status | stop | restart`), local HTTP API
-(`onenote serve`, default `127.0.0.1:8788`), MCP server (`onenote mcp`), and multi-protocol
+(`onenote serve`, default `127.0.0.1:8793`), MCP server (`onenote mcp`), and multi-protocol
 terminal image preview (`Kitty` / `iTerm2` / `Sixel` / `Halfblock` via `onenote preview-file`
 and the interactive TUI).
 
@@ -58,6 +56,24 @@ Use `--replace-text` and `--with-text` to change one exact substring in a block'
 
 Graph creates a top-level page. Windows desktop commands can promote or indent an existing page. Use the OneNote app's **Move** command to move a page. [Hierarchy operations and permissions](API.md#hierarchy-operations)
 
+## Upgrade scripts and clients
+
+Replace the previous `note` alias with `onenote` in scripts.
+
+```sh
+# Previous invocation
+note notebooks --json
+
+# Current invocation
+onenote notebooks --json
+```
+
+In your MCP configuration, change `{"command":"note","args":["mcp"]}` to `{"command":"onenote","args":["mcp"]}`. If you installed the PowerShell profile launcher, rerun `scripts/install-profile.ps1` and restart the shell to load the updated profile.
+
+npm removes the previous package's global `note` launcher during an upgrade. If you manually replaced that file with another program's launcher, move it to a separate `PATH` directory before upgrading.
+
+Change HTTP clients from `http://127.0.0.1:8788` to `http://127.0.0.1:8793` to use the new default. To keep an existing client on port `8788`, run `onenote serve --port 8788` when that port is available. Teams uses `8788` by default.
+
 ## Supported platforms
 
 | npm package                     | OS      | CPU   | Rust target                         |
@@ -77,7 +93,7 @@ build from source with Cargo (`cargo build --release`).
 
 ## How resolution works
 
-`bin/onenote.js` and `bin/note.js` look up `@bitefoundry/onenote-<platform>-<arch>` through
+`bin/onenote.js` looks up `@bitefoundry/onenote-<platform>-<arch>` through
 `require.resolve`, then execute `node_modules/@bitefoundry/onenote-<platform>-<arch>/bin/onenote`
 (or `onenote.exe` on Windows) with `stdio: 'inherit'`. On `npm install`, `scripts/postinstall.mjs`
 additionally links the native binary directly for zero-Node-startup execution.
@@ -88,9 +104,8 @@ and the `--include=optional` hint instead of a stack trace.
 ## Layout
 
 ```
-package.json                  # @bitefoundry/onenote launcher package (bin: onenote, note)
+package.json                  # @bitefoundry/onenote launcher package (bin: onenote)
 bin/onenote.js                # onenote launcher
-bin/note.js                   # note shorthand launcher
 scripts/postinstall.mjs       # zero-Node native binary linker on npm install
 npm/onenote-<platform>/       # one package per platform
   package.json                # os/cpu/files, same version as root
@@ -113,9 +128,9 @@ node scripts/sync-version.mjs --check
 
 ## External token brokers, M365 bootstrap & token scopes
 
-### Required Microsoft Graph delegated scopes
+### Microsoft Graph delegated scopes
 
-`offline_access`, `User.Read`, `Notes.Read`, `Notes.ReadWrite`, `Notes.Create`
+Basic sign-in requests `offline_access`, `User.Read`, `Notes.Read`, `Notes.ReadWrite`, and `Notes.Create`. A company tenant sign-in also requests `Notes.Read.All`, `Notes.ReadWrite.All`, and `Team.ReadBasic.All`. [Company-managed sign-in and permissions](../README.md#company-managed-microsoft-entra-sign-in)
 
 Run `onenote whoami` or `onenote doctor` to inspect JWT `scp`/`roles` claims automatically.
 

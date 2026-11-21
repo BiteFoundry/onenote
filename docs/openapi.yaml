@@ -3,10 +3,10 @@ info:
   title: OneNote CLI Local HTTP API (@bitefoundry/onenote)
   version: 0.1.0
   description: >
-    Local HTTP JSON API exposed by `onenote serve` (default `127.0.0.1:8788`).
+    Local HTTP JSON API exposed by `onenote serve` (default `127.0.0.1:8793`).
     All `/v1/onenote/*` routes are also mirrored under `/onenote/*`.
 servers:
-  - url: http://127.0.0.1:8788
+  - url: http://127.0.0.1:8793
 components:
   securitySchemes:
     bearerAuth:

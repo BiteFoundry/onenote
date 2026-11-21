@@ -11,3 +11,4 @@ npm/*/bin/onenote.exe
 
 # local release staging
 /dist-release/
+npm/*/LICENSE

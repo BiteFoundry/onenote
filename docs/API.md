@@ -1,13 +1,16 @@
 # Local HTTP JSON API (`onenote serve`)
 
-`onenote serve` runs a local Axum HTTP server bound to `127.0.0.1:8788` by default.
+`onenote serve` runs a local Axum HTTP server bound to `127.0.0.1:8793` by default.
 
 ```sh
-# Start with default port (127.0.0.1:8788)
+# Start with default port (127.0.0.1:8793)
 onenote serve
 
-# Start on a custom address with Bearer token protection
-onenote serve --bind 127.0.0.1:8788 --token my-secret-token
+# Keep a client configured for the previous port
+onenote serve --port 8788
+
+# Set a bind address and require a Bearer token
+onenote serve --bind 127.0.0.1 --token my-secret-token
 ```
 
 When `--token` is provided, every endpoint except `/health` requires:

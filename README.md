@@ -24,7 +24,7 @@
 | **Minimal-Chrome 3-Pane TUI** | Personal, Teams/Group & SharePoint notebooks, colored section ribbon, nested subpages (`level 0/1/2`), bidirectional XHTML ↔ Markdown canvas, surgical `data-id` `PATCH` edits, `0ms` optimistic to-do toggles, Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), and 6 themes. |
 | **High-Res Terminal Images** | Inline thumbnails & fullscreen HD previews (`v` / `Alt+v`) with 80ms protocol probing for **Kitty**, **iTerm2**, **Sixel** (Floyd-Steinberg dithering), and **24-bit Unicode Half-Blocks** + `Ctrl+V` clipboard PNG upload. |
 | **Local SQLite FTS5 + IPC Daemon** | WAL-mode SQLite cache with 4-reader pool, trigram full-text search (`/`), persistent `DraftStore`, and a shared background sync daemon (`onenote daemon start`). |
-| **4-in-1 Agent Interface** | Interactive **TUI** (`onenote` / `note`), scriptable `--json` **CLI**, local **HTTP JSON API** (`onenote serve`, port `8788`), and stdio **MCP Server** (`onenote mcp`). |
+| **4-in-1 Agent Interface** | Interactive **TUI** (`onenote`), scriptable `--json` **CLI**, local **HTTP JSON API** (`onenote serve`, port `8793`), and stdio **MCP Server** (`onenote mcp`). |
 
 ---
 
@@ -37,12 +37,32 @@ npm i -g @bitefoundry/onenote
 # 2. Authenticate with Microsoft 365 (PKCE loopback, --device-code, or --token-file)
 onenote login
 
-# 3. Launch the interactive TUI (or use the short alias `note`)
+# 3. Launch the interactive TUI
 onenote
 ```
 
-> Required Microsoft Graph delegated scopes: `Notes.Read`, `Notes.ReadWrite`, `Notes.Create`, `User.Read`, `offline_access`.  
-> Prefer building from source? Run `cargo build --release` and see [docs/NPM.md](docs/NPM.md) for external token brokers & environment variables.
+Build from source with `cargo build --release`. See [installation and migration](docs/NPM.md) for updating scripts, MCP configurations, and local HTTP clients.
+
+### Company-managed Microsoft Entra sign-in
+
+`onenote login` uses the public Microsoft Graph Command Line Tools client by default. To use a company-owned app, register it as a public client and configure the `http://localhost` redirect URI. Enable public client flows for headless `--device-code` sign-in. [Company app registration guide](https://github.com/BiteFoundry/teams/blob/master/docs/ENTERPRISE.md)
+
+Add the Microsoft Graph delegated permissions your users need and have your Entra administrator grant consent where required.
+
+| Feature | Delegated scopes |
+| --- | --- |
+| Profile and session refresh | `User.Read`, `offline_access` |
+| Read, create, and edit the user's OneNote content | `Notes.Read`, `Notes.Create`, `Notes.ReadWrite` |
+| Discover joined Teams and read or edit organizational notebooks the user can access | `Team.ReadBasic.All`, `Notes.Read.All`, `Notes.ReadWrite.All` |
+
+The default sign-in adds the organizational scopes when you specify your company's tenant ID. Set `scopes` in `config.toml` to request a narrower set that matches your workflow.
+
+```sh
+onenote login --client-id YOUR_APP_ID --tenant-id YOUR_TENANT_ID
+onenote whoami --json
+```
+
+For persistent environment configuration, set `ONENOTE_CLIENT_ID` and `ONENOTE_TENANT_ID`.
 
 ---
 
@@ -94,12 +114,12 @@ On Windows, `desktop-set-page-level` and `desktop-rename-section` work on existi
 ### Local HTTP API (`onenote serve`)
 
 ```sh
-# Start local Axum JSON server (default 127.0.0.1:8788)
-onenote serve --bind 127.0.0.1:8788 --token dev-secret
+# Start local Axum JSON server (default 127.0.0.1:8793)
+onenote serve --token dev-secret
 
 # Query pages & FTS5 search from scripts or agents
 curl -H "Authorization: Bearer dev-secret" \
-  "http://127.0.0.1:8788/v1/onenote/search?q=canary&limit=10"
+  "http://127.0.0.1:8793/v1/onenote/search?q=canary&limit=10"
 ```
 
 Full route reference & OpenAPI 3.1 spec: [docs/API.md](docs/API.md) · [docs/openapi.yaml](docs/openapi.yaml).
@@ -129,10 +149,10 @@ Full tool catalog & schemas: [docs/MCP.md](docs/MCP.md).
 | --- | --- | --- |
 | [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams` | Microsoft Teams chats, channels, threads & meetings |
 | [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook` | Microsoft Outlook mail, calendar & contacts |
-| **`@bitefoundry/onenote`** | `onenote`, `note` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
-| [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `sp`, `onedrive`, `od` | Microsoft SharePoint sites, document libraries & OneDrive files |
-| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira issues, boards, sprints & Confluence pages |
-| [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion`, `nt` | Notion pages, databases, blocks & Markdown sync |
+| **`@bitefoundry/onenote`** | `onenote` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
+| [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `bitefoundry-onedrive` | Microsoft SharePoint sites, document libraries & OneDrive files |
+| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `confluence`, `conf` | Atlassian Jira issues, boards, sprints & Confluence pages |
+| [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion` | Notion pages, databases, blocks & Markdown sync |
 
 ---
 

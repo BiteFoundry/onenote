@@ -1,14 +1,13 @@
 <#
 .SYNOPSIS
-    Idempotently installs the `onenote` (`note`) terminal launcher on any Windows PC.
+    Installs the `onenote` terminal launcher on Windows.
 
 .DESCRIPTION
     1. Ensures <RepoRoot>\target\release\onenote.exe exists (downloads the prebuilt
        release binary from GitHub `BiteFoundry/onenote` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
-    2. Registers/updates `# >>> onenote launcher >>>` (`function onenote` & `Set-Alias note onenote`) in PowerShell $PROFILE.
-    3. If $HOME\Tools\bin exists, also writes `onenote.cmd` and `note.cmd` there so already-open shells
-       find `onenote` and `note` immediately.
+    2. Registers/updates `# >>> onenote launcher >>>` in the PowerShell profile.
+    3. If $HOME\Tools\bin exists, writes `onenote.cmd` and removes any matching launcher from the previous install.
 
 .EXAMPLE
     pwsh -File .\scripts\install-profile.ps1
@@ -66,7 +65,6 @@ function onenote {
     }
     & `$exe @args
 }
-Set-Alias -Name note -Value onenote -Force
 $endMarker
 "@.TrimEnd("`r", "`n")
 
@@ -109,12 +107,17 @@ if ($updated -ne $existing) {
 
 $toolsBin = Join-Path $HOME 'Tools\bin'
 if (Test-Path -LiteralPath $toolsBin) {
-    foreach ($shimName in @('onenote.cmd', 'note.cmd')) {
-        $shimPath = Join-Path $toolsBin $shimName
-        $shimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$releaseExe`" %*`r`n"
-        if ($PSCmdlet.ShouldProcess($shimPath, "Write PATH shim $shimName")) {
-            [System.IO.File]::WriteAllText($shimPath, $shimContent, [System.Text.Encoding]::ASCII)
-            Write-Output "Updated PATH shim: $shimPath"
-        }
+    $shimPath = Join-Path $toolsBin 'onenote.cmd'
+    $shimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$releaseExe`" %*`r`n"
+    if ($PSCmdlet.ShouldProcess($shimPath, 'Write PATH shim onenote.cmd')) {
+        [System.IO.File]::WriteAllText($shimPath, $shimContent, [System.Text.Encoding]::ASCII)
+        Write-Output "Updated PATH shim: $shimPath"
+    }
+
+    $legacyShim = Join-Path $toolsBin 'note.cmd'
+    if ((Test-Path -LiteralPath $legacyShim -PathType Leaf) -and
+        ([System.IO.File]::ReadAllText($legacyShim) -ceq $shimContent) -and
+        $PSCmdlet.ShouldProcess($legacyShim, 'Remove previous OneNote PATH shim')) {
+        Remove-Item -LiteralPath $legacyShim
     }
 }

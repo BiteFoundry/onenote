@@ -1,4 +1,4 @@
-//! Local HTTP JSON API server (`onenote serve`, default `127.0.0.1:8788`).
+//! Local HTTP JSON API server (`onenote serve`, default `127.0.0.1:8793`).
 //!
 //! Endpoints:
 //! - `GET /health`
