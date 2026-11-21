@@ -2,12 +2,14 @@
 
 # `@bitefoundry/onenote`
 
-**Keyboard-first Microsoft OneNote terminal client, CLI, HTTP API, and MCP server — powered by Rust, Ratatui, and local SQLite FTS5.**
+**Read and edit OneNote pages, search cached notebooks, and update checklists from the terminal.**
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fonenote?style=flat-square&color=7719AA&label=npm)](https://www.npmjs.com/package/@bitefoundry/onenote)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-2b3137?style=flat-square)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-dea584?style=flat-square)](https://github.com/BiteFoundry/onenote/blob/master/Cargo.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](LICENSE)
+
+[BiteFoundry](https://bitefoundry.dev/#app-onenote) · [Latest release notes](https://github.com/BiteFoundry/onenote/releases/latest)
 
 <br />
 
@@ -21,7 +23,7 @@
 
 | Capability | Details |
 | --- | --- |
-| **Minimal-Chrome 3-Pane TUI** | Personal, Teams/Group & SharePoint notebooks, colored section ribbon, nested subpages (`level 0/1/2`), bidirectional XHTML ↔ Markdown canvas, surgical `data-id` `PATCH` edits, `0ms` optimistic to-do toggles, Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), and 6 themes. |
+| **Minimal-Chrome 3-Pane TUI** | Personal, Teams/Group & SharePoint notebooks, colored section ribbon, nested subpages (`level 0/1/2`), bidirectional XHTML ↔ Markdown canvas, surgical `data-id` `PATCH` edits, optimistic to-do toggles, Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), and 6 themes. |
 | **High-Res Terminal Images** | Inline thumbnails & fullscreen HD previews (`v` / `Alt+v`) with 80ms protocol probing for **Kitty**, **iTerm2**, **Sixel** (Floyd-Steinberg dithering), and **24-bit Unicode Half-Blocks** + `Ctrl+V` clipboard PNG upload. |
 | **Local SQLite FTS5 + IPC Daemon** | WAL-mode SQLite cache with 4-reader pool, trigram full-text search (`/`), persistent `DraftStore`, and a shared background sync daemon (`onenote daemon start`). |
 | **4-in-1 Agent Interface** | Interactive **TUI** (`onenote`), scriptable `--json` **CLI**, local **HTTP JSON API** (`onenote serve`, port `8793`), and stdio **MCP Server** (`onenote mcp`). |
@@ -40,6 +42,12 @@ onenote login
 # 3. Launch the interactive TUI
 onenote
 ```
+
+```sh
+onenote read "Meeting notes" --json
+```
+
+Read a page with its key and notebook scope. Local search uses the identified account’s cache. If you use an opaque access token, run `onenote whoami` once online first. For full detail, add `--full` in the CLI or pass `compact: false` to `get_page` in MCP.
 
 Build from source with `cargo build --release`. See [installation and migration](docs/NPM.md) for updating scripts, MCP configurations, and local HTTP clients.
 
