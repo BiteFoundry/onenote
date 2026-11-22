@@ -229,6 +229,9 @@ pub enum Command {
     #[command(visible_alias = "cat")]
     Read {
         page: String,
+        /// Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup
+        #[arg(long)]
+        section: Option<String>,
         /// Text output format: md, plain, blocks or xhtml [default: md].
         /// With --json, an explicit --format keeps the full JSON page unless --compact is given.
         #[arg(long, value_parser = ["md", "plain", "blocks", "xhtml"])]
@@ -284,12 +287,18 @@ pub enum Command {
     Append {
         page: String,
         markdown_body: Option<String>,
+        /// Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup
+        #[arg(long)]
+        section: Option<String>,
         #[arg(long)]
         file: Option<PathBuf>,
         #[arg(long = "image", value_name = "img_path")]
         image: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// With --json: include the full page object in the response
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Update a OneNote page/block (`onenote update <page> ...`), or self-update when called without `<page>` (`onenote update --check`)
     #[command(
@@ -298,6 +307,9 @@ pub enum Command {
     Update {
         /// Page key/ID/title to update. Omit to run the GitHub Releases self-updater.
         page: Option<String>,
+        /// Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup
+        #[arg(long)]
+        section: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -326,6 +338,9 @@ pub enum Command {
         repo: Option<String>,
         #[arg(long)]
         json: bool,
+        /// With --json: include the full page object in the response
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Check GitHub Releases and self-update the `onenote` binary
     #[command(name = "self-update", visible_alias = "upgrade")]
@@ -342,6 +357,9 @@ pub enum Command {
     /// Toggle a OneNote `to-do` checkbox block (`--block-id` or `--index`)
     Check {
         page: String,
+        /// Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup
+        #[arg(long)]
+        section: Option<String>,
         #[arg(long = "block-id")]
         block_id: Option<String>,
         #[arg(long)]
@@ -360,11 +378,17 @@ pub enum Command {
         force: bool,
         #[arg(long)]
         json: bool,
+        /// With --json: include the full page object in the response
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Delete a OneNote page (`--yes` required with `--json` or non-interactive mode)
     #[command(visible_alias = "rm")]
     Delete {
         page: String,
+        /// Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup
+        #[arg(long)]
+        section: Option<String>,
         #[arg(long)]
         yes: bool,
         #[arg(long)]
@@ -748,10 +772,140 @@ pub fn try_fast_help_or_version() -> Option<Result<()>> {
     }
 }
 
+impl Command {
+    fn wants_json(&self) -> bool {
+        match self {
+            Command::Login { json, .. }
+            | Command::Logout { json }
+            | Command::Whoami { json }
+            | Command::Doctor { json, .. }
+            | Command::Notebooks { json, .. }
+            | Command::CreateNotebook { json, .. }
+            | Command::RenameNotebook { json, .. }
+            | Command::Sections { json, .. }
+            | Command::CreateSection { json, .. }
+            | Command::RenameSection { json, .. }
+            | Command::Pages { json, .. }
+            | Command::Read { json, .. }
+            | Command::Create { json, .. }
+            | Command::CopyPage { json, .. }
+            | Command::Append { json, .. }
+            | Command::Update { json, .. }
+            | Command::SelfUpdate { json, .. }
+            | Command::Check { json, .. }
+            | Command::Delete { json, .. }
+            | Command::Search { json, .. }
+            | Command::Resource { json, .. }
+            | Command::Sync { json } => *json,
+            #[cfg(windows)]
+            Command::DesktopSetPageLevel { json, .. }
+            | Command::DesktopRenameSection { json, .. } => *json,
+            Command::Daemon { action } => match action {
+                DaemonCommand::Start { json }
+                | DaemonCommand::Status { json }
+                | DaemonCommand::Stop { json }
+                | DaemonCommand::Restart { json } => *json,
+                DaemonCommand::Run => false,
+            },
+            Command::PreviewFile { .. } | Command::Tui | Command::Serve { .. } | Command::Mcp => {
+                false
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CliFailure {
+    code: String,
+    message: String,
+    extra: serde_json::Value,
+}
+
+impl std::fmt::Display for CliFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliFailure {}
+
+fn error_code(err: &anyhow::Error) -> (&'static str, Option<serde_json::Value>) {
+    let message = format!("{err:#}");
+    let lower = message.to_ascii_lowercase();
+    if let Some(status) = crate::graph::client::graph_http_status(err) {
+        return match status {
+            401 => ("unauthorized", None),
+            404 | 410 => ("not_found", None),
+            other => ("graph_error", Some(json!({ "http_status": other }))),
+        };
+    }
+    if message.starts_with("Conflict:") {
+        return ("conflict", None);
+    }
+    if message.starts_with("Ambiguous ") {
+        return ("ambiguous", None);
+    }
+    if message.starts_with("Refusing to delete") {
+        return ("confirmation_required", None);
+    }
+    if message.starts_with("Unknown identity") {
+        return ("unknown_identity", None);
+    }
+    if lower.contains("not found") {
+        return ("not_found", None);
+    }
+    ("error", None)
+}
+
+fn cli_error_json(err: &anyhow::Error) -> serde_json::Value {
+    if let Some(failure) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CliFailure>())
+    {
+        let mut map = serde_json::Map::new();
+        map.insert("ok".to_string(), json!(false));
+        if let Some(extra) = failure.extra.as_object() {
+            for (k, v) in extra {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+        map.insert(
+            "error".to_string(),
+            json!({
+                "code": failure.code,
+                "message": failure.message,
+            }),
+        );
+        return serde_json::Value::Object(map);
+    }
+    let message = format!("{err:#}");
+    let (code, details) = error_code(err);
+    let mut error_obj = json!({
+        "code": code,
+        "message": message,
+    });
+    if let Some(details) = details {
+        error_obj["details"] = details;
+    }
+    json!({
+        "ok": false,
+        "error": error_obj,
+    })
+}
+
 pub async fn run_from_env() -> Result<()> {
     let mut cfg = AppConfig::load();
     let cli = Cli::parse();
-    dispatch_command(&mut cfg, cli.command).await
+    let wants_json = cli.command.as_ref().is_some_and(Command::wants_json);
+    let res = dispatch_command(&mut cfg, cli.command).await;
+    if let Err(ref err) = res {
+        if wants_json {
+            if let Ok(rendered) = serde_json::to_string_pretty(&cli_error_json(err)) {
+                println!("{rendered}");
+            }
+        }
+    }
+    res
 }
 
 pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Result<()> {
@@ -865,6 +1019,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
         }) => cmd_pages(cfg, &section, limit, cursor, refresh, offline, cached, json).await,
         Some(Command::Read {
             page,
+            section,
             format,
             preview_images,
             offline,
@@ -876,6 +1031,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             cmd_read(
                 cfg,
                 &page,
+                section.as_deref(),
                 format.as_deref(),
                 preview_images,
                 offline,
@@ -918,17 +1074,52 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             let outcome = graph
                 .copy_onenote_page(&page, &section, operation.as_deref(), wait_seconds)
                 .await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&outcome)?);
-            }
             if !outcome.ok {
-                let detail = outcome.error.as_deref().unwrap_or("Graph has not confirmed completion");
-                bail!(
+                let detail = outcome
+                    .error
+                    .as_deref()
+                    .unwrap_or("Graph has not confirmed completion");
+                let message = format!(
                     "Copy {:?} ({}): {detail}. Check the existing operation with --operation '{}'.",
                     outcome.status, outcome.operation_id, outcome.operation_url
                 );
+                let mut extra = serde_json::to_value(&outcome)?;
+                let status_str = extra
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("failed")
+                    .to_string();
+                if let Some(obj) = extra.as_object_mut() {
+                    obj.remove("ok");
+                    obj.remove("error");
+                }
+                return Err(anyhow::Error::new(CliFailure {
+                    code: format!("copy_{status_str}"),
+                    message,
+                    extra,
+                }));
             }
-            if !json {
+            nudge_live_daemon(
+                cfg,
+                &graph,
+                sync::SyncCommand::RefreshSectionPages {
+                    section_key: outcome.destination_section_key.clone(),
+                },
+            )
+            .await;
+            if let Some(ref new_page_key) = outcome.new_page_key {
+                nudge_live_daemon(
+                    cfg,
+                    &graph,
+                    sync::SyncCommand::HydratePage {
+                        page_key: new_page_key.clone(),
+                    },
+                )
+                .await;
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
                 println!(
                     "Copied {} to {} as {}",
                     outcome.source_page_key,
@@ -941,22 +1132,27 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
         Some(Command::Append {
             page,
             markdown_body,
+            section,
             file,
             image,
             json,
+            full,
         }) => {
             cmd_append(
                 cfg,
                 &page,
+                section.as_deref(),
                 markdown_body.as_deref(),
                 file.as_deref(),
                 &image,
                 json,
+                full,
             )
             .await
         }
         Some(Command::Update {
             page,
+            section,
             title,
             body,
             file,
@@ -968,11 +1164,13 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             force,
             repo,
             json,
+            full,
         }) => {
             if let Some(page_query) = page {
                 cmd_update_page(
                     cfg,
                     &page_query,
+                    section.as_deref(),
                     title.as_deref(),
                     body.as_deref(),
                     file.as_deref(),
@@ -981,6 +1179,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
                     expected_content.as_deref(),
                     force,
                     json,
+                    full,
                 )
                 .await
             } else {
@@ -995,6 +1194,7 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
         }) => cmd_self_update(cfg, check, force, repo.as_deref(), json).await,
         Some(Command::Check {
             page,
+            section,
             block_id,
             index,
             done,
@@ -1002,20 +1202,28 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             expected_content,
             force,
             json,
+            full,
         }) => {
             cmd_check(
                 cfg,
                 &page,
+                section.as_deref(),
                 block_id.as_deref(),
                 index,
                 (done || undone).then_some(done),
                 expected_content.as_deref(),
                 force,
                 json,
+                full,
             )
             .await
         }
-        Some(Command::Delete { page, yes, json }) => cmd_delete(cfg, &page, yes, json).await,
+        Some(Command::Delete {
+            page,
+            section,
+            yes,
+            json,
+        }) => cmd_delete(cfg, &page, section.as_deref(), yes, json).await,
         Some(Command::Search {
             query,
             section,
@@ -1598,6 +1806,45 @@ pub async fn load_onenote_page_detail(
     load_onenote_page_detail_with_cache(storage, graph, page_query, offline, false).await
 }
 
+async fn fetch_onenote_page_detail_remote(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+) -> Result<OnenotePageDetail> {
+    let q = page_query.trim();
+    if q.is_empty() {
+        bail!("Page ID or title is empty.");
+    }
+    let cached_summary = resolver::resolve_page_cached(storage, q, None)?.into_option()?;
+    let was_cached = cached_summary.is_some();
+    let (scope, raw_id) = match cached_summary.as_ref() {
+        Some(s) => (s.scope.clone(), s.id.clone()),
+        None => split_onenote_entity_key(q),
+    };
+    let resolved_page_key = cached_summary
+        .as_ref()
+        .map(|s| s.page_key.clone())
+        .unwrap_or_else(|| scope.make_entity_key(&raw_id));
+
+    match graph
+        .get_onenote_page_detail(&scope, &raw_id, cached_summary)
+        .await
+    {
+        Ok(d) => Ok(d),
+        Err(err) => {
+            if crate::graph::onenote::is_not_found_error(&err) {
+                let _ = storage.delete_onenote_page(&resolved_page_key);
+                if !was_cached {
+                    return Err(err.context(format!(
+                        "OneNote page not found: '{q}' is neither a cached title nor a page ID. Pass a page key from 'onenote pages SECTION --json', or add --section to look the title up in one section."
+                    )));
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
 pub async fn load_onenote_page_detail_with_cache(
     storage: &Storage,
     graph: &GraphClient,
@@ -1614,11 +1861,7 @@ pub async fn load_onenote_page_detail_with_cache(
         if let Some(detail) = storage.get_onenote_page_detail(q)? {
             return Ok(detail);
         }
-    }
-
-    let cached_summary = resolver::resolve_page_cached(storage, q, None)?.into_option()?;
-
-    if offline || cached {
+        let cached_summary = resolver::resolve_page_cached(storage, q, None)?.into_option()?;
         if let Some(ref summary) = cached_summary {
             if let Some(detail) = storage.get_onenote_page_detail(&summary.page_key)? {
                 return Ok(detail);
@@ -1629,27 +1872,7 @@ pub async fn load_onenote_page_detail_with_cache(
         }
     }
 
-    let (scope, raw_id) = match cached_summary.as_ref() {
-        Some(s) => (s.scope.clone(), s.id.clone()),
-        None => split_onenote_entity_key(q),
-    };
-    let resolved_page_key = cached_summary
-        .as_ref()
-        .map(|s| s.page_key.clone())
-        .unwrap_or_else(|| scope.make_entity_key(&raw_id));
-
-    let detail = match graph
-        .get_onenote_page_detail(&scope, &raw_id, cached_summary)
-        .await
-    {
-        Ok(d) => d,
-        Err(err) => {
-            if crate::graph::onenote::is_not_found_error(&err) {
-                let _ = storage.delete_onenote_page(&resolved_page_key);
-            }
-            return Err(err);
-        }
-    };
+    let detail = fetch_onenote_page_detail_remote(storage, graph, q).await?;
     storage.upsert_onenote_page_detail(&detail)?;
     Ok(detail)
 }
@@ -1705,8 +1928,17 @@ pub async fn rename_onenote_section_helper(
     section_key: &str,
     name: &str,
 ) -> Result<OnenoteSection> {
-    let (scope, id) = split_onenote_entity_key(section_key.trim());
-    let section = graph.rename_onenote_section(&scope, &id, name).await?;
+    let trimmed = section_key.trim();
+    let (scope, id) = split_onenote_entity_key(trimmed);
+    let section = match graph.rename_onenote_section(&scope, &id, name).await {
+        Ok(section) => section,
+        Err(err) if crate::graph::onenote::is_not_found_error(&err) => {
+            return Err(err.context(format!(
+                "OneNote section not found: '{trimmed}'. rename-section takes a section ID or scoped key from 'onenote sections --json'."
+            )));
+        }
+        Err(err) => return Err(err),
+    };
     storage.upsert_onenote_sections(std::slice::from_ref(&section))?;
     Ok(section)
 }
@@ -1915,7 +2147,11 @@ async fn update_onenote_content_guarded(
         );
     }
     let cached_before = load_cached_detail_for_query(storage, page_query)?;
-    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
+    let detail = fetch_onenote_page_detail_remote(storage, graph, page_query).await?;
+    let implicit_baseline = !force && expected_content.is_none() && cached_before.is_some();
+    if !implicit_baseline {
+        storage.upsert_onenote_page_detail(&detail)?;
+    }
 
     if !force {
         if let Some(bid) = trimmed_bid {
@@ -1999,6 +2235,9 @@ async fn update_onenote_content_guarded(
                 }
             }
         }
+    }
+    if implicit_baseline {
+        storage.upsert_onenote_page_detail(&detail)?;
     }
 
     let commands = if let Some(bid) = trimmed_bid {
@@ -2150,7 +2389,11 @@ async fn change_onenote_todo_guarded(
     force: bool,
 ) -> Result<GuardedTodoResult> {
     let cached_before = load_cached_detail_for_query(storage, page_query)?;
-    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
+    let detail = fetch_onenote_page_detail_remote(storage, graph, page_query).await?;
+    let implicit_baseline = !force && expected_content.is_none() && cached_before.is_some();
+    if !implicit_baseline {
+        storage.upsert_onenote_page_detail(&detail)?;
+    }
     let target_block: &OnenoteBlock =
         if let Some(bid) = block_id.map(str::trim).filter(|s| !s.is_empty()) {
             match parser::onenote::find_todo_block_by_element_id(&detail, bid) {
@@ -2213,6 +2456,9 @@ async fn change_onenote_todo_guarded(
             }
         }
     }
+    if implicit_baseline {
+        storage.upsert_onenote_page_detail(&detail)?;
+    }
 
     let Some(OnenoteTagKind::Todo { completed: current }) = target_block.tag else {
         bail!("Selected block is not a OneNote to-do item.");
@@ -2260,6 +2506,7 @@ pub async fn delete_onenote_page_helper(
         bail!("Page ID or title is empty.");
     }
     let cached = resolver::resolve_page_cached(storage, q, None)?.into_option()?;
+    let was_cached = cached.is_some();
     let (scope, raw_id, page_key) = match cached {
         Some(s) => (s.scope, s.id, s.page_key),
         None => {
@@ -2268,7 +2515,14 @@ pub async fn delete_onenote_page_helper(
             (s, id, key)
         }
     };
-    graph.delete_onenote_page(&scope, &raw_id).await?;
+    if let Err(err) = graph.delete_onenote_page(&scope, &raw_id).await {
+        if !was_cached && crate::graph::onenote::is_not_found_error(&err) {
+            return Err(err.context(format!(
+                "OneNote page not found: '{q}' is neither a cached title nor a page ID. Pass a page key from 'onenote pages SECTION --json', or add --section to look the title up in one section."
+            )));
+        }
+        return Err(err);
+    }
     let _ = storage.delete_onenote_page(&page_key);
     Ok(page_key)
 }
@@ -2449,16 +2703,29 @@ pub async fn search_onenote_with_offset(
         return Ok((Vec::new(), None));
     }
     let sec_filter = section_filter.map(str::trim).filter(|s| !s.is_empty());
+    let sql_section_key = match sec_filter {
+        Some(sec_q) if sec_q.contains('|') => Some(sec_q.to_string()),
+        Some(sec_q) if sec_q.contains('/') => {
+            let sec = resolve_onenote_section_query(storage, graph, sec_q, true).await?;
+            Some(sec.section_key)
+        }
+        _ => None,
+    };
+    let post_filter = if sql_section_key.is_some() {
+        None
+    } else {
+        sec_filter
+    };
     let end = offset.saturating_add(limit);
     let want = end.saturating_add(1);
-    let fetch_n = if sec_filter.is_some() {
+    let fetch_n = if post_filter.is_some() {
         want.saturating_mul(2).max(20)
     } else {
         want
     };
-    let mut raw = storage.search_onenote_pages(query, None, fetch_n)?;
+    let mut raw = storage.search_onenote_pages(query, sql_section_key.as_deref(), fetch_n)?;
     let raw_full = raw.len() == fetch_n;
-    if let Some(sec_q) = sec_filter {
+    if let Some(sec_q) = post_filter {
         let needle = sec_q.to_lowercase();
         raw.retain(|h| {
             h.section_id == sec_q
@@ -2469,7 +2736,7 @@ pub async fn search_onenote_with_offset(
     }
     let has_more = if raw.len() > end {
         Some(true)
-    } else if sec_filter.is_some() && raw_full {
+    } else if post_filter.is_some() && raw_full {
         None
     } else {
         Some(false)
@@ -3064,6 +3331,30 @@ pub(crate) fn page_content_json(
     })
 }
 
+pub(crate) fn write_result_json(
+    detail: &OnenotePageDetail,
+    block_id: Option<&str>,
+    completed: Option<bool>,
+    full: bool,
+) -> serde_json::Value {
+    let mut out = json!({
+        "ok": true,
+        "page_key": detail.summary.page_key,
+        "title": detail.summary.title,
+        "last_modified_at": detail.summary.last_modified_at,
+    });
+    if let Some(bid) = block_id.map(str::trim).filter(|s| !s.is_empty()) {
+        out["block_id"] = json!(bid);
+    }
+    if let Some(done) = completed {
+        out["completed"] = json!(done);
+    }
+    if full {
+        out["page"] = json!(detail);
+    }
+    out
+}
+
 fn read_json_is_compact(format_explicit: bool, compact: bool, full: bool) -> bool {
     if full {
         false
@@ -3078,6 +3369,7 @@ fn read_json_is_compact(format_explicit: bool, compact: bool, full: bool) -> boo
 async fn cmd_read(
     cfg: &AppConfig,
     page: &str,
+    section: Option<&str>,
     format: Option<&str>,
     preview_images: bool,
     offline: bool,
@@ -3092,7 +3384,11 @@ async fn cmd_read(
         IdentityMode::AllowNetwork
     };
     let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, mode).await?;
-    let detail = load_onenote_page_detail_with_cache(&storage, &graph, page, offline, cached).await?;
+    let resolved_page =
+        resolve_page_query_in_section(&storage, &graph, page, section, offline || cached).await?;
+    let detail =
+        load_onenote_page_detail_with_cache(&storage, &graph, &resolved_page, offline, cached)
+            .await?;
     if json_out {
         let is_compact = read_json_is_compact(format.is_some(), compact, full);
         let page = page_content_json(&detail, is_compact, PageSurface::Cli);
@@ -3187,19 +3483,24 @@ async fn cmd_create(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_append(
     cfg: &AppConfig,
     page: &str,
+    section: Option<&str>,
     markdown_body: Option<&str>,
     file: Option<&Path>,
     images: &[PathBuf],
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     let body = resolve_markdown_input(markdown_body, file)?;
     let inline_images = load_inline_images_from_paths(images)?;
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let resolved_page =
+        resolve_page_query_in_section(&storage, &graph, page, section, false).await?;
     let updated =
-        append_onenote_page_helper(&storage, &graph, page, &body, &inline_images).await?;
+        append_onenote_page_helper(&storage, &graph, &resolved_page, &body, &inline_images).await?;
     nudge_live_daemon(
         cfg,
         &graph,
@@ -3224,7 +3525,7 @@ async fn cmd_append(
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "page": updated }))?
+            serde_json::to_string_pretty(&write_result_json(&updated, None, None, full))?
         );
     } else {
         println!("Appended content to page '{}' ({}).", updated.summary.title, updated.summary.page_key);
@@ -3236,6 +3537,7 @@ async fn cmd_append(
 async fn cmd_update_page(
     cfg: &AppConfig,
     page: &str,
+    section: Option<&str>,
     title: Option<&str>,
     body: Option<&str>,
     file: Option<&Path>,
@@ -3244,6 +3546,7 @@ async fn cmd_update_page(
     expected_content: Option<&str>,
     force: bool,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     let loaded_body = match (body, file) {
         (_, Some(path)) => Some(
@@ -3254,10 +3557,12 @@ async fn cmd_update_page(
         (None, None) => None,
     };
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let resolved_page =
+        resolve_page_query_in_section(&storage, &graph, page, section, false).await?;
     let updated = update_onenote_content_helper_with_guard(
         &storage,
         &graph,
-        page,
+        &resolved_page,
         title,
         loaded_body.as_deref(),
         block_id,
@@ -3290,7 +3595,7 @@ async fn cmd_update_page(
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "page": updated }))?
+            serde_json::to_string_pretty(&write_result_json(&updated, block_id, None, full))?
         );
     } else {
         println!("Updated page '{}' ({}).", updated.summary.title, updated.summary.page_key);
@@ -3298,21 +3603,26 @@ async fn cmd_update_page(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_check(
     cfg: &AppConfig,
     page: &str,
+    section: Option<&str>,
     block_id: Option<&str>,
     index: Option<usize>,
     completed: Option<bool>,
     expected_content: Option<&str>,
     force: bool,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let resolved_page =
+        resolve_page_query_in_section(&storage, &graph, page, section, false).await?;
     let (updated, target_id, completed) = change_onenote_todo_helper_with_guard(
         &storage,
         &graph,
-        page,
+        &resolved_page,
         block_id,
         index,
         completed,
@@ -3344,13 +3654,12 @@ async fn cmd_check(
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "page_key": updated.summary.page_key,
-                "block_id": target_id,
-                "completed": completed,
-                "page": updated,
-            }))?
+            serde_json::to_string_pretty(&write_result_json(
+                &updated,
+                Some(&target_id),
+                Some(completed),
+                full,
+            ))?
         );
     } else {
         let state = if completed { "checked [x]" } else { "unchecked [ ]" };
@@ -3359,7 +3668,13 @@ async fn cmd_check(
     Ok(())
 }
 
-async fn cmd_delete(cfg: &AppConfig, page: &str, yes: bool, json_out: bool) -> Result<()> {
+async fn cmd_delete(
+    cfg: &AppConfig,
+    page: &str,
+    section: Option<&str>,
+    yes: bool,
+    json_out: bool,
+) -> Result<()> {
     if !yes {
         if json_out || !io::stdin().is_terminal() {
             bail!("Refusing to delete page without `--yes` in JSON or non-interactive mode.");
@@ -3374,10 +3689,12 @@ async fn cmd_delete(cfg: &AppConfig, page: &str, yes: bool, json_out: bool) -> R
         }
     }
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let section_key = resolver::resolve_page_cached(&storage, page, None)?
+    let resolved_page =
+        resolve_page_query_in_section(&storage, &graph, page, section, false).await?;
+    let section_key = resolver::resolve_page_cached(&storage, &resolved_page, None)?
         .into_option()?
         .map(|s| s.scope.make_entity_key(&s.section_id));
-    let deleted_key = delete_onenote_page_helper(&storage, &graph, page).await?;
+    let deleted_key = delete_onenote_page_helper(&storage, &graph, &resolved_page).await?;
     let nudge_cmd = match section_key {
         Some(sec_key) => sync::SyncCommand::RefreshSectionPages {
             section_key: sec_key,

@@ -38,7 +38,7 @@ If installed via `npx`:
 | `list_notebooks` | List accessible OneNote notebooks (personal, Teams/Group, SharePoint) | `include_teams?`, `limit?`, `cursor?`, `refresh?`, `offline?` |
 | `list_sections` | List sections in a notebook or across all notebooks | `notebook?`, `limit?`, `cursor?`, `refresh?`, `offline?` |
 | `list_pages` | List pages in a section (supports `Notebook/Section`, name, or ID) | `section` (required), `limit?`, `cursor?`, `refresh?`, `offline?` |
-| `get_page` | Read compact Markdown and identifiers; pass compact: false for XHTML, blocks and resources | `page` (required), `compact?`, `offline?` |
+| `get_page` | Read compact Markdown and identifiers; pass compact: false for XHTML, blocks and resources | `page` (required), `section?`, `compact?`, `offline?` |
 | `create_notebook` | Create a new OneNote notebook | `name` (required), `group_id?`, `site_id?` |
 | `rename_notebook` | Rename a OneNote notebook package by explicit storage IDs | `drive_id`, `item_id`, `name` (all required) |
 | `create_section` | Create a new section inside a notebook | `notebook` (required), `name` (required) |
@@ -47,10 +47,10 @@ If installed via `npx`:
 | `desktop_set_page_level` | Set the indentation of an existing page in OneNote for Windows | `page_id`, `level` (both required, level 0–2) |
 | `create_page` | Create a top-level OneNote page from Markdown and local images | `section` (required), `title` (required), `markdown?`, `level?` (0), `image_paths?` |
 | `copy_page` | Copy an existing page through Graph and verify its destination and new ID | `page`, `section` (IDs or scoped keys, both required), `operation_url?`, `wait_seconds?` |
-| `append_page` | Append Markdown and local images to the primary page region | `page` (required), `markdown` (required), `image_paths?` |
-| `update_block`, `update_page` | Replace a block, edit its text, or update the page title/body | `page` (required), `block_id?`, `title?`, `markdown?`, `replace_text?`, `with_text?`, `expected_content?`, `force?` |
-| `toggle_todo` | Set or toggle a checkbox by element ID or zero-based index | `page` (required), `block_id?`, `todo_index?`, `completed?`, `expected_content?`, `force?` |
-| `delete_page` | Permanently delete a OneNote page | `page` (required), `confirm: true` (required) |
+| `append_page` | Append Markdown and local images to the primary page region | `page` (required), `section?`, `markdown` (required), `image_paths?`, `compact?` |
+| `update_block`, `update_page` | Replace a block, edit its text, or update the page title/body | `page` (required), `section?`, `block_id?`, `title?`, `markdown?`, `replace_text?`, `with_text?`, `expected_content?`, `force?`, `compact?` |
+| `toggle_todo` | Set or toggle a checkbox by element ID or zero-based index | `page` (required), `section?`, `block_id?`, `todo_index?`, `completed?`, `expected_content?`, `force?`, `compact?` |
+| `delete_page` | Permanently delete a OneNote page | `page` (required), `section?`, `confirm: true` (required) |
 | `search_pages` | Full-text search across locally cached OneNote pages (SQLite FTS5) | `query` (required), `section?`, `limit?`, `cursor?`, `refresh?` |
 | `download_resource` | Download an embedded OneNote image or file attachment to disk | `page` (required), `index?`, `out_dir?` |
 
@@ -58,11 +58,11 @@ The server resolves the signed-in account and local cache on the first `tools/ca
 
 ### Page reads and writes
 
-`get_page` returns the compact page by default, including `page.page_key`, `page.scope`, `page.omitted`, and `page.hint`. Pass `compact: false` to read `page.blocks[].element_id`, `page.raw_xhtml`, and `page.resources`. Write tools (`append_page`, `update_block`, `update_page`, `toggle_todo`) always return the full `page` object. Use current element IDs for block writes. Both `update_block` and its `update_page` alias appear in `tools/list`.
+`get_page` returns the compact page by default, including `page.page_key`, `page.scope`, `page.omitted`, and `page.hint`. Pass `compact: false` to read `page.blocks[].element_id`, `page.raw_xhtml`, and `page.resources`. Write tools (`append_page`, `update_block`, `update_page`, `toggle_todo`) return a compact summary (`ok`, `page_key`, `title`, `last_modified_at`, plus `block_id` / `completed` where applicable) by default; pass `compact: false` to include the full `page` object. Page tools (`get_page`, `append_page`, `update_block`, `update_page`, `toggle_todo`, `delete_page`) accept an optional `section` argument to narrow title lookup. Use current element IDs for block writes. Both `update_block` and its `update_page` alias appear in `tools/list`.
 
 ### List paging
 
-`list_notebooks` and `list_sections` return up to 50 items by default (`limit` range `1`–`1000`); `list_pages` defaults to 50 and `search_pages` defaults to 30. All four responses include `returned`, `has_more`, and `next_cursor` (pass `next_cursor` back as `cursor` to read the next page). When called with `offline: true`, `list_notebooks`, `list_sections`, and `list_pages` also include `cache_synced_at` (an RFC 3339 timestamp string, or `null` when the cache has never been synced). `search_pages` includes `cache: { pages, pages_with_body }` to show how many cached pages exist and how many have hydrated bodies.
+`list_notebooks`, `list_sections`, `list_pages`, and `search_pages` enforce `limit` in `1`–`1000` (`list_notebooks`, `list_sections`, and `list_pages` default to 50; `search_pages` defaults to 30). All four responses include `returned`, `has_more`, and `next_cursor` (pass `next_cursor` back as `cursor` to read the next page). When called with `offline: true`, `list_notebooks`, `list_sections`, and `list_pages` also include `cache_synced_at` (an RFC 3339 timestamp string, or `null` when the cache has never been synced). `search_pages` includes `cache: { pages, pages_with_body }` to show how many cached pages exist and how many have hydrated bodies; body search covers pages that have been read or synced.
 
 `rename_section` takes the section's current ID from `list_sections`. `rename_notebook` takes the current DriveItem ID and requires a delegated file-write token. The desktop tools use the Windows app's object IDs from `GetHierarchy`. [Hierarchy operations and permissions](API.md#hierarchy-operations)
 

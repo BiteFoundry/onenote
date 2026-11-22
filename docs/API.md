@@ -34,7 +34,7 @@ All OneNote endpoints are served under both `/v1/onenote/...` and the shorter `/
 | `GET` | `/v1/onenote/pages` | List pages in a section (`?section=...&limit=50&refresh=false&offline=false`) |
 | `POST` | `/v1/onenote/pages` | Create a top-level page (`{ section, title, markdown?, level?, image_paths? }`). `level` defaults to 0. |
 | `GET` | `/v1/onenote/pages/{page}` | Get structured page detail (`?section=...&offline=false`) |
-| `PATCH` | `/v1/onenote/pages/{page}` | Update block or page (`{ block_id?, title?, markdown?, section? }`) |
+| `PATCH` | `/v1/onenote/pages/{page}` | Update block or page (`{ block_id?, title?, markdown?, expected_content?, force?, section? }`) |
 | `DELETE` | `/v1/onenote/pages/{page}` | Delete page (`?section=...`) |
 | `POST` | `/v1/onenote/pages/{page}/append` | Append Markdown/images (`{ markdown, images? \| image_paths?, section? }`) |
 | `POST` | `/v1/onenote/pages/{page}/todo` | Set or toggle checkbox (`{ block_id?, index?, completed?, expected_content?, force?, section? }`; alias: `/pages/{page}/toggle-todo`) |
@@ -82,7 +82,7 @@ Sign in with a delegated personal Microsoft account or work or school account. T
 
 The client sends one copy request, takes the operation URL from the `202 Accepted` response, and polls it on the configured Graph origin. On completion, the client reads the new page and verifies its ID differs from the source ID and its parent matches the requested destination. The original page and its links stay in place. [Graph operation status](https://learn.microsoft.com/en-us/graph/api/onenoteoperation-get?view=graph-rest-1.0) · [Graph page metadata](https://learn.microsoft.com/en-us/graph/api/page-get?view=graph-rest-1.0)
 
-The JSON result includes `source_page_id`, `destination_section_id`, `operation_id` and `operation_url`. A verified copy returns `status: "completed"`, `new_page_id` and `new_page_key`. If polling reaches its deadline, the status is `pending`. A terminal Graph error returns `failed`. Polling errors and destination read-back errors return `status_unavailable` and `verification_failed` respectively. The CLI exits nonzero for these four outcomes and still prints the result with `--json`.
+The JSON result includes `source_page_id`, `destination_section_id`, `operation_id` and `operation_url`. A verified copy returns `status: "completed"`, `new_page_id` and `new_page_key`. If polling reaches its deadline, the status is `pending`. A terminal Graph error returns `failed`. Polling errors and destination read-back errors return `status_unavailable` and `verification_failed` respectively. The CLI exits nonzero for these four outcomes and prints a single JSON object with `ok: false`, the top-level operation fields, and `error: { code, message }` when `--json` is passed.
 
 Polling defaults to 20 seconds. Use `--wait-seconds 0` to return the accepted operation handle immediately. To check the same operation, use `--operation` with the returned `operation_url` and the original page and section arguments. If submission fails before you receive a usable operation URL, check the destination before submitting a new copy. See also [MCP copy_page](MCP.md#copy_page).
 

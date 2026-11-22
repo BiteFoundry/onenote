@@ -811,7 +811,7 @@ impl GraphClient {
     ) -> Result<OnenoteNotebook> {
         let name = display_name.trim();
         if name.is_empty() {
-            bail!("OneNote 필기장 이름을 입력해야 합니다.");
+            bail!("OneNote notebook name is required.");
         }
         let path = format!("{}/notebooks", scope.graph_base_path());
         let raw: GraphOnenoteNotebook = self
@@ -1350,11 +1350,11 @@ impl GraphClient {
     ) -> Result<OnenoteSection> {
         let nb_id = clean_raw_onenote_id(notebook_id);
         if nb_id.is_empty() {
-            bail!("OneNote 필기장 ID를 지정해야 합니다.");
+            bail!("OneNote notebook ID is required.");
         }
         let name = display_name.trim();
         if name.is_empty() {
-            bail!("OneNote 섹션 이름을 입력해야 합니다.");
+            bail!("OneNote section name is required.");
         }
         let path = format!(
             "{}/notebooks/{}/sections",
@@ -1484,7 +1484,7 @@ impl GraphClient {
         }
         let sec_id = clean_raw_onenote_id(section_id);
         if sec_id.is_empty() {
-            bail!("OneNote 섹션 ID를 지정해야 합니다.");
+            bail!("OneNote section ID is required.");
         }
         let top = limit.clamp(1, 100);
         let base = scope.graph_base_path();
@@ -1537,7 +1537,7 @@ impl GraphClient {
     ) -> Result<String> {
         let pid = clean_raw_onenote_id(page_id);
         if pid.is_empty() {
-            bail!("OneNote 페이지 ID를 지정해야 합니다.");
+            bail!("OneNote page ID is required.");
         }
         let base = scope.graph_base_path();
         let pid_enc = urlencoding::encode(&pid);
@@ -1553,7 +1553,7 @@ impl GraphClient {
     ) -> Result<OnenotePageSummary> {
         let pid = clean_raw_onenote_id(page_id);
         if pid.is_empty() {
-            bail!("OneNote 페이지 ID를 지정해야 합니다.");
+            bail!("OneNote page ID is required.");
         }
         let base = scope.graph_base_path();
         let pid_enc = urlencoding::encode(&pid);
@@ -1577,7 +1577,7 @@ impl GraphClient {
     ) -> Result<OnenotePageDetail> {
         let pid = clean_raw_onenote_id(page_id);
         if pid.is_empty() {
-            bail!("OneNote 페이지 ID를 지정해야 합니다.");
+            bail!("OneNote page ID is required.");
         }
         let base = scope.graph_base_path();
         let pid_enc = urlencoding::encode(&pid);
@@ -1633,7 +1633,7 @@ impl GraphClient {
         validate_page_creation_level(outgoing.level)?;
         let sec_id = clean_raw_onenote_id(section_id);
         if sec_id.is_empty() {
-            bail!("OneNote 섹션 ID를 지정해야 합니다.");
+            bail!("OneNote section ID is required.");
         }
         let (bytes, content_type) = crate::parser::onenote::compile_new_page_payload(outgoing);
         let path = format!(
@@ -1668,7 +1668,7 @@ impl GraphClient {
         }
         let pid = clean_raw_onenote_id(page_id);
         if pid.is_empty() {
-            bail!("OneNote 페이지 ID를 지정해야 합니다.");
+            bail!("OneNote page ID is required.");
         }
         let bytes = serde_json::to_vec(commands)?;
         self.patch_bytes_empty(
@@ -1693,7 +1693,7 @@ impl GraphClient {
     ) -> Result<()> {
         let pid = clean_raw_onenote_id(page_id);
         if pid.is_empty() {
-            bail!("OneNote 페이지 ID를 지정해야 합니다.");
+            bail!("OneNote page ID is required.");
         }
         let (bytes, ct) = crate::parser::onenote::build_append_markdown_payload(
             primary_div_id,
@@ -1715,7 +1715,7 @@ impl GraphClient {
     pub async fn delete_onenote_page(&self, scope: &OnenoteScope, page_id: &str) -> Result<()> {
         let pid = clean_raw_onenote_id(page_id);
         if pid.is_empty() {
-            bail!("OneNote 페이지 ID를 지정해야 합니다.");
+            bail!("OneNote page ID is required.");
         }
         self.delete_req(&format!(
             "{}/pages/{}",

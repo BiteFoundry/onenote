@@ -105,9 +105,15 @@ impl GraphClient {
                 body["groupId"] = serde_json::json!(group_id);
             }
             let headers = self.start_operation(&path, body).await.map_err(|err| {
-                anyhow::anyhow!(
-                    "Copy submission returned no usable operation handle ({err:#}). Check the destination before submitting another copy."
-                )
+                if super::client::graph_http_status(&err) == Some(404) {
+                    err.context(format!(
+                        "Copy was not submitted: Graph found no page '{source_id}' or no section '{section_id}' (404 not found). copy-page takes IDs or scoped keys from 'onenote pages'/'onenote sections --json', not names."
+                    ))
+                } else {
+                    anyhow::anyhow!(
+                        "Copy submission returned no usable operation handle ({err:#}). Check the destination before submitting another copy."
+                    )
+                }
             })?;
             let location = headers
                 .get("Operation-Location")

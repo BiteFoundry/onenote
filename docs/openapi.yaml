@@ -193,6 +193,8 @@ paths:
                 block_id: { type: string }
                 title: { type: string }
                 markdown: { type: string }
+                expected_content: { type: string }
+                force: { type: boolean, default: false }
                 section: { type: string }
       responses:
         '200':

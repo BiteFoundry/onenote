@@ -179,6 +179,12 @@ pub struct CreatePageBody {
     pub level: Option<i32>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct DeletePageQuery {
+    #[serde(default)]
+    pub section: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PatchPageBody {
     #[serde(default)]
@@ -191,6 +197,8 @@ pub struct PatchPageBody {
     pub expected_content: Option<String>,
     #[serde(default)]
     pub force: bool,
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -545,10 +553,19 @@ async fn patch_page(
     AxumPath(page_key): AxumPath<String>,
     Json(body): Json<PatchPageBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let updated = cli::update_onenote_page_helper_with_guard(
+    let target_page = cli::resolve_page_query_in_section(
         &state.storage,
         &state.graph,
         &page_key,
+        body.section.as_deref(),
+        false,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    let updated = cli::update_onenote_page_helper_with_guard(
+        &state.storage,
+        &state.graph,
+        &target_page,
         body.title.as_deref(),
         body.markdown.as_deref(),
         body.block_id.as_deref(),
@@ -584,12 +601,22 @@ async fn patch_page(
 async fn delete_page(
     State(state): State<Arc<AppState>>,
     AxumPath(page_key): AxumPath<String>,
+    Query(query): Query<DeletePageQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let section_key = resolver::resolve_page_cached(&state.storage, &page_key, None)
+    let target_page = cli::resolve_page_query_in_section(
+        &state.storage,
+        &state.graph,
+        &page_key,
+        query.section.as_deref(),
+        false,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    let section_key = resolver::resolve_page_cached(&state.storage, &target_page, None)
         .and_then(resolver::PageResolution::into_option)
         .map_err(onenote_api_error)?
         .map(|s| s.scope.make_entity_key(&s.section_id));
-    let deleted = cli::delete_onenote_page_helper(&state.storage, &state.graph, &page_key)
+    let deleted = cli::delete_onenote_page_helper(&state.storage, &state.graph, &target_page)
         .await
         .map_err(onenote_api_error)?;
     let nudge_cmd = match section_key {

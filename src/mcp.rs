@@ -211,13 +211,15 @@ pub fn tool_definitions() -> Vec<Value> {
             "required": ["page"],
             "properties": {
                 "page": { "type": "string" },
+                "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
                 "block_id": { "type": "string", "description": "Graph element ID from get_page (e.g. `p:{...}`)" },
                 "title": { "type": "string" },
                 "markdown": { "type": "string" },
                 "replace_text": { "type": "string", "description": "Exact text to replace in block_id; provide with_text and omit markdown" },
                 "with_text": { "type": "string", "description": "New text for replace_text" },
                 "expected_content": { "type": "string", "description": "Baseline block/page content from prior read; aborts with conflict if remote changed" },
-                "force": { "type": "boolean", "description": "Override conflict check when true" }
+                "force": { "type": "boolean", "description": "Override conflict check when true" },
+                "compact": { "type": "boolean", "default": true, "description": "Default true. Set false to include the full page object in the response." }
             }
         }
     });
@@ -266,7 +268,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["section"],
                 "properties": {
                     "section": { "type": "string" },
-                    "limit": { "type": "integer", "default": 50 },
+                    "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" },
                     "refresh": { "type": "boolean" },
                     "offline": { "type": "boolean" }
@@ -281,6 +283,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string", "description": "Page key, ID, or title" },
+                    "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
                     "offline": { "type": "boolean" },
                     "compact": { "type": "boolean", "default": true, "description": "Default true. Set false for blocks[].element_id, raw_xhtml and resources." }
                 }
@@ -399,8 +402,10 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["page", "markdown"],
                 "properties": {
                     "page": { "type": "string" },
+                    "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
                     "markdown": { "type": "string" },
-                    "image_paths": { "type": "array", "items": { "type": "string" } }
+                    "image_paths": { "type": "array", "items": { "type": "string" } },
+                    "compact": { "type": "boolean", "default": true, "description": "Default true. Set false to include the full page object in the response." }
                 }
             }
         }),
@@ -414,11 +419,13 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string" },
+                    "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
                     "block_id": { "type": "string" },
                     "todo_index": { "type": "integer", "minimum": 0 },
                     "completed": { "type": "boolean", "description": "Set this state; omit to toggle" },
                     "expected_content": { "type": "string", "description": "Baseline to-do block content from prior read; aborts with conflict if remote changed" },
-                    "force": { "type": "boolean", "description": "Override conflict check when true" }
+                    "force": { "type": "boolean", "description": "Override conflict check when true" },
+                    "compact": { "type": "boolean", "default": true, "description": "Default true. Set false to include the full page object in the response." }
                 }
             }
         }),
@@ -430,6 +437,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["page", "confirm"],
                 "properties": {
                     "page": { "type": "string" },
+                    "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
                     "confirm": { "type": "boolean" }
                 }
             }
@@ -444,7 +452,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "query": { "type": "string" },
                     "section": { "type": "string" },
                     "refresh": { "type": "boolean" },
-                    "limit": { "type": "integer", "default": 30 },
+                    "limit": { "type": "integer", "default": 30, "minimum": 1, "maximum": 1000 },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" }
                 }
             }
@@ -525,11 +533,7 @@ async fn dispatch_tool(
         }
         "list_pages" | "onenote_list_pages" => {
             let section = required_str(args, "section")?;
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
-                .map(|n| n as usize)
-                .unwrap_or(50);
+            let limit = parse_bounded_limit(args, 50)?;
             let offset = cli::parse_mcp_cursor(args)?;
             let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
             let offline = args.get("offline").and_then(Value::as_bool).unwrap_or(false);
@@ -553,8 +557,11 @@ async fn dispatch_tool(
         }
         "get_page" | "onenote_get_page" => {
             let page = required_str(args, "page")?;
+            let section = args.get("section").and_then(Value::as_str);
             let offline = args.get("offline").and_then(Value::as_bool).unwrap_or(false);
-            let detail = cli::load_onenote_page_detail(storage, graph, page, offline).await?;
+            let resolved_page =
+                cli::resolve_page_query_in_section(storage, graph, page, section, offline).await?;
+            let detail = cli::load_onenote_page_detail(storage, graph, &resolved_page, offline).await?;
             let compact = args
                 .get("compact")
                 .and_then(Value::as_bool)
@@ -656,23 +663,56 @@ async fn dispatch_tool(
                 .transpose()?
                 .unwrap_or(DEFAULT_COPY_WAIT_SECONDS);
             let outcome = graph.copy_onenote_page(page, section, operation_url, wait).await?;
+            if outcome.ok {
+                cli::nudge_live_daemon(
+                    config,
+                    graph,
+                    crate::sync::SyncCommand::RefreshSectionPages {
+                        section_key: outcome.destination_section_key.clone(),
+                    },
+                )
+                .await;
+                if let Some(ref new_page_key) = outcome.new_page_key {
+                    cli::nudge_live_daemon(
+                        config,
+                        graph,
+                        crate::sync::SyncCommand::HydratePage {
+                            page_key: new_page_key.clone(),
+                        },
+                    )
+                    .await;
+                }
+            }
             Ok(serde_json::to_value(outcome)?)
         }
         "append_page" | "onenote_append_page" => {
             let page = required_str(args, "page")?;
+            let section = args.get("section").and_then(Value::as_str);
             let markdown = required_str(args, "markdown")?;
+            let compact = args
+                .get("compact")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             let paths = string_array(args, "image_paths")
                 .into_iter()
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
             let inline_images = cli::load_inline_images_from_paths(&paths)?;
-            let updated =
-                cli::append_onenote_page_helper(storage, graph, page, markdown, &inline_images)
-                    .await?;
-            Ok(json!({ "ok": true, "page": updated }))
+            let resolved_page =
+                cli::resolve_page_query_in_section(storage, graph, page, section, false).await?;
+            let updated = cli::append_onenote_page_helper(
+                storage,
+                graph,
+                &resolved_page,
+                markdown,
+                &inline_images,
+            )
+            .await?;
+            Ok(cli::write_result_json(&updated, None, None, !compact))
         }
         "update_block" | "update_page" | "onenote_update_page" => {
             let page = required_str(args, "page")?;
+            let section = args.get("section").and_then(Value::as_str);
             let block_id = args.get("block_id").and_then(Value::as_str);
             let title = args.get("title").and_then(Value::as_str);
             let markdown = args
@@ -692,10 +732,16 @@ async fn dispatch_tool(
                 .or_else(|| args.get("base_content"))
                 .and_then(Value::as_str);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let compact = args
+                .get("compact")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let resolved_page =
+                cli::resolve_page_query_in_section(storage, graph, page, section, false).await?;
             let updated = cli::update_onenote_content_helper_with_guard(
                 storage,
                 graph,
-                page,
+                &resolved_page,
                 title,
                 markdown,
                 block_id,
@@ -712,10 +758,11 @@ async fn dispatch_tool(
                 },
             )
             .await;
-            Ok(json!({ "ok": true, "page": updated }))
+            Ok(cli::write_result_json(&updated, block_id, None, !compact))
         }
         "toggle_todo" | "onenote_toggle_todo" => {
             let page = required_str(args, "page")?;
+            let section = args.get("section").and_then(Value::as_str);
             let block_id = args.get("block_id").and_then(Value::as_str);
             let todo_index = args
                 .get("todo_index")
@@ -727,14 +774,20 @@ async fn dispatch_tool(
                 .or_else(|| args.get("base_content"))
                 .and_then(Value::as_str);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let compact = args
+                .get("compact")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             let requested_completed = args
                 .get("completed")
                 .map(|value| value.as_bool().context("completed must be a boolean"))
                 .transpose()?;
+            let resolved_page =
+                cli::resolve_page_query_in_section(storage, graph, page, section, false).await?;
             let (updated, target_id, completed) = cli::change_onenote_todo_helper_with_guard(
                 storage,
                 graph,
-                page,
+                &resolved_page,
                 block_id,
                 todo_index,
                 requested_completed,
@@ -750,24 +803,26 @@ async fn dispatch_tool(
                 },
             )
             .await;
-            Ok(json!({
-                "ok": true,
-                "page_key": updated.summary.page_key,
-                "block_id": target_id,
-                "completed": completed,
-                "page": updated,
-            }))
+            Ok(cli::write_result_json(
+                &updated,
+                Some(&target_id),
+                Some(completed),
+                !compact,
+            ))
         }
         "delete_page" | "onenote_delete_page" => {
             let page = required_str(args, "page")?;
+            let section = args.get("section").and_then(Value::as_str);
             let confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
             if !confirm {
                 bail!("Refusing to delete OneNote page without `confirm: true`.");
             }
-            let section_key = resolver::resolve_page_cached(storage, page, None)?
+            let resolved_page =
+                cli::resolve_page_query_in_section(storage, graph, page, section, false).await?;
+            let section_key = resolver::resolve_page_cached(storage, &resolved_page, None)?
                 .into_option()?
                 .map(|s| s.scope.make_entity_key(&s.section_id));
-            let deleted = cli::delete_onenote_page_helper(storage, graph, page).await?;
+            let deleted = cli::delete_onenote_page_helper(storage, graph, &resolved_page).await?;
             let nudge_cmd = match section_key {
                 Some(sec_key) => crate::sync::SyncCommand::RefreshSectionPages {
                     section_key: sec_key,
@@ -781,11 +836,7 @@ async fn dispatch_tool(
             let query = required_str(args, "query")?;
             let section = args.get("section").and_then(Value::as_str);
             let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
-                .map(|v| v as usize)
-                .unwrap_or(30);
+            let limit = parse_bounded_limit(args, 30)?;
             let offset = cli::parse_mcp_cursor(args)?;
             let (hits, has_more) = cli::search_onenote_with_offset(
                 storage, graph, query, section, refresh, limit, offset,

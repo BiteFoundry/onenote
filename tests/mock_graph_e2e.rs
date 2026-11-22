@@ -913,7 +913,8 @@ async fn e2e_http_serve_and_mcp_tools() {
         (Some(false), false, 2),
         (None, true, 3),
     ] {
-        let mut arguments = json!({ "page": "me|page-1", "block_id": "p:{todo-1}" });
+        let mut arguments =
+            json!({ "page": "me|page-1", "block_id": "p:{todo-1}", "compact": false });
         if let Some(state) = requested {
             arguments["completed"] = json!(state);
         }
@@ -1628,6 +1629,68 @@ async fn e2e_bidirectional_sync_fixes_s1_s3_s4_s6_and_section4() {
         .unwrap()
         .contains("CRITICAL REMOTE EDIT BY ALICE"));
 
+    // W1 regression: retrying the same implicit-baseline update must keep failing with Conflict
+    // and never overwrite remote edits until the caller explicitly re-reads (or passes --force).
+    let stale_err_retry = cli::update_onenote_page_helper_with_guard(
+        &storage,
+        &graph,
+        "me|p-1",
+        None,
+        Some("Local stale edit"),
+        Some("p:{b1}"),
+        None,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(stale_err_retry.to_string().to_lowercase().contains("conflict"));
+    assert_eq!(*st.patch_count.lock().unwrap(), patches_before_s3);
+    assert!(st
+        .page_xhtml
+        .lock()
+        .unwrap()
+        .get("p-1")
+        .unwrap()
+        .contains("CRITICAL REMOTE EDIT BY ALICE"));
+
+    // Same implicit-baseline protection for `check` (`change_onenote_todo_helper_with_guard`):
+    // edit p:{todo1} remotely while keeping the earlier cached baseline, verify 2x Conflict + 0 PATCH.
+    let saved_xhtml_before_todo_conflict = st.page_xhtml.lock().unwrap().get("p-1").unwrap().clone();
+    st.page_xhtml.lock().unwrap().insert(
+        "p-1".to_string(),
+        r#"<!DOCTYPE html><html><head><title>Spec v3 LocalRename</title></head><body><div id="div:{root}"><p id="p:{b1}">CRITICAL REMOTE EDIT BY ALICE</p><p id="p:{todo1}" data-tag="to-do">Ship sync audit (REMOTE EDIT)</p></div></body></html>"#
+            .to_string(),
+    );
+    for attempt in 1..=2 {
+        let todo_conflict = cli::change_onenote_todo_helper_with_guard(
+            &storage,
+            &graph,
+            "me|p-1",
+            Some("p:{todo1}"),
+            None,
+            Some(true),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            todo_conflict.to_string().to_lowercase().contains("conflict"),
+            "attempt {attempt}: {todo_conflict}"
+        );
+        assert_eq!(
+            *st.patch_count.lock().unwrap(),
+            patches_before_s3,
+            "attempt {attempt} must not send PATCH"
+        );
+    }
+    // Restore remote p:{todo1} to the original text for the control group below, then verify
+    // re-reading allows the update on p:{b1} to proceed after the control group.
+    st.page_xhtml
+        .lock()
+        .unwrap()
+        .insert("p-1".to_string(), saved_xhtml_before_todo_conflict);
+
     // Different-paragraph concurrent edit (toggle p:{todo1} while p:{b1} changed remotely) MUST succeed!
     let (after_todo, _, completed) = cli::toggle_onenote_todo_helper_with_guard(
         &storage,
@@ -1643,6 +1706,56 @@ async fn e2e_bidirectional_sync_fixes_s1_s3_s4_s6_and_section4() {
     assert!(completed);
     assert!(after_todo.raw_xhtml.contains("CRITICAL REMOTE EDIT BY ALICE"));
     assert!(after_todo.raw_xhtml.contains("to-do:completed"));
+
+    // After an explicit re-read refreshes the cache baseline, the same update succeeds.
+    // Re-stage remote change on p:{b1}, confirm 2x Conflict, then re-read and succeed.
+    st.page_xhtml.lock().unwrap().insert(
+        "p-1".to_string(),
+        r#"<!DOCTYPE html><html><head><title>Spec v3 LocalRename</title></head><body><div id="div:{root}"><p id="p:{b1}">REMOTE V2 BY ALICE</p><p id="p:{todo1}" data-tag="to-do:completed">Ship sync audit</p></div></body></html>"#
+            .to_string(),
+    );
+    let patches_before_reread_check = *st.patch_count.lock().unwrap();
+    for attempt in 1..=2 {
+        let err = cli::update_onenote_page_helper_with_guard(
+            &storage,
+            &graph,
+            "me|p-1",
+            None,
+            Some("Local edit after reread"),
+            Some("p:{b1}"),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("conflict"),
+            "attempt {attempt}: {err}"
+        );
+        assert_eq!(*st.patch_count.lock().unwrap(), patches_before_reread_check);
+    }
+    let _ = cli::load_onenote_page_detail(&storage, &graph, "me|p-1", false)
+        .await
+        .unwrap();
+    let after_reread = cli::update_onenote_page_helper_with_guard(
+        &storage,
+        &graph,
+        "me|p-1",
+        None,
+        Some("CRITICAL REMOTE EDIT BY ALICE"),
+        Some("p:{b1}"),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *st.patch_count.lock().unwrap(),
+        patches_before_reread_check + 1
+    );
+    assert!(after_reread
+        .raw_xhtml
+        .contains("CRITICAL REMOTE EDIT BY ALICE"));
 
     // S4: Remote deletions pruned by --refresh on sections, notebooks, pages, and 404 read
     st.notebooks
@@ -1846,7 +1959,8 @@ async fn e2e_bidirectional_sync_fixes_s1_s3_s4_s6_and_section4() {
                     "page": "me|p-1",
                     "block_id": "p:{b1}",
                     "markdown": "MCP fresh preflight edit",
-                    "expected_content": "HTTP fresh preflight edit"
+                    "expected_content": "HTTP fresh preflight edit",
+                    "compact": false
                 }
             }
         }),
@@ -2305,6 +2419,19 @@ mod cli_feedback_regression {
                     },
                 ),
             )
+            .route(
+                "/v1.0/me/onenote/pages/{page_id}/copyToSection",
+                axum::routing::post(
+                    |State(st): State<CliMockState>| async move {
+                        let op_url = format!("{}/me/onenote/operations/op-pending-1", st.base_url);
+                        (
+                            StatusCode::ACCEPTED,
+                            [("Operation-Location", op_url)],
+                            "",
+                        )
+                    },
+                ),
+            )
             .with_state(state.clone());
 
         let handle = tokio::spawn(async move {
@@ -2569,6 +2696,52 @@ mod cli_feedback_regression {
             assert!(String::from_utf8_lossy(&out.stdout).contains("Usage:"));
         }
         assert_eq!(state.writes.lock().unwrap().len(), writes_before);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn e2e_real_cli_copy_page_pending_emits_single_json_object() {
+        let (base_url, _state, server) = spawn_cli_mock_graph().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("cfg");
+        let data_dir = tmp.path().join("data");
+
+        let out = run_onenote_bin(
+            &base_url,
+            &cfg_dir,
+            &data_dir,
+            &[
+                "copy-page",
+                "me|page-hyphen",
+                "--section",
+                "me|sec-1",
+                "--wait-seconds",
+                "0",
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(out.status.code(), Some(1));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "copy-page pending must emit a single JSON object ({e}), got: {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["status"], "pending");
+        assert_eq!(v["operation_id"], "op-pending-1");
+        assert!(v["operation_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/me/onenote/operations/op-pending-1"));
+        assert_eq!(v["error"]["code"], "copy_pending");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--operation"));
+        assert!(!out.stderr.is_empty());
 
         server.abort();
     }

@@ -530,11 +530,18 @@ async fn unmapped_search_errors_without_network() {
     )
     .await;
     assert_eq!(out.status.code(), Some(1));
-    assert!(
-        out.stdout.is_empty(),
-        "stdout must be empty, got: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be valid JSON error object ({e}), got: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "unknown_identity");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown identity"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("Unknown identity"), "stderr={stderr}");
     assert!(stderr.contains("onenote whoami"), "stderr={stderr}");
@@ -775,7 +782,14 @@ async fn unmapped_offline_errors() {
     ] {
         let out = run_onenote(&base_url, &cfg_dir, &data_dir, Some("opaque-a"), args).await;
         assert_eq!(out.status.code(), Some(1), "args={args:?}");
-        assert!(out.stdout.is_empty(), "args={args:?}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "args={args:?} stdout must be JSON error ({e}), got: {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        assert_eq!(v["ok"], false, "args={args:?}");
+        assert_eq!(v["error"]["code"], "unknown_identity", "args={args:?}");
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("Unknown identity"),
             "args={args:?}, stderr={}",
@@ -901,7 +915,9 @@ async fn second_account_without_binding_is_refused() {
     )
     .await;
     assert_eq!(out.status.code(), Some(1));
-    assert!(out.stdout.is_empty());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "unknown_identity");
     assert!(String::from_utf8_lossy(&out.stderr).contains("Unknown identity"));
 
     server.abort();
@@ -1351,6 +1367,68 @@ async fn read_selector_errors() {
         assert!(out.stdout.is_empty(), "args={args:?}");
     }
 
+    // W6: cold-cache title returning 404 explains the cause and next actions (--section / pages).
+    let cold = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["read", "Cold Cache Spec"],
+    )
+    .await;
+    assert_eq!(cold.status.code(), Some(1));
+    assert!(cold.stdout.is_empty());
+    let cold_err = String::from_utf8_lossy(&cold.stderr);
+    assert!(
+        cold_err.contains("OneNote page not found: 'Cold Cache Spec' is neither a cached title nor a page ID."),
+        "stderr={cold_err}"
+    );
+    assert!(cold_err.contains("--section"), "stderr={cold_err}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn runtime_json_errors_emit_single_stdout_object() {
+    let (base_url, _mock, server) = spawn_contract_mock(2, 3).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg_dir, data_dir) = (tmp.path().join("cfg"), tmp.path().join("data"));
+
+    let out_json = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["read", "me|nonexistent-999", "--json"],
+    )
+    .await;
+    assert_eq!(out_json.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&out_json.stdout).unwrap_or_else(|e| {
+        panic!(
+            "expected single JSON error object ({e}), got: {}",
+            String::from_utf8_lossy(&out_json.stdout)
+        )
+    });
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "not_found");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not found"));
+    assert!(!out_json.stderr.is_empty());
+
+    let out_text = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["read", "me|nonexistent-999"],
+    )
+    .await;
+    assert_eq!(out_text.status.code(), Some(1));
+    assert!(out_text.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out_text.stderr).contains("OneNote page not found"));
+
     server.abort();
 }
 
@@ -1390,11 +1468,12 @@ async fn read_text_formats_unchanged() {
 }
 
 #[tokio::test]
-async fn write_json_page_stays_full() {
+async fn write_json_is_compact_by_default_and_supports_full() {
     let (base_url, _mock, server) = spawn_contract_mock(2, 3).await;
     let tmp = tempfile::tempdir().unwrap();
     let (cfg_dir, data_dir) = (tmp.path().join("cfg"), tmp.path().join("data"));
 
+    // Default append --json is compact: no `page`, has `ok`, `page_key`, `title`, `last_modified_at`.
     let out = run_onenote(
         &base_url,
         &cfg_dir,
@@ -1409,9 +1488,81 @@ async fn write_json_page_stays_full() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(v["page"].get("summary").is_some());
-    assert!(v["page"].get("blocks").is_some());
-    assert!(v["page"].get("omitted").is_none());
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["page_key"], "me|page-1");
+    assert!(v["title"].is_string());
+    assert!(v.get("last_modified_at").is_some());
+    assert!(v.get("page").is_none());
+
+    // append --json --full includes the full page with blocks.
+    let out_full = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["append", "me|page-1", "hello", "--json", "--full"],
+    )
+    .await;
+    assert!(
+        out_full.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out_full.stderr)
+    );
+    let vf: Value = serde_json::from_slice(&out_full.stdout).unwrap();
+    assert_eq!(vf["ok"], true);
+    assert_eq!(vf["page_key"], "me|page-1");
+    assert!(vf["page"].get("summary").is_some());
+    assert!(vf["page"].get("blocks").is_some());
+    assert!(vf["page"].get("omitted").is_none());
+
+    // update --block-id default compact includes block_id, omits page.
+    let out_upd = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &[
+            "update",
+            "me|page-2",
+            "--block-id",
+            "p:body-2",
+            "--body",
+            "Updated body",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        out_upd.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out_upd.stderr)
+    );
+    let vu: Value = serde_json::from_slice(&out_upd.stdout).unwrap();
+    assert_eq!(vu["ok"], true);
+    assert_eq!(vu["page_key"], "me|page-2");
+    assert_eq!(vu["block_id"], "p:body-2");
+    assert!(vu.get("page").is_none());
+
+    // check default compact includes block_id & completed, omits page.
+    let out_chk = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["check", "me|page-1", "--block-id", "p:todo1", "--done", "--json"],
+    )
+    .await;
+    assert!(
+        out_chk.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out_chk.stderr)
+    );
+    let vc: Value = serde_json::from_slice(&out_chk.stdout).unwrap();
+    assert_eq!(vc["ok"], true);
+    assert_eq!(vc["page_key"], "me|page-1");
+    assert_eq!(vc["block_id"], "p:todo1");
+    assert_eq!(vc["completed"], true);
+    assert!(vc.get("page").is_none());
 
     server.abort();
 }
@@ -1456,7 +1607,7 @@ async fn mcp_get_page_compact_default_and_full() {
 }
 
 #[tokio::test]
-async fn mcp_write_tool_page_stays_full() {
+async fn mcp_write_tool_is_compact_by_default_and_supports_full() {
     let (base_url, _mock, server) = spawn_contract_mock(2, 3).await;
     let tmp = tempfile::tempdir().unwrap();
     let (cfg_dir, data_dir) = (tmp.path().join("cfg"), tmp.path().join("data"));
@@ -1470,8 +1621,38 @@ async fn mcp_write_tool_page_stays_full() {
         .await;
     assert_eq!(r["result"]["isError"], false, "{r}");
     let sc = &r["result"]["structuredContent"];
-    assert!(sc["page"].get("summary").is_some());
-    assert!(sc["page"].get("omitted").is_none());
+    assert_eq!(sc["ok"], true);
+    assert_eq!(sc["page_key"], "me|page-1");
+    assert!(sc["title"].is_string());
+    assert!(sc.get("page").is_none());
+
+    let r_full = proc
+        .call(json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"append_page","arguments":{"page":"me|page-1","markdown":"hello","compact":false}}
+        }))
+        .await;
+    assert_eq!(r_full["result"]["isError"], false, "{r_full}");
+    let sc_full = &r_full["result"]["structuredContent"];
+    assert_eq!(sc_full["ok"], true);
+    assert_eq!(sc_full["page_key"], "me|page-1");
+    assert!(sc_full["page"].get("summary").is_some());
+    assert!(sc_full["page"].get("blocks").is_some());
+    assert!(sc_full["page"].get("omitted").is_none());
+
+    let r_todo = proc
+        .call(json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"toggle_todo","arguments":{"page":"me|page-1","block_id":"p:todo1","completed":true}}
+        }))
+        .await;
+    assert_eq!(r_todo["result"]["isError"], false, "{r_todo}");
+    let sc_todo = &r_todo["result"]["structuredContent"];
+    assert_eq!(sc_todo["ok"], true);
+    assert_eq!(sc_todo["page_key"], "me|page-1");
+    assert_eq!(sc_todo["block_id"], "p:todo1");
+    assert_eq!(sc_todo["completed"], true);
+    assert!(sc_todo.get("page").is_none());
 
     proc.close().await;
     server.abort();
@@ -1832,6 +2013,113 @@ async fn search_paging_and_cache_counts() {
 }
 
 #[tokio::test]
+async fn search_section_accepts_scoped_key_and_notebook_path() {
+    let (base_url, _mock, server) = spawn_contract_mock(2, 3).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg_dir, data_dir) = (tmp.path().join("cfg"), tmp.path().join("data"));
+
+    assert!(run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["pages", "Engineering/Specs", "--limit", "50", "--json"],
+    )
+    .await
+    .status
+    .success());
+
+    let collect_keys = |out: &std::process::Output| -> BTreeSet<String> {
+        assert!(
+            out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["page_key"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let by_raw_id = collect_keys(
+        &run_onenote(
+            &base_url,
+            &cfg_dir,
+            &data_dir,
+            Some("opaque-a"),
+            &["search", "Architecture", "--section", "sec-1", "--json"],
+        )
+        .await,
+    );
+    let by_scoped_key = collect_keys(
+        &run_onenote(
+            &base_url,
+            &cfg_dir,
+            &data_dir,
+            Some("opaque-a"),
+            &["search", "Architecture", "--section", "me|sec-1", "--json"],
+        )
+        .await,
+    );
+    let by_path = collect_keys(
+        &run_onenote(
+            &base_url,
+            &cfg_dir,
+            &data_dir,
+            Some("opaque-a"),
+            &[
+                "search",
+                "Architecture",
+                "--section",
+                "Engineering/Specs",
+                "--json",
+            ],
+        )
+        .await,
+    );
+    let by_name_sub = collect_keys(
+        &run_onenote(
+            &base_url,
+            &cfg_dir,
+            &data_dir,
+            Some("opaque-a"),
+            &["search", "Architecture", "--section", "Specs", "--json"],
+        )
+        .await,
+    );
+
+    assert_eq!(by_raw_id.len(), 3);
+    assert_eq!(by_scoped_key, by_raw_id);
+    assert_eq!(by_path, by_raw_id);
+    assert_eq!(by_name_sub, by_raw_id);
+
+    // Missing Notebook/Section path returns explicit not_found error instead of silent 0 hits.
+    let missing = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &[
+            "search",
+            "Architecture",
+            "--section",
+            "Engineering/Nope",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(missing.status.code(), Some(1));
+    let mv: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(mv["ok"], false);
+    assert_eq!(mv["error"]["code"], "not_found");
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn mcp_list_sections_limit_and_bad_cursor() {
     let (base_url, _mock, server) = spawn_contract_mock(120, 3).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1872,6 +2160,31 @@ async fn mcp_list_sections_limit_and_bad_cursor() {
         .await;
     assert_eq!(r3["result"]["isError"], true);
     assert!(r3["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("limit must be between 1 and 1000"));
+
+    // W7: list_pages and search_pages enforce the same 1..=1000 limit validation.
+    let r4 = proc
+        .call(json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"list_pages","arguments":{"section":"Engineering/Specs","limit":0}}
+        }))
+        .await;
+    assert_eq!(r4["result"]["isError"], true);
+    assert!(r4["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("limit must be between 1 and 1000"));
+
+    let r5 = proc
+        .call(json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"search_pages","arguments":{"query":"Architecture","limit":-5}}
+        }))
+        .await;
+    assert_eq!(r5["result"]["isError"], true);
+    assert!(r5["result"]["content"][0]["text"]
         .as_str()
         .unwrap()
         .contains("limit must be between 1 and 1000"));
@@ -2001,8 +2314,85 @@ async fn http_get_page_honours_section() {
     assert_eq!(v3["ok"], true);
     assert_eq!(json_object_keys(&v3["page"]), full_page_key_set());
 
+    // W5 (S1): PATCH honours `section` in request body.
+    let r_patch_ok = http
+        .patch(format!(
+            "http://{api_addr}/v1/onenote/pages/Architecture%20Spec"
+        ))
+        .json(&json!({
+            "section": "Specs",
+            "title": "Architecture Spec Renamed"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_patch_ok.status(), StatusCode::OK);
+    let vp: Value = r_patch_ok.json().await.unwrap();
+    assert_eq!(vp["ok"], true);
+
+    let r_patch_miss = http
+        .patch(format!(
+            "http://{api_addr}/v1/onenote/pages/Architecture%20Spec"
+        ))
+        .json(&json!({
+            "section": "Section 2",
+            "title": "Architecture Spec Renamed"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_patch_miss.status(), StatusCode::NOT_FOUND);
+
     api_server.abort();
     graph_server.abort();
+}
+
+#[tokio::test]
+async fn cli_read_honours_section() {
+    let (base_url, _mock, server) = spawn_contract_mock(2, 3).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg_dir, data_dir) = (tmp.path().join("cfg"), tmp.path().join("data"));
+
+    let ok_out = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["read", "Architecture Spec", "--section", "Specs", "--json"],
+    )
+    .await;
+    assert!(
+        ok_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&ok_out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&ok_out.stdout).unwrap();
+    assert_eq!(v["page"]["page_key"], "me|page-1");
+
+    let miss_out = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &[
+            "read",
+            "Architecture Spec",
+            "--section",
+            "Section 2",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(miss_out.status.code(), Some(1));
+    let mv: Value = serde_json::from_slice(&miss_out.stdout).unwrap();
+    assert_eq!(mv["ok"], false);
+    assert_eq!(mv["error"]["code"], "not_found");
+    assert!(mv["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not found in section 'Section 2'"));
+
+    server.abort();
 }
 
 #[tokio::test]

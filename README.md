@@ -115,9 +115,13 @@ onenote check "Migration Cutover" --block-id 'p:m3' --done --json
 onenote search "canary" --json
 ```
 
-`onenote read PAGE --json` returns compact Markdown and identifiers by default; pass `--full` for parsed blocks, raw XHTML, and resources. Passing an explicit `--format <fmt> --json` returns the full JSON page, and adding `--compact` selects the compact shape.
+`onenote read PAGE --json` returns compact Markdown and identifiers by default; pass `--full` for parsed blocks, raw XHTML, and resources. Passing an explicit `--format <fmt> --json` returns the full JSON page, and adding `--compact` selects the compact shape. Write commands (`append`, `update`, `check`) with `--json` return a compact summary (`ok`, `page_key`, `title`, `last_modified_at`, plus `block_id` / `completed` where applicable) by default; pass `--full` to include the full `page` object.
 
-`onenote notebooks --json` and `onenote sections --json` return 50 items by default (text output stays unbounded unless `--limit` is passed); `pages` defaults to 50 and `search` defaults to 30. All four JSON list responses include `returned`, `has_more`, and `next_cursor`, which can be passed back with `--limit` and `--cursor` to page through results.
+Page commands (`read`, `append`, `update`, `check`, `delete`) accept an optional `--section` (name, `Notebook/Section`, ID, or scoped key) to narrow title lookup to one section.
+
+When a `--json` command fails at runtime, it exits 1 and writes a single JSON object (`{"ok":false,"error":{"code","message"}}`, plus top-level operation fields for non-completed `copy-page`) to stdout alongside the stderr error line. Successful read/list `--json` responses omit `ok` and signal success with exit 0; CLI argument/usage errors exit 2 on stderr without JSON.
+
+`onenote notebooks --json` and `onenote sections --json` return 50 items by default (text output stays unbounded unless `--limit` is passed); `pages` defaults to 50 and `search` defaults to 30. All four JSON list responses include `returned`, `has_more`, and `next_cursor`, which can be passed back with `--limit` and `--cursor` to page through results. Full-text body search in `onenote search` covers pages that have been read or synced (`cache.pages_with_body`).
 
 Use `onenote read PAGE --format blocks` to find a checkbox or text block's current element ID. Use `--done` or `--undone` to set a checkbox state. Omit both flags to toggle it.
 
