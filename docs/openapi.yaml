@@ -5,6 +5,11 @@ info:
   description: >
     Local HTTP JSON API exposed by `onenote serve` (default `127.0.0.1:8793`).
     All `/v1/onenote/*` routes are also mirrored under `/onenote/*`.
+    Every route except `/health` needs the API key (`Authorization: Bearer` or
+    `x-api-key`); a loopback server without `--api-key` / `ONENOTE_API_KEY`
+    generates one and prints it on stderr. Requests with a `Host` outside the
+    allow-list get 421, and requests with an `Origin` not listed with
+    `--cors-origin` get 403.
 servers:
   - url: http://127.0.0.1:8793
 components:

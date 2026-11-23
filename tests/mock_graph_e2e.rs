@@ -4493,3 +4493,226 @@ mod confirmed_bug_regressions {
         graph_server.abort();
     }
 }
+
+/// NEW-01: the HTTP API must not be reachable from a web page (cross-origin
+/// requests, DNS rebinding) and must not act without the API key.
+#[tokio::test]
+async fn e2e_http_serve_guard_blocks_cross_site_and_rebinding() {
+    let (base_url, mock, graph_server) = spawn_mock_graph().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, graph, storage) = make_test_runtime(base_url, dir.path());
+    let state = |api_key: Option<&str>| {
+        Arc::new(ServeState {
+            config: cfg.clone(),
+            graph: graph.clone(),
+            storage: storage.clone(),
+            api_key: api_key.map(str::to_string),
+        })
+    };
+    async fn spawn_api(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, handle)
+    }
+    let http = reqwest::Client::new();
+
+    // --- Default (loopback) guard with a key ---
+    let (addr, keyed_server) = spawn_api(serve::build_router(state(Some("secret-key")))).await;
+
+    // (a) Preflight from a foreign origin gets no CORS grant.
+    let preflight = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("http://{addr}/v1/onenote/pages/me%7Cpage-1"),
+        )
+        .header("Origin", "https://evil.example")
+        .header("Access-Control-Request-Method", "DELETE")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::FORBIDDEN);
+    assert!(preflight
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+
+    // (b) DNS rebinding: an attacker-controlled Host is refused, key or not.
+    for host in ["evil.example", "127.0.0.1.evil.example:8793"] {
+        let rebound = http
+            .get(format!("http://{addr}/v1/onenote/notebooks"))
+            .header("Host", host)
+            .header("x-api-key", "secret-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebound.status(), StatusCode::MISDIRECTED_REQUEST, "{host}");
+        let body: Value = rebound.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+    }
+    let rebound_health = http
+        .get(format!("http://{addr}/health"))
+        .header("Host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rebound_health.status(), StatusCode::MISDIRECTED_REQUEST);
+
+    // (c) A "simple" cross-site GET is refused even with a valid key, and
+    // never reaches Graph.
+    let hits_before = *mock.notebook_list_hits.lock().unwrap();
+    let cross_site = http
+        .get(format!("http://{addr}/v1/onenote/notebooks?refresh=true"))
+        .header("Origin", "https://evil.example")
+        .header("x-api-key", "secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
+    assert!(cross_site
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+    assert_eq!(*mock.notebook_list_hits.lock().unwrap(), hits_before);
+
+    // (d) Destructive call without (or with a wrong) key: 401, nothing deleted.
+    for key in [None, Some("secret-kez"), Some("")] {
+        let mut request = http.delete(format!("http://{addr}/v1/onenote/pages/me%7Cpage-1"));
+        if let Some(key) = key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert!(mock.deleted_pages.lock().unwrap().is_empty());
+
+    // (e) /health stays key-free for a valid Host (IP and name).
+    let health = http
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    assert!(health
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+    let health_by_name = http
+        .get(format!("http://{addr}/health"))
+        .header("Host", format!("LOCALHOST:{}", addr.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health_by_name.status(), StatusCode::OK);
+    keyed_server.abort();
+
+    // An empty configured key must not mean "no key".
+    let (addr, empty_key_server) = spawn_api(serve::build_router(state(Some("")))).await;
+    let empty = http
+        .get(format!("http://{addr}/v1/onenote/notebooks"))
+        .header("x-api-key", "")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::UNAUTHORIZED);
+    empty_key_server.abort();
+
+    // A keyless router (`--allow-keyless`) keeps the Host and Origin checks.
+    let (addr, keyless_server) = spawn_api(serve::build_router(state(None))).await;
+    let keyless_ok = http
+        .get(format!("http://{addr}/v1/onenote/notebooks"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keyless_ok.status(), StatusCode::OK);
+    let keyless_rebound = http
+        .get(format!("http://{addr}/v1/onenote/notebooks"))
+        .header("Host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keyless_rebound.status(), StatusCode::MISDIRECTED_REQUEST);
+    let keyless_cross_site = http
+        .delete(format!("http://{addr}/v1/onenote/pages/me%7Cpage-1"))
+        .header("Origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keyless_cross_site.status(), StatusCode::FORBIDDEN);
+    assert!(mock.deleted_pages.lock().unwrap().is_empty());
+    keyless_server.abort();
+
+    // (f) `--cors-origin` echoes exactly the configured origin and nothing else.
+    let guard = serve::ServeGuard::new(
+        "127.0.0.1",
+        &["notes.corp.example".to_string()],
+        &["https://app.example.com".to_string()],
+    )
+    .unwrap();
+    let (addr, cors_server) = spawn_api(serve::build_router_with_guard(
+        state(Some("secret-key")),
+        guard,
+    ))
+    .await;
+    let allowed = http
+        .get(format!("http://{addr}/v1/onenote/notebooks"))
+        .header("Origin", "https://app.example.com")
+        .header("x-api-key", "secret-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert_eq!(
+        allowed.headers()["access-control-allow-origin"],
+        "https://app.example.com"
+    );
+    let allowed_preflight = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("http://{addr}/v1/onenote/pages/me%7Cpage-1"),
+        )
+        .header("Origin", "https://app.example.com")
+        .header("Access-Control-Request-Method", "DELETE")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed_preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        allowed_preflight.headers()["access-control-allow-origin"],
+        "https://app.example.com"
+    );
+    assert!(allowed_preflight.headers()["access-control-allow-methods"]
+        .to_str()
+        .unwrap()
+        .contains("DELETE"));
+    // The allowed origin still needs the key.
+    let allowed_no_key = http
+        .get(format!("http://{addr}/v1/onenote/notebooks"))
+        .header("Origin", "https://app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed_no_key.status(), StatusCode::UNAUTHORIZED);
+    let other_origin = http
+        .get(format!("http://{addr}/health"))
+        .header("Origin", "https://app.example.com.evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_origin.status(), StatusCode::FORBIDDEN);
+    let extra_host = http
+        .get(format!("http://{addr}/health"))
+        .header("Host", "notes.corp.example:8793")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(extra_host.status(), StatusCode::OK);
+    cors_server.abort();
+
+    graph_server.abort();
+}

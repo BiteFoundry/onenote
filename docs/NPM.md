@@ -74,6 +74,8 @@ npm removes the previous package's global `note` launcher during an upgrade. If 
 
 Change HTTP clients from `http://127.0.0.1:8788` to `http://127.0.0.1:8793` to use the new default. To keep an existing client on port `8788`, run `onenote serve --port 8788` when that port is available. Teams uses `8788` by default.
 
+From 0.4.1 the HTTP API requires an API key by default: pass `--token <SECRET>` or set `ONENOTE_API_KEY` and send it as `Authorization: Bearer <SECRET>`, or copy the key that a bare `onenote serve` prints on stderr. `--allow-keyless` restores keyless access on loopback only. See [docs/API.md](API.md#authentication-and-access-control).
+
 ## Supported platforms
 
 | npm package                     | OS      | CPU   | Rust target                         |

@@ -2161,7 +2161,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tower-http",
  "unicode-width 0.2.3",
  "url",
  "urlencoding",

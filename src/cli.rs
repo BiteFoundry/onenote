@@ -458,8 +458,22 @@ pub enum Command {
         bind: String,
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
+        /// API key clients must send (`Authorization: Bearer <key>` or `x-api-key`).
+        /// Falls back to `ONENOTE_API_KEY`; a loopback bind without either
+        /// generates a random key and prints it once on stderr.
         #[arg(long = "api-key", visible_alias = "token")]
         api_key: Option<String>,
+        /// Run a loopback server without an API key (not allowed on other binds)
+        #[arg(long, conflicts_with = "api_key")]
+        allow_keyless: bool,
+        /// Extra `Host` header value to accept (repeatable). Loopback names and
+        /// the `--bind` value are always accepted
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_hosts: Vec<String>,
+        /// Exact browser origin allowed to call the API, e.g. `https://app.example.com`
+        /// (repeatable). Without it every cross-origin browser request is refused
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origins: Vec<String>,
     },
     /// Start the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
@@ -1267,9 +1281,25 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             bind,
             port,
             api_key,
+            allow_keyless,
+            allowed_hosts,
+            cors_origins,
         }) => {
             let (_auth, graph, storage) = open_runtime(cfg, false).await?;
-            serve::run(cfg.clone(), graph, storage, &bind, port, api_key).await
+            serve::run(
+                cfg.clone(),
+                graph,
+                storage,
+                serve::ServeOptions {
+                    bind,
+                    port,
+                    api_key,
+                    allow_keyless,
+                    allowed_hosts,
+                    cors_origins,
+                },
+            )
+            .await
         }
         Some(Command::Mcp) => crate::mcp::run(cfg.clone()).await,
     }
@@ -4047,6 +4077,37 @@ mod tests {
             cli.command.unwrap(),
             Command::Serve { port: 8788, .. }
         ));
+
+        let cli = Cli::try_parse_from([
+            "onenote",
+            "serve",
+            "--allow-keyless",
+            "--allowed-host",
+            "notes.corp.example",
+            "--allowed-host",
+            "10.0.0.5",
+            "--cors-origin",
+            "https://app.example.com",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Serve {
+                api_key,
+                allow_keyless,
+                allowed_hosts,
+                cors_origins,
+                ..
+            } => {
+                assert_eq!(api_key, None);
+                assert!(allow_keyless);
+                assert_eq!(allowed_hosts, vec!["notes.corp.example", "10.0.0.5"]);
+                assert_eq!(cors_origins, vec!["https://app.example.com"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["onenote", "serve", "--token", "k", "--allow-keyless"]).is_err()
+        );
 
         let cli = Cli::try_parse_from(["onenote", "update", "--check", "--json"]).unwrap();
         assert!(matches!(

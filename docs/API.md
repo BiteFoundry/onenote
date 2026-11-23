@@ -3,21 +3,39 @@
 `onenote serve` runs a local Axum HTTP server bound to `127.0.0.1:8793` by default.
 
 ```sh
-# Start with default port (127.0.0.1:8793)
+# Start with default port (127.0.0.1:8793); a random API key is printed once on stderr
 onenote serve
 
 # Keep a client configured for the previous port
 onenote serve --port 8788
 
-# Set a bind address and require a Bearer token
-onenote serve --bind 127.0.0.1 --token my-secret-token
+# Choose the API key yourself (flag or environment variable)
+onenote serve --token my-secret-token
+ONENOTE_API_KEY=my-secret-token onenote serve
 ```
 
-When `--token` is provided, every endpoint except `/health` requires:
+### Authentication and access control
+
+Every endpoint except `/health` requires the API key, sent as either header:
 
 ```http
 Authorization: Bearer my-secret-token
+x-api-key: my-secret-token
 ```
+
+| Situation | Behaviour |
+| --- | --- |
+| `--api-key` / `--token` or `ONENOTE_API_KEY` set | That key is required. An empty value is an error. |
+| Loopback bind, no key given | A random 32-byte key is generated for this run and printed once on stderr with a ready-to-copy `Authorization: Bearer …` line. |
+| Loopback bind with `--allow-keyless` | No key is required (a warning is printed). Any local process can then read, edit and delete notebooks through the server. |
+| Non-loopback bind (for example `--bind 0.0.0.0`) | A key is mandatory. `--allow-keyless` and the former `ONENOTE_ALLOW_INSECURE_SERVE` variable do not apply. |
+
+The server also checks where a request comes from, on every route including `/health`:
+
+- **`Host` allow-list.** The `Host` header must name `127.0.0.1`, `localhost`, `[::1]`, the `--bind` value, or a host added with `--allowed-host <HOST>` (repeatable; the port is ignored). Other hosts get `421 Misdirected Request`. When binding a LAN address, add the name clients use: `onenote serve --bind 0.0.0.0 --token … --allowed-host notes.corp.example`.
+- **No cross-origin browser access by default.** A request with an `Origin` header gets `403 Forbidden`, and no `Access-Control-Allow-*` header is sent. To let a web app call the API, list its exact origin: `--cors-origin https://app.example.com` (repeatable). Wildcards are not supported. An allowed origin still needs the API key.
+
+Command-line clients such as `curl` send no `Origin` header and are unaffected.
 
 ## Endpoints
 
