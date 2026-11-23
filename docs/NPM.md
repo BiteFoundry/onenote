@@ -166,10 +166,15 @@ token_refresh_mins = 5
 | `ONENOTE_IMAGE_PROTOCOL` | Terminal image protocol override (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`) |
 | `ONENOTE_GITHUB_REPO` | Override GitHub `owner/repo` used by `onenote self-update` (default `BiteFoundry/onenote`) |
 | `ONENOTE_GITHUB_TOKEN` | GitHub token for private release checks in `onenote self-update` |
+| `ONENOTE_EXTRA_CA_PEM` | PEM root certificate(s) to trust in addition to the bundled and OS roots, for TLS-inspecting corporate proxies. An unusable file is an error |
+| `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS` | Also loaded as extra PEM roots; an unusable file is a stderr warning and is skipped |
 
 ## Troubleshooting
 
 - **`no prebuilt binary found for <platform>-<arch>`** — reinstall with
   `npm install -g @bitefoundry/onenote --include=optional`.
+- **`TLS certificate was not trusted (unknown issuer)`** — your network inspects HTTPS with a private root CA.
+  Export it as PEM and set `ONENOTE_EXTRA_CA_PEM=/path/to/root.pem` (`SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS`
+  are also honoured), then check with `onenote doctor --online`.
 - **Older Linux (`GLIBC < 2.28`) or Alpine/musl Linux** — build from source with Cargo (`cargo build --release`).
 - **Verify the binary** — `node -p "require.resolve('@bitefoundry/onenote-win32-x64/package.json')"` (adjust for your platform).

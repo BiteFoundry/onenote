@@ -74,6 +74,23 @@ For persistent environment configuration, set `ONENOTE_CLIENT_ID` and `ONENOTE_T
 
 When supplying a token without an embedded user ID (for example an opaque `ONENOTE_ACCESS_TOKEN` or `ONENOTE_TOKEN_FILE`), run `onenote whoami` once while online to record only the token fingerprint and user ID under `identity-map/`. Running local `search` (without `--refresh`) or `--offline` with an unrecorded token returns an `Unknown identity` error instead of falling back to an empty `default` cache. Running `onenote search <query> --refresh` also records the identity binding. Whenever the token rotates or changes, run `onenote whoami` once again for the new token.
 
+### Enterprise networks / custom CA
+
+HTTPS connections trust the bundled Mozilla roots and the operating system's trust store. If your network inspects HTTPS with a private root CA that is not in either, export that root as PEM and point the CLI at it:
+
+| Variable | Behaviour |
+| --- | --- |
+| `ONENOTE_EXTRA_CA_PEM` | PEM file (one certificate or a bundle) added to the trusted roots. If it cannot be read or parsed, the command fails with an error naming the file. |
+| `SSL_CERT_FILE` | Also loaded as extra roots. An unusable file is reported on stderr and skipped. When set, it replaces the OS trust store for the native-roots lookup; the bundled roots still apply. |
+| `NODE_EXTRA_CA_CERTS` | Also loaded as extra roots, so an existing Node.js setup works unchanged. An unusable file is reported on stderr and skipped. |
+
+```sh
+export ONENOTE_EXTRA_CA_PEM=/path/to/corporate-root.pem
+onenote doctor --online
+```
+
+A certificate from an unknown issuer produces a `TLS certificate was not trusted (unknown issuer)` hint naming these variables. Certificate verification cannot be turned off. Warnings go to stderr only, so `onenote mcp` stdio output is unaffected.
+
 ---
 
 ## Keybindings Cheat Sheet

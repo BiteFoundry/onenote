@@ -173,7 +173,7 @@ impl AuthManager {
     }
 
     pub fn from_tokens(config: AppConfig, tokens: StoredTokens) -> Self {
-        let http = build_auth_http_client().unwrap_or_else(|_| reqwest::Client::new());
+        let http = build_auth_http_client_or_warn();
         Self {
             config,
             http,
@@ -191,7 +191,7 @@ impl AuthManager {
 
     #[cfg(test)]
     pub(crate) fn empty_for_test(config: AppConfig) -> Self {
-        let http = build_auth_http_client().unwrap_or_else(|_| reqwest::Client::new());
+        let http = build_auth_http_client_or_warn();
         Self {
             config,
             http,
@@ -1336,7 +1336,7 @@ impl AuthManager {
             .form(&[("client_id", client_id), ("scope", scope.as_str())])
             .send()
             .await
-            .context("Failed to send Device Code request")?;
+            .map_err(|e| crate::http::transport_error(e, "Failed to send Device Code request"))?;
 
         let mut status = res.status();
         let mut body_text = res.text().await.unwrap_or_default();
@@ -1354,7 +1354,9 @@ impl AuthManager {
                     .form(&[("client_id", client_id), ("scope", fallback_scope.as_str())])
                     .send()
                     .await
-                    .context("Failed to send fallback Device Code request")?;
+                    .map_err(|e| {
+                        crate::http::transport_error(e, "Failed to send fallback Device Code request")
+                    })?;
                 status = retry_res.status();
                 body_text = retry_res.text().await.unwrap_or_default();
             }
@@ -1398,7 +1400,7 @@ impl AuthManager {
                 ])
                 .send()
                 .await
-                .context("Failed to poll Device Code token")?;
+                .map_err(|e| crate::http::transport_error(e, "Failed to poll Device Code token"))?;
 
             let poll_status = poll_res.status();
             let poll_text = poll_res.text().await.unwrap_or_default();
@@ -1553,7 +1555,7 @@ impl AuthManager {
         let res = req
             .send()
             .await
-            .context("Failed to send OAuth token request")?;
+            .map_err(|e| crate::http::transport_error(e, "Failed to send OAuth token request"))?;
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -1772,11 +1774,25 @@ fn generate_random_b64(num_bytes: usize) -> String {
 }
 
 fn build_auth_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("onenote-cli/", env!("CARGO_PKG_VERSION")))
+    crate::http::client_builder()?
         .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to initialize HTTP client")
+}
+
+/// For constructors that cannot fail. An unusable `ONENOTE_EXTRA_CA_PEM` is reported on stderr
+/// here, and `GraphClient::new` (which builds from the same cached settings) returns it as an
+/// error, so it is never silently ignored. The fallback keeps the user agent, the timeout and the
+/// bundled/OS roots.
+fn build_auth_http_client_or_warn() -> reqwest::Client {
+    build_auth_http_client().unwrap_or_else(|err| {
+        eprintln!("Warning: {err:#}");
+        reqwest::Client::builder()
+            .user_agent(crate::http::USER_AGENT)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    })
 }
 
 fn is_truthy_env(val: Option<&str>) -> bool {

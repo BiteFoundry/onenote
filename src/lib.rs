@@ -5,6 +5,7 @@ pub mod daemon;
 #[cfg(windows)]
 mod desktop;
 pub mod graph;
+mod http;
 pub mod img_preview;
 pub mod mcp;
 pub mod models;

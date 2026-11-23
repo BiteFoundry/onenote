@@ -3108,11 +3108,13 @@ async fn cmd_doctor(cfg: &AppConfig, online: bool, json_out: bool) -> Result<()>
 
     let mut online_ok: Option<bool> = None;
     let mut online_error: Option<String> = None;
+    let mut online_hint: Option<&'static str> = None;
     if online {
         match graph.list_onenote_notebooks(&OnenoteScope::Me).await {
             Ok(_) => online_ok = Some(true),
             Err(e) => {
                 online_ok = Some(false);
+                online_hint = crate::http::tls_hint_for(&e);
                 online_error = Some(e.to_string());
             }
         }
@@ -3139,6 +3141,7 @@ async fn cmd_doctor(cfg: &AppConfig, online: bool, json_out: bool) -> Result<()>
                 "daemon": daemon_st,
                 "online_probe_ok": online_ok,
                 "online_probe_error": online_error,
+                "online_probe_hint": online_hint,
             }))?
         );
     } else {
@@ -3170,6 +3173,11 @@ async fn cmd_doctor(cfg: &AppConfig, online: bool, json_out: bool) -> Result<()>
                     "Online probe:   FAILED ({})",
                     online_error.as_deref().unwrap_or("unknown error")
                 );
+                if let Some(hint) = online_hint {
+                    if !online_error.as_deref().is_some_and(|e| e.contains(hint)) {
+                        eprintln!("hint: {hint}");
+                    }
+                }
             }
         }
         for w in &diag.warnings {

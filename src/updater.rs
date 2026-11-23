@@ -75,7 +75,7 @@ pub async fn check_or_apply_update_at(
 ) -> Result<UpdateCheckResult> {
     let repo = validate_github_repo(repo)?;
     let current_version = env!("CARGO_PKG_VERSION").to_string();
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()?
         .timeout(Duration::from_secs(60))
         .build()
         .context("Failed to create HTTP client")?;
@@ -95,7 +95,12 @@ pub async fn check_or_apply_update_at(
     let resp = req
         .send()
         .await
-        .with_context(|| format!("GitHub Release lookup request failed: {release_api_url}"))?;
+        .map_err(|e| {
+            crate::http::transport_error(
+                e,
+                format!("GitHub Release lookup request failed: {release_api_url}"),
+            )
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -294,7 +299,12 @@ async fn download_asset_bytes(
         let resp = req
             .send()
             .await
-            .with_context(|| format!("Asset download request failed: {}", asset.name))?;
+            .map_err(|e| {
+                crate::http::transport_error(
+                    e,
+                    format!("Asset download request failed: {}", asset.name),
+                )
+            })?;
         if resp.status().is_success() {
             return resp
                 .bytes()
@@ -320,7 +330,12 @@ async fn download_asset_bytes(
         let resp = req
             .send()
             .await
-            .with_context(|| format!("Asset API download request failed: {}", asset.name))?;
+            .map_err(|e| {
+                crate::http::transport_error(
+                    e,
+                    format!("Asset API download request failed: {}", asset.name),
+                )
+            })?;
         if resp.status().is_success() {
             return resp
                 .bytes()

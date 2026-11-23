@@ -88,18 +88,17 @@ pub struct GraphClient {
 
 impl GraphClient {
     pub fn new(config: AppConfig, auth: AuthManager) -> Result<Self> {
-        let http_builder = || {
-            reqwest::Client::builder()
-                .user_agent(concat!("onenote-cli/", env!("CARGO_PKG_VERSION")))
+        let http_builder = || -> Result<reqwest::ClientBuilder> {
+            Ok(crate::http::client_builder()?
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(60))
                 .tcp_nodelay(true)
                 .pool_max_idle_per_host(16)
                 .pool_idle_timeout(Duration::from_secs(90))
-                .tcp_keepalive(Duration::from_secs(30))
+                .tcp_keepalive(Duration::from_secs(30)))
         };
-        let http = http_builder().build()?;
-        let operation_http = http_builder()
+        let http = http_builder()?.build()?;
+        let operation_http = http_builder()?
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .build()?;
