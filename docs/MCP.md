@@ -35,7 +35,7 @@ If installed via `npx`:
 | Tool | Description | Key Parameters |
 | --- | --- | --- |
 | `whoami` | Return signed-in Microsoft 365 profile & auth mode | _(none)_ |
-| `list_notebooks` | List accessible OneNote notebooks (personal, Teams/Group, SharePoint) | `include_teams?`, `limit?`, `cursor?`, `refresh?`, `offline?` |
+| `list_notebooks` | List accessible OneNote notebooks (personal, plus Teams/Group with `include_teams`; SharePoint site notebooks are not auto-discovered) | `include_teams?`, `limit?`, `cursor?`, `refresh?`, `offline?` |
 | `list_sections` | List sections in a notebook or across all notebooks | `notebook?`, `limit?`, `cursor?`, `refresh?`, `offline?` |
 | `list_pages` | List pages in a section (supports `Notebook/Section`, name, or ID) | `section` (required), `limit?`, `cursor?`, `refresh?`, `offline?` |
 | `get_page` | Read compact Markdown and identifiers; pass compact: false for XHTML, blocks and resources | `page` (required), `section?`, `compact?`, `offline?` |

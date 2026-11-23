@@ -1747,6 +1747,18 @@ pub(crate) fn delete_tokens_at_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Page shown in the browser after a successful PKCE loopback sign-in.
+const LOGIN_SUCCESS_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>OneNote CLI Login</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f5f5f7;color:#1d1d1f">
+  <div style="background:#fff;padding:2.5rem 3rem;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);text-align:center">
+    <h1 style="margin:0 0 .5rem;color:#0078d4">Microsoft OneNote CLI Login Complete</h1>
+    <p style="margin:0;color:#555">Authentication succeeded. You can close this window and return to the terminal.</p>
+  </div>
+</body>
+</html>"#;
+
 /// Computes RFC 7636 PKCE `S256` challenge: `BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))`.
 pub fn compute_pkce_s256(code_verifier: &str) -> String {
     let digest = Sha256::digest(code_verifier.as_bytes());
@@ -2642,17 +2654,7 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
             }
         };
 
-        let success_html = r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Outlook CLI Login</title></head>
-<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f5f5f7;color:#1d1d1f">
-  <div style="background:#fff;padding:2.5rem 3rem;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);text-align:center">
-    <h1 style="margin:0 0 .5rem;color:#0078d4">Microsoft Outlook CLI Login Complete</h1>
-    <p style="margin:0;color:#555">Authentication succeeded. You can close this window and return to the terminal.</p>
-  </div>
-</body>
-</html>"#;
-        let _ = write_http_response(&mut socket, "200 OK", success_html).await;
+        let _ = write_http_response(&mut socket, "200 OK", LOGIN_SUCCESS_HTML).await;
         return Ok(code);
     }
 }
@@ -3961,5 +3963,12 @@ mod tests {
         let refreshed = mgr_org.valid_access_token().await.unwrap();
         assert_eq!(refreshed, "org-fallback-token");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn login_success_page_names_onenote() {
+        assert!(LOGIN_SUCCESS_HTML.contains("<title>OneNote CLI Login</title>"));
+        assert!(LOGIN_SUCCESS_HTML.contains("Microsoft OneNote CLI Login Complete"));
+        assert!(!LOGIN_SUCCESS_HTML.contains("Outlook"));
     }
 }

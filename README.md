@@ -23,7 +23,7 @@
 
 | Capability | Details |
 | --- | --- |
-| **Minimal-Chrome 3-Pane TUI** | Personal, Teams/Group & SharePoint notebooks, colored section ribbon, nested subpages (`level 0/1/2`), bidirectional XHTML ↔ Markdown canvas, surgical `data-id` `PATCH` edits, optimistic to-do toggles, Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), and 6 themes. |
+| **Minimal-Chrome 3-Pane TUI** | Personal and Teams/Group notebooks, colored section ribbon, nested subpages (`level 0/1/2`), bidirectional XHTML ↔ Markdown canvas, surgical `data-id` `PATCH` edits, optimistic to-do toggles, Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), and 6 themes. |
 | **High-Res Terminal Images** | Inline thumbnails & fullscreen HD previews (`v` / `Alt+v`) with 80ms protocol probing for **Kitty**, **iTerm2**, **Sixel** (Floyd-Steinberg dithering), and **24-bit Unicode Half-Blocks** + `Ctrl+V` clipboard PNG upload. |
 | **Local SQLite FTS5 + IPC Daemon** | WAL-mode SQLite cache with 4-reader pool, trigram full-text search (`/`), persistent `DraftStore`, and a shared background sync daemon (`onenote daemon start`). |
 | **4-in-1 Agent Interface** | Interactive **TUI** (`onenote`), scriptable `--json` **CLI**, local **HTTP JSON API** (`onenote serve`, port `8793`), and stdio **MCP Server** (`onenote mcp`). |
@@ -125,6 +125,8 @@ When a `--json` command fails at runtime, it exits 1 and writes a single JSON ob
 
 Use `onenote read PAGE --format blocks` to find a checkbox or text block's current element ID. Use `--done` or `--undone` to set a checkbox state. Omit both flags to toggle it.
 
+`onenote notebooks` lists your personal notebooks, plus the notebooks of your joined Teams/Groups with `--include-teams`. SharePoint site notebooks are not auto-discovered; you can create one with `onenote create-notebook NAME --site SITE_ID`.
+
 `copy-page` uses Microsoft Graph to create a new page in the destination section and preserves the original page and its links. If the copy is still pending, pass its `operation_url` with `--operation` to check the same copy. [Copy a page](docs/API.md#copy-a-page)
 
 On Windows, `desktop-set-page-level` and `desktop-rename-section` work on existing objects in an open notebook. Use the OneNote app's **Move** command to move a page between sections. [Hierarchy operations and permissions](docs/API.md#hierarchy-operations)
@@ -132,13 +134,15 @@ On Windows, `desktop-set-page-level` and `desktop-rename-section` work on existi
 ### Local HTTP API (`onenote serve`)
 
 ```sh
-# Start local Axum JSON server (default 127.0.0.1:8793)
+# Start local Axum JSON server (default 127.0.0.1:8793) with your own API key
 onenote serve --token dev-secret
 
 # Query pages & FTS5 search from scripts or agents
 curl -H "Authorization: Bearer dev-secret" \
   "http://127.0.0.1:8793/v1/onenote/search?q=canary&limit=10"
 ```
+
+The API key is required on every route except `/health`. Without `--token` (alias of `--api-key`) or `ONENOTE_API_KEY`, a loopback server generates a random key and prints it once on stderr; pass `--allow-keyless` to run a loopback server without one. A non-loopback `--bind` always needs a key. Browser pages cannot call the API unless their exact origin is listed with `--cors-origin`, and requests whose `Host` is not a loopback name, the bind address or an `--allowed-host` are refused. [Authentication and access control](docs/API.md#authentication-and-access-control)
 
 Full route reference & OpenAPI 3.1 spec: [docs/API.md](docs/API.md) · [docs/openapi.yaml](docs/openapi.yaml).
 

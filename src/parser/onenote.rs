@@ -2556,13 +2556,38 @@ fn parse_markdown_link_or_image(
         return None;
     }
     let after_mid = &after_open[close_bracket + 2..];
-    let close_paren = after_mid.find(')')?;
+    let close_paren = find_link_url_end(after_mid)?;
     let url = after_mid[..close_paren].trim();
     if url.is_empty() {
         return None;
     }
     let consumed = 1 + close_bracket + 2 + close_paren + 1;
     Some((label, url, consumed))
+}
+
+/// Byte index of the `)` that closes a Markdown link/image URL.
+///
+/// Parentheses inside the URL are matched, so
+/// `https://en.wikipedia.org/wiki/Rust_(programming_language)` keeps its closing
+/// paren. A backslash escapes the next character. If the parentheses are not
+/// balanced on the current line, the first `)` ends the URL (the behaviour
+/// before balanced matching), so unbalanced input never parses worse.
+fn find_link_url_end(after_mid: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut chars = after_mid.char_indices();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next();
+            }
+            '\n' => break,
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(idx),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    after_mid.find(')')
 }
 
 fn is_safe_onenote_link_url(url: &str) -> bool {
@@ -4854,5 +4879,65 @@ let ok = 1 < 2 && 3 > 1;
             Html::parse_fragment(&patch_pi.content),
             Html::parse_fragment(r#"<p id="p:inner" data-tag="to-do">Id p item</p>"#)
         );
+    }
+
+    #[test]
+    fn markdown_link_url_keeps_balanced_parentheses() {
+        // Balanced parentheses stay inside the URL; trailing text is untouched.
+        let input = "[Rust](https://en.wikipedia.org/wiki/Rust_(programming_language)) is fast";
+        let (label, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
+        assert_eq!(label, "Rust");
+        assert_eq!(
+            url,
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+        );
+        assert_eq!(&input[consumed..], " is fast");
+
+        // No parentheses in the URL: identical to the previous behaviour.
+        let input = "[a](https://example.com/u) and (note)";
+        let (label, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
+        assert_eq!((label, url), ("a", "https://example.com/u"));
+        assert_eq!(&input[consumed..], " and (note)");
+
+        // Nested parentheses.
+        let input = "[n](https://h/((x)))!";
+        let (_, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
+        assert_eq!(url, "https://h/((x))");
+        assert_eq!(&input[consumed..], "!");
+
+        // Unbalanced: falls back to the first `)`, as before.
+        let input = "[a](http://x/(y) tail";
+        let (_, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
+        assert_eq!(url, "http://x/(y");
+        assert_eq!(&input[consumed..], " tail");
+
+        // An escaped paren does not open or close a group.
+        let input = r"[e](https://h/a\)b) rest";
+        let (_, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
+        assert_eq!(url, r"https://h/a\)b");
+        assert_eq!(&input[consumed..], " rest");
+
+        // Image form (empty alt allowed) and surrounding whitespace trimmed.
+        let (alt, url, _) =
+            parse_markdown_link_or_image("[alt]( https://h/a_(1).png )", true).unwrap();
+        assert_eq!((alt, url), ("alt", "https://h/a_(1).png"));
+
+        assert!(parse_markdown_link_or_image("[a]()", false).is_none());
+        assert!(parse_markdown_link_or_image("[a](no-close", false).is_none());
+    }
+
+    #[test]
+    fn markdown_to_xhtml_keeps_parenthesised_link_and_image_urls() {
+        let html = markdown_to_onenote_html_fragment(
+            "See [Rust](https://en.wikipedia.org/wiki/Rust_(programming_language)) now.\n\n![diagram](https://h/a_(1).png)",
+            &[],
+        );
+        assert!(
+            html.contains(r#"href="https://en.wikipedia.org/wiki/Rust_(programming_language)""#),
+            "{html}"
+        );
+        assert!(html.contains(" now."), "{html}");
+        assert!(!html.contains(") now."), "{html}");
+        assert!(html.contains("https://h/a_(1).png"), "{html}");
     }
 }
