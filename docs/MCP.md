@@ -56,6 +56,15 @@ If installed via `npx`:
 
 The server resolves the signed-in account and local cache on the first `tools/call`; `initialize`, `ping`, and `tools/list` respond without contacting Graph or selecting a cache.
 
+### Request cost
+
+Each tool description in `tools/list` states what a call costs, so agents can avoid expensive patterns:
+
+- `search_pages` is local (no network). `refresh: true` first runs a full account sync, which issues many Graph requests on large accounts; do not use it in loops.
+- `list_notebooks`, `list_sections`, `list_pages` and `get_page` call Microsoft Graph unless `offline: true`. A recent cached list is reused only when `ONENOTE_CLI_CACHE_SECS` is set; `refresh: true` always refetches.
+- `include_teams` adds one Graph request per joined Team (up to `ONENOTE_MAX_TEAMS`, default 100). `list_sections` without `notebook` lists every notebook, including Teams notebooks, and then each notebook's sections.
+- `copy_page` blocks for up to `wait_seconds` while it polls the server-side copy. `download_resource` downloads the full file to disk.
+
 ### Page reads and writes
 
 `get_page` returns the compact page by default, including `page.page_key`, `page.scope`, `page.omitted`, and `page.hint`. Pass `compact: false` to read `page.blocks[].element_id`, `page.raw_xhtml`, and `page.resources`. Write tools (`append_page`, `update_block`, `update_page`, `toggle_todo`) return a compact summary (`ok`, `page_key`, `title`, `last_modified_at`, plus `block_id` / `completed` where applicable) by default; pass `compact: false` to include the full `page` object. Page tools (`get_page`, `append_page`, `update_block`, `update_page`, `toggle_todo`, `delete_page`) accept an optional `section` argument to narrow title lookup. Use current element IDs for block writes. Both `update_block` and its `update_page` alias appear in `tools/list`.

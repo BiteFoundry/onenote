@@ -234,35 +234,35 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "list_notebooks",
-            "description": "List accessible Microsoft OneNote notebooks (personal + optional Teams/Group shared notebooks).",
+            "description": "List accessible Microsoft OneNote notebooks (personal + optional Teams/Group shared notebooks). Calls Microsoft Graph unless offline:true (a recent cached answer is reused only when ONENOTE_CLI_CACHE_SECS is set). include_teams adds one Graph request per joined Team, up to ONENOTE_MAX_TEAMS (default 100), and can take several seconds.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "include_teams": { "type": "boolean", "description": "Include Microsoft Teams/Group shared notebooks" },
+                    "include_teams": { "type": "boolean", "description": "Include Microsoft Teams/Group shared notebooks (one extra Graph request per joined Team)" },
                     "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" },
-                    "refresh": { "type": "boolean", "description": "Force refresh from Microsoft Graph" },
-                    "offline": { "type": "boolean", "description": "Read local SQLite cache only" }
+                    "refresh": { "type": "boolean", "description": "Ignore any cached answer and refetch from Microsoft Graph. Costs extra Graph requests; use only when results look stale." },
+                    "offline": { "type": "boolean", "description": "Read the local SQLite cache only: no network, may be stale." }
                 }
             }
         }),
         json!({
             "name": "list_sections",
-            "description": "List OneNote sections across all notebooks or within a specific notebook.",
+            "description": "List OneNote sections across all notebooks or within a specific notebook. Calls Microsoft Graph unless offline:true. Without notebook it first lists every notebook, including Teams notebooks, then each notebook's sections: many requests on large accounts, so pass notebook when you can.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "notebook": { "type": "string", "description": "Optional notebook key, ID, or display name" },
                     "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" },
-                    "refresh": { "type": "boolean" },
-                    "offline": { "type": "boolean" }
+                    "refresh": { "type": "boolean", "description": "Ignore any cached answer and refetch from Microsoft Graph. Costs extra Graph requests; use only when results look stale." },
+                    "offline": { "type": "boolean", "description": "Read the local SQLite cache only: no network, may be stale." }
                 }
             }
         }),
         json!({
             "name": "list_pages",
-            "description": "List OneNote pages inside a section (supports `Notebook/Section`, section name, or ID).",
+            "description": "List OneNote pages inside a section (supports `Notebook/Section`, section name, or ID). Calls Microsoft Graph unless offline:true; the request size grows with cursor + limit.",
             "inputSchema": {
                 "type": "object",
                 "required": ["section"],
@@ -270,21 +270,21 @@ pub fn tool_definitions() -> Vec<Value> {
                     "section": { "type": "string" },
                     "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" },
-                    "refresh": { "type": "boolean" },
-                    "offline": { "type": "boolean" }
+                    "refresh": { "type": "boolean", "description": "Ignore any cached answer and refetch from Microsoft Graph. Costs extra Graph requests; use only when results look stale." },
+                    "offline": { "type": "boolean", "description": "Read the local SQLite cache only: no network, may be stale." }
                 }
             }
         }),
         json!({
             "name": "get_page",
-            "description": "Read a OneNote page. Returns compact Markdown and identifiers by default; set compact:false for parsed blocks (element_id, data-tag), plain text, raw XHTML and embedded resources.",
+            "description": "Read a OneNote page. Returns compact Markdown and identifiers by default; set compact:false for parsed blocks (element_id, data-tag), plain text, raw XHTML and embedded resources. Fetches the page content from Microsoft Graph on each call; offline:true returns the cached copy. compact:false responses can be large.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string", "description": "Page key, ID, or title" },
                     "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
-                    "offline": { "type": "boolean" },
+                    "offline": { "type": "boolean", "description": "Return the cached copy of the page without contacting Microsoft Graph." },
                     "compact": { "type": "boolean", "default": true, "description": "Default true. Set false for blocks[].element_id, raw_xhtml and resources." }
                 }
             }
@@ -382,7 +382,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "copy_page",
-            "description": "Copy a page via Microsoft Graph and verify its new ID and section. The original page and its links stay in place. To check a pending or interrupted copy, pass its operation_url with the original page and section.",
+            "description": "Copy a page via Microsoft Graph and verify its new ID and section. The original page and its links stay in place. The copy runs asynchronously on the server and wait_seconds polls it. To check a pending or interrupted copy, pass its operation_url with the original page and section.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page", "section"],
@@ -390,7 +390,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "page": { "type": "string", "description": "Source page ID or scoped page key" },
                     "section": { "type": "string", "description": "Destination section ID or scoped section key" },
                     "operation_url": { "type": "string", "description": "Existing Graph operation URL to poll instead of submitting a new copy" },
-                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": MAX_COPY_WAIT_SECONDS, "default": DEFAULT_COPY_WAIT_SECONDS, "description": "Seconds to poll; 0 returns the operation handle immediately" }
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": MAX_COPY_WAIT_SECONDS, "default": DEFAULT_COPY_WAIT_SECONDS, "description": "Seconds to poll; the call blocks for up to this long. 0 returns the operation handle immediately" }
                 }
             }
         }),
@@ -444,14 +444,14 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "search_pages",
-            "description": "Search cached OneNote pages via local SQLite FTS5 (`onenote_fts`).",
+            "description": "Search cached OneNote pages via local SQLite FTS5 (`onenote_fts`); no network by default. refresh:true first runs a full account sync (many Graph requests, slow on large accounts), so avoid it in loops.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
                 "properties": {
                     "query": { "type": "string" },
-                    "section": { "type": "string" },
-                    "refresh": { "type": "boolean" },
+                    "section": { "type": "string", "description": "Optional section name or Notebook/Section path to filter results" },
+                    "refresh": { "type": "boolean", "description": "Run a full account sync before searching. Expensive: many Graph requests." },
                     "limit": { "type": "integer", "default": 30, "minimum": 1, "maximum": 1000 },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" }
                 }
@@ -459,7 +459,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "download_resource",
-            "description": "Download an embedded image or file attachment from a OneNote page and return `{ ok, path, file_name, mime_type, size_bytes, is_image }`.",
+            "description": "Download an embedded image or file attachment from a OneNote page and return `{ ok, path, file_name, mime_type, size_bytes, is_image }`. Downloads the full binary to disk.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -976,5 +976,112 @@ mod tests {
         }));
         let bogus_val = bogus.expect("bogus handled").expect("bogus returns error");
         assert!(bogus_val["error"].is_object());
+    }
+
+    /// Name, required arguments and property keys of every tool, sorted by name.
+    fn schema_snapshot() -> Vec<(String, Vec<String>, Vec<String>)> {
+        let mut out: Vec<_> = tool_definitions()
+            .iter()
+            .map(|tool| {
+                let schema = &tool["inputSchema"];
+                let required = schema["required"]
+                    .as_array()
+                    .map(|items| items.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+                    .unwrap_or_default();
+                let mut props: Vec<String> = schema["properties"]
+                    .as_object()
+                    .map(|p| p.keys().cloned().collect())
+                    .unwrap_or_default();
+                props.sort();
+                (tool["name"].as_str().unwrap().to_string(), required, props)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn tool_names_and_required_arguments_are_unchanged() {
+        let got: Vec<(String, Vec<String>)> = schema_snapshot()
+            .into_iter()
+            .map(|(name, required, _)| (name, required))
+            .collect();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        #[allow(unused_mut)]
+        let mut want: Vec<(String, Vec<String>)> = vec![
+            ("append_page".into(), s(&["page", "markdown"])),
+            ("copy_page".into(), s(&["page", "section"])),
+            ("create_notebook".into(), s(&["name"])),
+            ("create_page".into(), s(&["section", "title"])),
+            ("create_section".into(), s(&["notebook", "name"])),
+            ("delete_page".into(), s(&["page", "confirm"])),
+            ("download_resource".into(), s(&["page"])),
+            ("get_page".into(), s(&["page"])),
+            ("list_notebooks".into(), s(&[])),
+            ("list_pages".into(), s(&["section"])),
+            ("list_sections".into(), s(&[])),
+            ("rename_notebook".into(), s(&["drive_id", "item_id", "name"])),
+            ("rename_section".into(), s(&["section", "name"])),
+            ("search_pages".into(), s(&["query"])),
+            ("toggle_todo".into(), s(&["page"])),
+            ("update_block".into(), s(&["page"])),
+            ("update_page".into(), s(&["page"])),
+            ("whoami".into(), s(&[])),
+        ];
+        #[cfg(windows)]
+        {
+            want.push(("desktop_rename_section".into(), s(&["section_id", "name"])));
+            want.push(("desktop_set_page_level".into(), s(&["page_id", "level"])));
+            want.sort();
+        }
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn tool_descriptions_state_their_cost_and_stay_short() {
+        let tools = tool_definitions();
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("tool {name} missing"))
+                .clone()
+        };
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap();
+            let description = tool["description"].as_str().unwrap();
+            assert!(
+                description.len() <= 400,
+                "{name} description is {} chars",
+                description.len()
+            );
+            for key in ["refresh", "offline"] {
+                if let Some(prop) = tool["inputSchema"]["properties"].get(key) {
+                    let text = prop["description"].as_str().unwrap_or_default();
+                    assert!(!text.trim().is_empty(), "{name}.{key} has no description");
+                }
+            }
+        }
+
+        let search = find("search_pages");
+        let text = search["description"].as_str().unwrap();
+        assert!(text.contains("no network") && text.contains("full account sync"), "{text}");
+        let refresh = search["inputSchema"]["properties"]["refresh"]["description"].as_str().unwrap();
+        assert!(refresh.contains("Expensive"), "{refresh}");
+
+        let notebooks = find("list_notebooks");
+        let text = notebooks["description"].as_str().unwrap();
+        assert!(text.contains("one Graph request per joined Team") && text.contains("ONENOTE_MAX_TEAMS"));
+
+        let sections = find("list_sections")["description"].as_str().unwrap().to_string();
+        assert!(sections.contains("pass notebook"), "{sections}");
+        assert!(find("copy_page")["inputSchema"]["properties"]["wait_seconds"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("blocks"));
+        assert!(find("download_resource")["description"]
+            .as_str()
+            .unwrap()
+            .contains("full binary"));
     }
 }
