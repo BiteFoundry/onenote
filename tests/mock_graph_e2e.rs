@@ -4993,3 +4993,176 @@ mod discovery_completeness {
         server.abort();
     }
 }
+
+fn search_fixture_section(id: &str, name: &str) -> onenote_cli::models::OnenoteSection {
+    onenote_cli::models::OnenoteSection {
+        section_key: format!("me|{id}"),
+        id: id.to_string(),
+        scope: OnenoteScope::Me,
+        notebook_id: Some("nb-1".to_string()),
+        notebook_name: Some("Work".to_string()),
+        parent_section_group_id: None,
+        parent_section_group_name: None,
+        display_name: name.to_string(),
+        color: None,
+        is_default: false,
+        pages_url: None,
+        created_at: None,
+        last_modified_at: None,
+        web_url: None,
+    }
+}
+
+fn search_fixture_page(
+    id: String,
+    section_id: &str,
+    section_name: &str,
+    modified_at: &str,
+) -> onenote_cli::models::OnenotePageSummary {
+    onenote_cli::models::OnenotePageSummary {
+        page_key: format!("me|{id}"),
+        title: format!("Kickoff notes {id}"),
+        id,
+        scope: OnenoteScope::Me,
+        section_id: section_id.to_string(),
+        section_name: Some(section_name.to_string()),
+        notebook_id: Some("nb-1".to_string()),
+        notebook_name: Some("Work".to_string()),
+        level: 0,
+        order: 0,
+        created_at: None,
+        last_modified_at: Some(modified_at.to_string()),
+        content_url: None,
+        web_url: None,
+        preview_text: None,
+        has_todo: false,
+    }
+}
+
+/// ON-10: a plain `--section` name used to be post-filtered over a small window of
+/// global hits, so a section whose hits ranked below that window returned nothing.
+#[tokio::test]
+async fn search_with_plain_section_name_is_filtered_before_the_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The search is local: the Graph URL is never contacted.
+    let (_cfg, graph, storage) =
+        make_test_runtime("http://127.0.0.1:9/v1.0".to_string(), tmp.path());
+
+    storage
+        .upsert_onenote_sections(&[
+            search_fixture_section("sec-alpha", "Alpha"),
+            search_fixture_section("sec-beta", "Beta"),
+            search_fixture_section("sec-ko", "회의록 DEV"),
+        ])
+        .unwrap();
+    let mut pages = Vec::new();
+    for i in 0..300 {
+        pages.push(search_fixture_page(
+            format!("alpha-{i:03}"),
+            "sec-alpha",
+            "Alpha",
+            "2026-11-22T09:00:00Z",
+        ));
+    }
+    for i in 0..3 {
+        pages.push(search_fixture_page(
+            format!("beta-{i}"),
+            "sec-beta",
+            "Beta",
+            "2026-11-02T09:00:00Z",
+        ));
+    }
+    for i in 0..25 {
+        pages.push(search_fixture_page(
+            format!("ko-{i:02}"),
+            "sec-ko",
+            "회의록 DEV",
+            "2026-11-03T09:00:00Z",
+        ));
+    }
+    // Pages whose section row is missing from the sections table.
+    for i in 0..2 {
+        pages.push(search_fixture_page(
+            format!("ghost-{i}"),
+            "sec-ghost",
+            "Ghost Notes",
+            "2026-11-01T09:00:00Z",
+        ));
+    }
+    storage.upsert_onenote_pages(&pages).unwrap();
+
+    // 300 newer hits in "Alpha" no longer hide the 3 in "Beta".
+    let (hits, has_more) =
+        cli::search_onenote_with_offset(&storage, &graph, "kickoff", Some("Beta"), false, 10, 0)
+            .await
+            .unwrap();
+    assert_eq!(hits.len(), 3);
+    assert!(hits.iter().all(|h| h.section_id == "sec-beta"));
+    assert_eq!(has_more, Some(false));
+
+    // A raw section ID keeps working as a plain filter.
+    let (by_id, by_id_more) =
+        cli::search_onenote_with_offset(&storage, &graph, "kickoff", Some("sec-beta"), false, 10, 0)
+            .await
+            .unwrap();
+    assert_eq!(by_id.len(), 3);
+    assert_eq!(by_id_more, Some(false));
+
+    // Offset/limit paging across a 25-hit section, matched case-insensitively.
+    let mut seen = std::collections::BTreeSet::new();
+    for (offset, expect_len, expect_more) in [(0, 10, true), (10, 10, true), (20, 5, false)] {
+        let (page, more) = cli::search_onenote_with_offset(
+            &storage,
+            &graph,
+            "kickoff",
+            Some("회의록 dev"),
+            false,
+            10,
+            offset,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.len(), expect_len, "offset {offset}");
+        assert_eq!(more, Some(expect_more), "offset {offset}");
+        assert!(page.iter().all(|h| h.section_id == "sec-ko"));
+        seen.extend(page.into_iter().map(|h| h.page_key));
+    }
+    assert_eq!(seen.len(), 25);
+
+    // No matching section: an empty result that is known to be complete.
+    let (none, none_more) =
+        cli::search_onenote_with_offset(&storage, &graph, "kickoff", Some("Nope"), false, 10, 0)
+            .await
+            .unwrap();
+    assert!(none.is_empty());
+    assert_eq!(none_more, Some(false));
+
+    // Hits whose section is missing from the sections table are still matched by name.
+    let (ghost, ghost_more) =
+        cli::search_onenote_with_offset(&storage, &graph, "kickoff", Some("ghost"), false, 10, 0)
+            .await
+            .unwrap();
+    assert_eq!(ghost.len(), 2);
+    assert_eq!(ghost_more, Some(false));
+
+    // Scoped keys and the unfiltered search are unchanged.
+    let (scoped, scoped_more) = cli::search_onenote_with_offset(
+        &storage,
+        &graph,
+        "kickoff",
+        Some("me|sec-beta"),
+        false,
+        10,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(scoped.len(), 3);
+    assert_eq!(scoped_more, Some(false));
+    let (all, all_more) =
+        cli::search_onenote_with_offset(&storage, &graph, "kickoff", None, false, 10, 0)
+            .await
+            .unwrap();
+    assert_eq!(all.len(), 10);
+    assert_eq!(all_more, Some(true));
+}

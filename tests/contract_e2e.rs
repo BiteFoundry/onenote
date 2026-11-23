@@ -2426,3 +2426,155 @@ async fn http_search_default_is_30() {
     api_server.abort();
     graph_server.abort();
 }
+
+/// ON-03: a title lookup with `--section` used to read only the first 100 pages.
+#[tokio::test]
+async fn read_title_with_section_resolves_past_the_first_100_pages() {
+    let (base_url, _mock, server) = spawn_contract_mock(2, 150).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg_dir, data_dir) = (tmp.path().join("cfg"), tmp.path().join("data"));
+
+    let out = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &[
+            "read",
+            "Architecture Note 140 user-a",
+            "--section",
+            "Specs",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["page"]["page_key"], "me|page-140");
+
+    // A title that exists nowhere keeps the plain not-found message.
+    let miss = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["read", "No Such Title", "--section", "Specs", "--json"],
+    )
+    .await;
+    assert_eq!(miss.status.code(), Some(1));
+    let mv: Value = serde_json::from_slice(&miss.stdout).unwrap();
+    assert_eq!(mv["error"]["code"], "not_found");
+    assert!(mv["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not found in section 'Specs'."));
+
+    server.abort();
+}
+
+/// ON-10 over HTTP: `section=<plain name>` is applied before the limit.
+#[tokio::test]
+async fn http_search_plain_section_name_is_filtered_before_the_limit() {
+    let (base_url, _mock, graph_server) = spawn_contract_mock(2, 40).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (api_addr, storage, graph, api_server) = make_inprocess_serve(base_url, tmp.path()).await;
+
+    // 40 cached pages in "Specs" (sec-1) ...
+    cli::list_onenote_pages_helper(&storage, &graph, "Engineering/Specs", 50, true, false)
+        .await
+        .unwrap();
+    // ... and 300 newer matching pages in "Section 2" that fill any global window.
+    let flood: Vec<onenote_cli::models::OnenotePageSummary> = (0..300)
+        .map(|i| onenote_cli::models::OnenotePageSummary {
+            page_key: format!("me|flood-{i:03}"),
+            id: format!("flood-{i:03}"),
+            scope: onenote_cli::models::OnenoteScope::Me,
+            section_id: "sec-2".to_string(),
+            section_name: Some("Section 2".to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Engineering".to_string()),
+            title: format!("Architecture Flood {i}"),
+            level: 0,
+            order: i,
+            created_at: None,
+            last_modified_at: Some("2026-11-22T10:00:00Z".to_string()),
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        })
+        .collect();
+    storage.upsert_onenote_pages(&flood).unwrap();
+
+    let http = reqwest::Client::new();
+    let search = |section: &'static str| {
+        let http = http.clone();
+        async move {
+            let resp = http
+                .get(format!("http://{api_addr}/v1/onenote/search"))
+                .query(&[("q", "Architecture"), ("section", section), ("limit", "5")])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let v: Value = resp.json().await.unwrap();
+            v["hits"].as_array().unwrap().clone()
+        }
+    };
+
+    let specs = search("Specs").await;
+    assert_eq!(specs.len(), 5);
+    assert!(specs.iter().all(|h| h["section_id"] == "sec-1"));
+
+    let second = search("section 2").await;
+    assert_eq!(second.len(), 5);
+    assert!(second.iter().all(|h| h["section_id"] == "sec-2"));
+
+    assert!(search("Nope").await.is_empty());
+
+    api_server.abort();
+    graph_server.abort();
+}
+
+/// ON-22: the refusal still comes before the runtime is opened, so nothing is sent.
+#[tokio::test]
+async fn delete_without_yes_is_refused_before_any_request() {
+    let (base_url, mock, server) = spawn_contract_mock(2, 3).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg_dir, data_dir) = (tmp.path().join("cfg"), tmp.path().join("data"));
+    const REFUSAL: &str =
+        "Refusing to delete page without `--yes` in JSON or non-interactive mode.";
+
+    let out_json = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["delete", "Architecture Spec", "--json"],
+    )
+    .await;
+    assert_eq!(out_json.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&out_json.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["message"], REFUSAL);
+
+    // Without a terminal on stdin the text mode refuses the same way.
+    let out_text = run_onenote(
+        &base_url,
+        &cfg_dir,
+        &data_dir,
+        Some("opaque-a"),
+        &["delete", "Architecture Spec", "--section", "Specs"],
+    )
+    .await;
+    assert_eq!(out_text.status.code(), Some(1));
+    assert!(out_text.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out_text.stderr).contains(REFUSAL));
+
+    assert_eq!(mock.total_count(), 0, "no Graph request before the refusal");
+    server.abort();
+}

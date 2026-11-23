@@ -1496,6 +1496,39 @@ pub fn count_onenote_pages(conn: &Connection) -> Result<(u64, u64)> {
     Ok((pages.max(0) as u64, pages_with_body.max(0) as u64))
 }
 
+/// Section restriction for the page search.
+#[derive(Clone, Copy)]
+enum SearchSectionFilter<'a> {
+    All,
+    /// One scoped section key or raw section ID.
+    KeyOrId(&'a str),
+    /// Any of these scoped section keys.
+    Keys(&'a [String]),
+}
+
+impl SearchSectionFilter<'_> {
+    /// SQL condition on alias `p` and its bound values; placeholders start at `first_param`.
+    fn sql(&self, first_param: usize) -> (String, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value;
+        match self {
+            Self::All => (String::new(), Vec::new()),
+            Self::KeyOrId(sec) => (
+                format!("AND (p.section_key = ?{first_param} OR p.section_id = ?{first_param})"),
+                vec![Value::Text(sec.to_string())],
+            ),
+            Self::Keys(keys) => {
+                let marks: Vec<String> = (0..keys.len())
+                    .map(|i| format!("?{}", first_param + i))
+                    .collect();
+                (
+                    format!("AND p.section_key IN ({})", marks.join(", ")),
+                    keys.iter().map(|k| Value::Text(k.clone())).collect(),
+                )
+            }
+        }
+    }
+}
+
 pub fn search_onenote_pages(
     conn: &Connection,
     query: &str,
@@ -1503,21 +1536,51 @@ pub fn search_onenote_pages(
     limit: usize,
     trigram_enabled: bool,
 ) -> Result<Vec<OnenoteSearchHit>> {
+    let filter = match section_key_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sec) => SearchSectionFilter::KeyOrId(sec),
+        None => SearchSectionFilter::All,
+    };
+    search_onenote_pages_filtered(conn, query, filter, limit, trigram_enabled)
+}
+
+/// Searches only pages whose scoped section key is one of `section_keys`.
+/// An empty slice matches nothing.
+pub fn search_onenote_pages_in_sections(
+    conn: &Connection,
+    query: &str,
+    section_keys: &[String],
+    limit: usize,
+    trigram_enabled: bool,
+) -> Result<Vec<OnenoteSearchHit>> {
+    if section_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    search_onenote_pages_filtered(
+        conn,
+        query,
+        SearchSectionFilter::Keys(section_keys),
+        limit,
+        trigram_enabled,
+    )
+}
+
+fn search_onenote_pages_filtered(
+    conn: &Connection,
+    query: &str,
+    filter: SearchSectionFilter<'_>,
+    limit: usize,
+    trigram_enabled: bool,
+) -> Result<Vec<OnenoteSearchHit>> {
     let trimmed = query.trim();
     if trimmed.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    let section_filter = section_key_filter
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
 
     if (trigram_enabled && trimmed.chars().count() >= 3)
         || (!trigram_enabled && trimmed.chars().count() >= 2)
     {
         if let Some(fts_query) = build_fts_query(trimmed) {
-            if let Ok(hits) =
-                run_onenote_fts_search(conn, &fts_query, trimmed, section_filter, limit)
-            {
+            if let Ok(hits) = run_onenote_fts_search(conn, &fts_query, trimmed, filter, limit) {
                 if !hits.is_empty() {
                     return Ok(hits);
                 }
@@ -1525,113 +1588,134 @@ pub fn search_onenote_pages(
         }
     }
 
-    run_onenote_like_search(conn, trimmed, section_filter, limit)
+    run_onenote_like_search(conn, trimmed, filter, limit)
 }
+
+const SEARCH_HIT_COLUMNS: &str = "
+        p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
+        p.section_id, p.section_name, p.title, p.last_modified_at,
+        COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
+    ";
 
 fn run_onenote_fts_search(
     conn: &Connection,
     fts_query: &str,
     raw_query: &str,
-    section_filter: Option<&str>,
+    filter: SearchSectionFilter<'_>,
     limit: usize,
 ) -> Result<Vec<OnenoteSearchHit>> {
-    let cols = "
-        p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
-        p.section_id, p.section_name, p.title, p.last_modified_at,
-        COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
-    ";
-    if let Some(sec) = section_filter {
-        let sql = format!(
-            "
-            SELECT {cols}
-            FROM onenote_fts f
-            JOIN onenote_pages p ON p.page_key = f.page_key
-            WHERE onenote_fts MATCH ?1
-              AND (p.section_key = ?2 OR p.section_id = ?2)
-            ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
-            LIMIT ?3
-            "
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![fts_query, sec, limit as i64], |row| {
-            map_onenote_search_hit_row(row, raw_query)
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    } else {
-        let sql = format!(
-            "
-            SELECT {cols}
-            FROM onenote_fts f
-            JOIN onenote_pages p ON p.page_key = f.page_key
-            WHERE onenote_fts MATCH ?1
-            ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
-            LIMIT ?2
-            "
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
-            map_onenote_search_hit_row(row, raw_query)
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    }
+    use rusqlite::types::Value;
+    let (section_sql, section_values) = filter.sql(2);
+    let limit_param = 2 + section_values.len();
+    let sql = format!(
+        "
+        SELECT {SEARCH_HIT_COLUMNS}
+        FROM onenote_fts f
+        JOIN onenote_pages p ON p.page_key = f.page_key
+        WHERE onenote_fts MATCH ?1
+          {section_sql}
+        ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
+        LIMIT ?{limit_param}
+        "
+    );
+    let mut values = vec![Value::Text(fts_query.to_string())];
+    values.extend(section_values);
+    values.push(Value::Integer(limit as i64));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+        map_onenote_search_hit_row(row, raw_query)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
 fn run_onenote_like_search(
     conn: &Connection,
     raw_query: &str,
-    section_filter: Option<&str>,
+    filter: SearchSectionFilter<'_>,
     limit: usize,
 ) -> Result<Vec<OnenoteSearchHit>> {
-    let cols = "
-        p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
-        p.section_id, p.section_name, p.title, p.last_modified_at,
-        COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
-    ";
+    use rusqlite::types::Value;
     let pattern = format!("%{}%", escape_like(&raw_query.to_lowercase()));
-    if let Some(sec) = section_filter {
-        let sql = format!(
-            "
-            SELECT {cols}
-            FROM onenote_pages p
-            WHERE (p.section_key = ?1 OR p.section_id = ?1)
-              AND (
-                  LOWER(p.title) LIKE ?2 ESCAPE '\\'
-                  OR LOWER(COALESCE(p.body_plain, '')) LIKE ?2 ESCAPE '\\'
-                  OR LOWER(COALESCE(p.preview_text, '')) LIKE ?2 ESCAPE '\\'
-                  OR LOWER(COALESCE(p.notebook_name, '')) LIKE ?2 ESCAPE '\\'
-                  OR LOWER(COALESCE(p.section_name, '')) LIKE ?2 ESCAPE '\\'
-              )
-            ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
-            LIMIT ?3
-            "
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![sec, pattern, limit as i64], |row| {
-            map_onenote_search_hit_row(row, raw_query)
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    } else {
-        let sql = format!(
-            "
-            SELECT {cols}
-            FROM onenote_pages p
-            WHERE (
-                LOWER(p.title) LIKE ?1 ESCAPE '\\'
-                OR LOWER(COALESCE(p.body_plain, '')) LIKE ?1 ESCAPE '\\'
-                OR LOWER(COALESCE(p.preview_text, '')) LIKE ?1 ESCAPE '\\'
-                OR LOWER(COALESCE(p.notebook_name, '')) LIKE ?1 ESCAPE '\\'
-                OR LOWER(COALESCE(p.section_name, '')) LIKE ?1 ESCAPE '\\'
-            )
-            ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
-            LIMIT ?2
-            "
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
-            map_onenote_search_hit_row(row, raw_query)
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    let (section_sql, section_values) = filter.sql(2);
+    let limit_param = 2 + section_values.len();
+    let sql = format!(
+        "
+        SELECT {SEARCH_HIT_COLUMNS}
+        FROM onenote_pages p
+        WHERE (
+            LOWER(p.title) LIKE ?1 ESCAPE '\\'
+            OR LOWER(COALESCE(p.body_plain, '')) LIKE ?1 ESCAPE '\\'
+            OR LOWER(COALESCE(p.preview_text, '')) LIKE ?1 ESCAPE '\\'
+            OR LOWER(COALESCE(p.notebook_name, '')) LIKE ?1 ESCAPE '\\'
+            OR LOWER(COALESCE(p.section_name, '')) LIKE ?1 ESCAPE '\\'
+        )
+          {section_sql}
+        ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
+        LIMIT ?{limit_param}
+        "
+    );
+    let mut values = vec![Value::Text(pattern)];
+    values.extend(section_values);
+    values.push(Value::Integer(limit as i64));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+        map_onenote_search_hit_row(row, raw_query)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
+/// Cached pages that `resolver::resolve_page_in_slice` can match for `query`:
+/// an ID or page-key prefix, or a title containing the query. Every cached page
+/// is scanned (no row window) and titles are compared in Rust because SQLite's
+/// `LOWER` only folds ASCII. Order matches `Storage::list_all_onenote_pages`.
+pub fn list_onenote_page_lookup_candidates(
+    conn: &Connection,
+    query: &str,
+) -> Result<Vec<OnenotePageSummary>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
     }
+    let q_lower = q.to_lowercase();
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            page_key, id, scope_json, scope_key, section_id, section_name,
+            notebook_id, notebook_name, title, level, page_order,
+            created_at, last_modified_at, content_url, web_url, preview_text, has_todo
+        FROM onenote_pages
+        ORDER BY last_modified_at DESC, page_order ASC, title COLLATE NOCASE ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let page_key: String = row.get(0)?;
+        let id: String = row.get(1)?;
+        let title: String = row.get(8)?;
+        if id.starts_with(q) || page_key.starts_with(q) || title.to_lowercase().contains(&q_lower)
+        {
+            map_page_summary_row(row).map(Some)
+        } else {
+            Ok(None)
+        }
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        if let Some(page) = row? {
+            out.push(page);
+        }
+    }
+    Ok(out)
+}
+
+/// Distinct `(section_key, section_id, section_name)` carried by cached pages.
+pub fn list_onenote_page_section_refs(
+    conn: &Connection,
+) -> Result<Vec<(String, String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT section_key, section_id, section_name FROM onenote_pages",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
 fn build_fts_query(trimmed: &str) -> Option<String> {
@@ -2541,6 +2625,67 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn test_search_in_sections_applies_the_limit_inside_the_given_sections() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut pages: Vec<OnenotePageSummary> = (0..300)
+            .map(|i| {
+                sample_page_summary(
+                    OnenoteScope::Me,
+                    &format!("alpha-{i:03}"),
+                    "sec-alpha",
+                    &format!("Kickoff agenda {i}"),
+                    i,
+                    "2026-11-21T09:00:00Z",
+                )
+            })
+            .collect();
+        pages.extend((0..3).map(|i| {
+            sample_page_summary(
+                OnenoteScope::Me,
+                &format!("beta-{i}"),
+                "sec-beta",
+                &format!("Kickoff retro {i}"),
+                i,
+                "2026-11-01T09:00:00Z",
+            )
+        }));
+        storage.upsert_onenote_pages(&pages).unwrap();
+
+        let beta = vec!["me|sec-beta".to_string()];
+        let hits = storage.search_onenote_pages_in_sections("kickoff", &beta, 10).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|h| h.section_id == "sec-beta"));
+
+        let both = vec!["me|sec-alpha".to_string(), "me|sec-beta".to_string()];
+        assert_eq!(
+            storage.search_onenote_pages_in_sections("kickoff", &both, 400).unwrap().len(),
+            303
+        );
+        assert_eq!(
+            storage.search_onenote_pages_in_sections("kickoff", &both, 10).unwrap().len(),
+            10
+        );
+        assert!(storage.search_onenote_pages_in_sections("kickoff", &[], 10).unwrap().is_empty());
+        assert!(storage
+            .search_onenote_pages_in_sections("kickoff", &["me|sec-none".to_string()], 10)
+            .unwrap()
+            .is_empty());
+
+        // The single-filter form keeps accepting a scoped key or a raw section ID.
+        for filter in ["me|sec-beta", "sec-beta"] {
+            assert_eq!(storage.search_onenote_pages("kickoff", Some(filter), 10).unwrap().len(), 3);
+        }
+        assert_eq!(storage.search_onenote_pages("kickoff", None, 10).unwrap().len(), 10);
+
+        let mut refs = storage.list_onenote_page_section_refs().unwrap();
+        refs.sort();
+        assert_eq!(
+            refs.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            vec!["me|sec-alpha", "me|sec-beta"]
         );
     }
 }

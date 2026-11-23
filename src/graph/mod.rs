@@ -134,6 +134,11 @@ impl GraphClient {
         graph
     }
 
+    /// True for clones created by `with_automatic_budget` (background sync).
+    pub(crate) fn has_automatic_budget(&self) -> bool {
+        self.request_allowance.is_some()
+    }
+
     pub fn http_request_count(&self) -> u64 {
         self.http_requests_total.load(Ordering::Relaxed)
     }

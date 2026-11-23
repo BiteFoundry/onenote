@@ -2658,6 +2658,10 @@ pub async fn delete_onenote_page_helper(
     Ok(page_key)
 }
 
+/// Pages read from Graph when a title is looked up inside one section
+/// (well above the per-section cap used by sync).
+const PAGE_TITLE_LOOKUP_LIMIT: usize = 5_000;
+
 pub async fn resolve_page_query_in_section(
     storage: &Storage,
     graph: &GraphClient,
@@ -2684,16 +2688,54 @@ pub async fn resolve_page_query_in_section(
             sec.display_name
         );
     }
-    let (_sec, pages) =
-        list_onenote_pages_helper(storage, graph, &sec.section_key, 100, false, false).await?;
+    let (_sec, pages, has_more) = list_onenote_pages_with_cache(
+        storage,
+        graph,
+        &sec.section_key,
+        PAGE_TITLE_LOOKUP_LIMIT,
+        0,
+        false,
+        false,
+        false,
+    )
+    .await?;
     match resolver::resolve_page_in_slice(&pages, q)? {
         resolver::PageResolution::Found(p) => Ok(p.page_key),
         resolver::PageResolution::Ambiguous { message, .. } => bail!("{message}"),
+        resolver::PageResolution::NotFound if has_more == Some(true) => bail!(
+            "OneNote page '{q}' not found in the first {PAGE_TITLE_LOOKUP_LIMIT} pages of section '{}'. The section has more pages; pass a page key from 'onenote pages SECTION --json' instead of a title.",
+            sec.display_name
+        ),
         resolver::PageResolution::NotFound => bail!(
             "OneNote page '{q}' not found in section '{}'.",
             sec.display_name
         ),
     }
+}
+
+/// Scoped keys of cached sections matching a plain `--section` name filter:
+/// raw section ID equality or a case-insensitive name substring. Lowercasing
+/// stays in Rust because SQLite's `LOWER` only folds ASCII.
+fn section_keys_matching_name(storage: &Storage, sec_q: &str) -> Result<Vec<String>> {
+    let needle = sec_q.to_lowercase();
+    let matches = |id: &str, name: Option<&str>| {
+        id == sec_q || name.is_some_and(|n| n.to_lowercase().contains(&needle))
+    };
+    let mut known = std::collections::HashSet::new();
+    let mut keys = std::collections::BTreeSet::new();
+    for sec in storage.list_onenote_sections(None)? {
+        if matches(&sec.id, Some(&sec.display_name)) {
+            keys.insert(sec.section_key.clone());
+        }
+        known.insert(sec.section_key);
+    }
+    // Fallback for cached pages whose section row is missing from the sections table.
+    for (section_key, section_id, section_name) in storage.list_onenote_page_section_refs()? {
+        if !known.contains(&section_key) && matches(&section_id, section_name.as_deref()) {
+            keys.insert(section_key);
+        }
+    }
+    Ok(keys.into_iter().collect())
 }
 
 pub fn select_onenote_resource<'a>(
@@ -2834,44 +2876,28 @@ pub async fn search_onenote_with_offset(
         return Ok((Vec::new(), None));
     }
     let sec_filter = section_filter.map(str::trim).filter(|s| !s.is_empty());
-    let sql_section_key = match sec_filter {
-        Some(sec_q) if sec_q.contains('|') => Some(sec_q.to_string()),
-        Some(sec_q) if sec_q.contains('/') => {
-            let sec = resolve_onenote_section_query(storage, graph, sec_q, true).await?;
-            Some(sec.section_key)
-        }
-        _ => None,
-    };
-    let post_filter = if sql_section_key.is_some() {
-        None
-    } else {
-        sec_filter
-    };
     let end = offset.saturating_add(limit);
     let want = end.saturating_add(1);
-    let fetch_n = if post_filter.is_some() {
-        want.saturating_mul(2).max(20)
-    } else {
-        want
+    let raw = match sec_filter {
+        None => storage.search_onenote_pages(query, None, want)?,
+        Some(sec_q) if sec_q.contains('|') => {
+            storage.search_onenote_pages(query, Some(sec_q), want)?
+        }
+        Some(sec_q) if sec_q.contains('/') => {
+            let sec = resolve_onenote_section_query(storage, graph, sec_q, true).await?;
+            storage.search_onenote_pages(query, Some(&sec.section_key), want)?
+        }
+        // A plain name is resolved to section keys first so the SQL limit applies
+        // inside those sections instead of to a window of global hits.
+        Some(sec_q) => {
+            let keys = section_keys_matching_name(storage, sec_q)?;
+            if keys.is_empty() {
+                return Ok((Vec::new(), Some(false)));
+            }
+            storage.search_onenote_pages_in_sections(query, &keys, want)?
+        }
     };
-    let mut raw = storage.search_onenote_pages(query, sql_section_key.as_deref(), fetch_n)?;
-    let raw_full = raw.len() == fetch_n;
-    if let Some(sec_q) = post_filter {
-        let needle = sec_q.to_lowercase();
-        raw.retain(|h| {
-            h.section_id == sec_q
-                || h.section_name
-                    .as_deref()
-                    .is_some_and(|n| n.to_lowercase().contains(&needle))
-        });
-    }
-    let has_more = if raw.len() > end {
-        Some(true)
-    } else if post_filter.is_some() && raw_full {
-        None
-    } else {
-        Some(false)
-    };
+    let has_more = Some(raw.len() > end);
     let hits = raw.into_iter().skip(offset).take(limit).collect();
     Ok((hits, has_more))
 }
@@ -3816,6 +3842,34 @@ async fn cmd_check(
     Ok(())
 }
 
+/// Confirmation question for `onenote delete`, naming the page that was resolved.
+fn delete_prompt_text(resolved_query: &str, cached: Option<&OnenotePageSummary>) -> String {
+    match cached {
+        Some(page) => {
+            let notebook = page
+                .notebook_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(unknown notebook)");
+            let section = page
+                .section_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(page.section_id.as_str());
+            let modified = page.last_modified_at.as_deref().unwrap_or("unknown");
+            format!(
+                "Delete this OneNote page?\n  Title:         {}\n  Location:      {notebook} / {section}\n  Last modified: {modified}\n  Page key:      {}\n[y/N]: ",
+                page.title, page.page_key
+            )
+        }
+        None => format!(
+            "'{resolved_query}' is not in the local cache, so its title and location cannot be shown.\nIt will be sent to Microsoft Graph as a raw page ID.\nDelete OneNote page ID '{resolved_query}'? [y/N]: "
+        ),
+    }
+}
+
 async fn cmd_delete(
     cfg: &AppConfig,
     page: &str,
@@ -3823,11 +3877,18 @@ async fn cmd_delete(
     yes: bool,
     json_out: bool,
 ) -> Result<()> {
+    // Refuse before opening the runtime so this path never touches the network.
+    if !yes && (json_out || !io::stdin().is_terminal()) {
+        bail!("Refusing to delete page without `--yes` in JSON or non-interactive mode.");
+    }
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let resolved_page =
+        resolve_page_query_in_section(&storage, &graph, page, section, false).await?;
+    let cached_summary =
+        resolver::resolve_page_cached(&storage, &resolved_page, None)?.into_option()?;
     if !yes {
-        if json_out || !io::stdin().is_terminal() {
-            bail!("Refusing to delete page without `--yes` in JSON or non-interactive mode.");
-        }
-        eprint!("Delete OneNote page '{page}'? [y/N]: ");
+        // Ask only after resolving, so the prompt names what will be deleted.
+        eprint!("{}", delete_prompt_text(&resolved_page, cached_summary.as_ref()));
         io::stderr().flush()?;
         let mut line = String::new();
         io::stdin().read_line(&mut line)?;
@@ -3836,12 +3897,7 @@ async fn cmd_delete(
             return Ok(());
         }
     }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let resolved_page =
-        resolve_page_query_in_section(&storage, &graph, page, section, false).await?;
-    let section_key = resolver::resolve_page_cached(&storage, &resolved_page, None)?
-        .into_option()?
-        .map(|s| s.scope.make_entity_key(&s.section_id));
+    let section_key = cached_summary.map(|s| s.scope.make_entity_key(&s.section_id));
     let deleted_key = delete_onenote_page_helper(&storage, &graph, &resolved_page).await?;
     let nudge_cmd = match section_key {
         Some(sec_key) => sync::SyncCommand::RefreshSectionPages {
@@ -4896,5 +4952,50 @@ mod tests {
 
         assert_eq!(page_content_json(&detail, false, PageSurface::Cli), json!(detail));
         assert_eq!(page_content_json(&detail, false, PageSurface::Mcp), json!(detail));
+    }
+
+    #[test]
+    fn delete_prompt_names_the_resolved_page_or_flags_a_raw_id() {
+        let page = OnenotePageSummary {
+            page_key: "me|pg-1".to_string(),
+            id: "pg-1".to_string(),
+            scope: crate::models::OnenoteScope::Me,
+            section_id: "sec-1".to_string(),
+            section_name: Some("Specs".to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Engineering".to_string()),
+            title: "Release Plan".to_string(),
+            level: 0,
+            order: 0,
+            created_at: None,
+            last_modified_at: Some("2026-11-20T09:00:00Z".to_string()),
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        };
+        let text = delete_prompt_text("me|pg-1", Some(&page));
+        assert!(text.contains("Title:         Release Plan"));
+        assert!(text.contains("Location:      Engineering / Specs"));
+        assert!(text.contains("Last modified: 2026-11-20T09:00:00Z"));
+        assert!(text.contains("Page key:      me|pg-1"));
+        assert!(text.ends_with("[y/N]: "));
+
+        // Missing names fall back to the section ID instead of an empty location.
+        let bare = OnenotePageSummary {
+            section_name: None,
+            notebook_name: None,
+            last_modified_at: None,
+            ..page
+        };
+        let bare_text = delete_prompt_text("me|pg-1", Some(&bare));
+        assert!(bare_text.contains("Location:      (unknown notebook) / sec-1"));
+        assert!(bare_text.contains("Last modified: unknown"));
+
+        let raw = delete_prompt_text("0-abc!1-def", None);
+        assert!(raw.contains("not in the local cache"));
+        assert!(raw.contains("raw page ID"));
+        assert!(raw.contains("Delete OneNote page ID '0-abc!1-def'?"));
+        assert!(raw.ends_with("[y/N]: "));
     }
 }

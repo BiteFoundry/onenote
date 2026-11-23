@@ -425,7 +425,9 @@ pub fn resolve_page_cached(
     }
     let candidates = match section_filter {
         Some(sk) => storage.list_onenote_pages(sk)?,
-        None => storage.list_all_onenote_pages(500)?,
+        // Pre-filtered over the whole cache, so pages past any row window resolve
+        // and duplicates among them are still reported as ambiguous.
+        None => storage.list_onenote_page_lookup_candidates(q)?,
     };
     resolve_page_in_slice(&candidates, q)
 }
@@ -628,5 +630,71 @@ mod tests {
             resolve_page_in_slice(&pages, "remote-only-id").unwrap(),
             PageResolution::NotFound
         ));
+    }
+
+    /// Row `idx` sorts at position `idx` of the cache (newest first).
+    fn cached_page(idx: usize, title: &str) -> OnenotePageSummary {
+        OnenotePageSummary {
+            page_key: format!("me|p-{idx:04}"),
+            id: format!("p-{idx:04}"),
+            scope: OnenoteScope::Me,
+            section_id: format!("sec-{}", idx % 7),
+            section_name: Some(format!("Section {}", idx % 7)),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Work".to_string()),
+            title: title.to_string(),
+            level: 0,
+            order: idx as i32,
+            created_at: None,
+            last_modified_at: Some(format!(
+                "2026-11-20T{:02}:{:02}:00Z",
+                23 - idx / 60,
+                59 - idx % 60
+            )),
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        }
+    }
+
+    #[test]
+    fn cached_title_lookup_covers_pages_past_the_first_500_rows() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut pages: Vec<OnenotePageSummary> = (0..600)
+            .map(|idx| cached_page(idx, &format!("Filler note {idx:04}")))
+            .collect();
+        pages[550].title = "Quarterly Roadmap".to_string();
+        storage.upsert_onenote_pages(&pages).unwrap();
+
+        // Unique title at row 550: exact, prefix and substring all resolve.
+        for query in ["Quarterly Roadmap", "quarterly road", "erly Roadm"] {
+            match resolve_page_cached(&storage, query, None).unwrap() {
+                PageResolution::Found(page) => assert_eq!(page.page_key, "me|p-0550"),
+                _ => panic!("'{query}' must resolve to the page at row 550"),
+            }
+        }
+        // ID prefix lookups still work for rows past 500.
+        match resolve_page_cached(&storage, "p-0577", None).unwrap() {
+            PageResolution::Found(page) => assert_eq!(page.title, "Filler note 0577"),
+            _ => panic!("ID lookup must resolve"),
+        }
+        assert!(matches!(
+            resolve_page_cached(&storage, "No such title", None).unwrap(),
+            PageResolution::NotFound
+        ));
+
+        // The same title at rows 10 and 550 is ambiguous; the 500-row window used to
+        // hide the second one and silently pick row 10.
+        pages[10].title = "Duplicate Title".to_string();
+        pages[550].title = "Duplicate Title".to_string();
+        storage.upsert_onenote_pages(&pages).unwrap();
+        match resolve_page_cached(&storage, "Duplicate Title", None).unwrap() {
+            PageResolution::Ambiguous { message, candidates } => {
+                assert_eq!(candidates.len(), 2);
+                assert!(message.starts_with("Ambiguous page title 'Duplicate Title' matches 2 pages:"));
+            }
+            _ => panic!("duplicate titles across the 500-row boundary must be ambiguous"),
+        }
     }
 }

@@ -36,7 +36,10 @@ const MAX_ERROR_BACKOFF_MS: u64 = 300_000;
 const BOOTSTRAP_MAX_SECTIONS: usize = 64;
 const BACKGROUND_MAX_SECTIONS: usize = 6;
 const BOOTSTRAP_SECTION_CONCURRENCY: usize = 4;
-const SECTION_PAGES_LIMIT: usize = 500;
+/// Page-list cap per section for explicit refreshes (20 requests at `$top=100`).
+const SECTION_PAGES_LIMIT: usize = 2_000;
+/// Cap for polls running under the automatic request budget (5 requests).
+const BUDGETED_SECTION_PAGES_LIMIT: usize = 500;
 const INACTIVE_SECTION_STALE_SECS: i64 = 300;
 const MAX_REHYDRATE_PER_SYNC: usize = 16;
 const BACKGROUND_MAX_REHYDRATE: usize = 4;
@@ -426,10 +429,11 @@ async fn sync_hierarchy_and_sections_inner(
     let sections_to_sync: Vec<OnenoteSection> = iter.take(section_cap).collect();
 
     let attempted_sections = sections_to_sync.len();
-    let results: Vec<(OnenoteSection, Result<Vec<OnenotePageSummary>>)> =
+    let page_limit = section_pages_limit(graph);
+    let results: Vec<(OnenoteSection, Result<(Vec<OnenotePageSummary>, bool)>)> =
         stream::iter(sections_to_sync.into_iter().map(|sec| async move {
             let res = graph
-                .list_onenote_pages(&sec.scope, &sec.id, SECTION_PAGES_LIMIT)
+                .list_onenote_pages_with_more(&sec.scope, &sec.id, page_limit)
                 .await;
             (sec, res)
         }))
@@ -442,7 +446,7 @@ async fn sync_hierarchy_and_sections_inner(
     let mut auth_err: Option<anyhow::Error> = None;
     let mut first_err: Option<anyhow::Error> = None;
     let mut invalidated_pages: Vec<String> = Vec::new();
-    let mut succeeded_sections: Vec<(OnenoteSection, Vec<OnenotePageSummary>)> = Vec::new();
+    let mut succeeded_sections: Vec<(OnenoteSection, Vec<OnenotePageSummary>, bool)> = Vec::new();
     let mut synced_section_keys: HashSet<String> = HashSet::new();
     let rehydrate_cap = if force_all_sections {
         MAX_REHYDRATE_PER_SYNC
@@ -452,9 +456,9 @@ async fn sync_hierarchy_and_sections_inner(
 
     for (sec, pages_res) in results {
         match pages_res {
-            Ok(pages) => {
+            Ok((pages, has_more)) => {
                 synced_section_keys.insert(sec.section_key.clone());
-                succeeded_sections.push((sec, pages));
+                succeeded_sections.push((sec, pages, has_more));
             }
             Err(err) => {
                 if classify_sync_error(&err) == SyncErrorKind::Unauthorized401 && auth_err.is_none()
@@ -469,7 +473,7 @@ async fn sync_hierarchy_and_sections_inner(
 
     // Pass 1: Upsert all fetched pages across succeeded sections first so pages moved
     // between sections update their `section_key` in place without losing cached `detail_json`.
-    for (sec, pages) in &succeeded_sections {
+    for (sec, pages, _has_more) in &succeeded_sections {
         let invalidated = storage.reconcile_onenote_section_pages_returning_invalidated(
             &sec.section_key,
             pages,
@@ -485,8 +489,8 @@ async fn sync_hierarchy_and_sections_inner(
     }
 
     // Pass 2: Prune deleted pages only for sections whose full page list was fetched.
-    for (sec, pages) in &succeeded_sections {
-        if pages.len() < SECTION_PAGES_LIMIT {
+    for (sec, pages, has_more) in &succeeded_sections {
+        if !has_more {
             storage.prune_onenote_section_pages(&sec.section_key, pages)?;
         }
         let _ = storage.upsert_sync_cursor(&SyncCursor {
@@ -1362,6 +1366,17 @@ async fn run_open_page_content_poll(
     }
 }
 
+/// Explicit refreshes read up to `SECTION_PAGES_LIMIT` pages; polls charged to
+/// the automatic request budget keep the smaller cap so one large section
+/// cannot spend the hourly budget.
+fn section_pages_limit(graph: &GraphClient) -> usize {
+    if graph.has_automatic_budget() {
+        BUDGETED_SECTION_PAGES_LIMIT
+    } else {
+        SECTION_PAGES_LIMIT
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_section_pages_refresh(
     graph: &GraphClient,
@@ -1382,11 +1397,12 @@ async fn run_section_pages_refresh(
         .collect();
 
     match graph
-        .list_onenote_pages(&scope, &section_id, SECTION_PAGES_LIMIT)
+        .list_onenote_pages_with_more(&scope, &section_id, section_pages_limit(graph))
         .await
     {
-        Ok(pages) => {
-            let is_complete = pages.len() < SECTION_PAGES_LIMIT;
+        Ok((pages, has_more)) => {
+            // Prune only when Graph confirmed there is nothing past the limit.
+            let is_complete = !has_more;
             let mut preserve_page_key: Option<String> = None;
             let mut moved_target: Option<(String, String)> = None;
 
@@ -3363,6 +3379,156 @@ mod tests {
         assert_eq!(state.meta_hits.load(AtomicOrdering::SeqCst), 3);
 
         ctrl.request(SyncCommand::Shutdown);
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn test_section_page_list_prunes_on_has_more_flag_not_on_row_count() {
+        use axum::{
+            extract::{Query, State},
+            routing::get,
+            Json, Router,
+        };
+        use serde_json::json;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        use crate::auth::{AuthManager, StoredTokens};
+
+        #[derive(Clone)]
+        struct PagedMock {
+            base: String,
+            total: Arc<AtomicUsize>,
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = PagedMock {
+            base: format!("http://{addr}/v1.0"),
+            total: Arc::new(AtomicUsize::new(500)),
+        };
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/sections/sec-1/pages",
+                get(
+                    |State(st): State<PagedMock>, Query(q): Query<HashMap<String, String>>| async move {
+                        let total = st.total.load(AtomicOrdering::SeqCst);
+                        let skip: usize = q.get("$skip").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let top: usize = q.get("$top").and_then(|s| s.parse().ok()).unwrap_or(100);
+                        let end = skip.saturating_add(top).min(total);
+                        let value: Vec<serde_json::Value> = (skip..end)
+                            .map(|i| {
+                                json!({
+                                    "id": format!("p-{i:04}"),
+                                    "title": format!("Page {i}"),
+                                    "level": 0,
+                                    "order": i,
+                                    "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                                    "parentSection": { "id": "sec-1", "displayName": "Sec 1" }
+                                })
+                            })
+                            .collect();
+                        let mut body = json!({ "value": value });
+                        if end < total {
+                            body["@odata.nextLink"] = json!(format!(
+                                "{}/me/onenote/sections/sec-1/pages?$top={top}&$skip={end}",
+                                st.base
+                            ));
+                        }
+                        Json(body)
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tokens = StoredTokens {
+            access_token: "sync-test-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("user-1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let budget = AutomaticRequestBudget::default();
+        let budgeted = graph.with_automatic_budget(&budget, Instant::now(), 10_000);
+        assert_eq!(section_pages_limit(&budgeted), 500);
+        assert_eq!(section_pages_limit(&graph), 2_000);
+
+        let storage = Storage::open_in_memory().unwrap();
+        let seed_stale = |st: &Storage| {
+            st.upsert_onenote_pages(&[OnenotePageSummary {
+                page_key: "me|p-stale".to_string(),
+                id: "p-stale".to_string(),
+                scope: OnenoteScope::Me,
+                section_id: "sec-1".to_string(),
+                section_name: Some("Sec 1".to_string()),
+                notebook_id: None,
+                notebook_name: None,
+                title: "Deleted on the server".to_string(),
+                level: 0,
+                order: 0,
+                created_at: None,
+                last_modified_at: Some("2026-11-19T09:00:00Z".to_string()),
+                content_url: None,
+                web_url: None,
+                preview_text: None,
+                has_todo: false,
+            }])
+            .unwrap();
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut backoff = ErrorBackoffState::new(15_000);
+        let shared = SyncSharedState::new();
+
+        // 1. Exactly 500 pages at the 500-page cap and no nextLink: the list is complete,
+        //    so the page deleted on the server is pruned (row count alone used to block it).
+        seed_stale(&storage);
+        assert!(
+            run_section_pages_refresh(
+                &budgeted, &storage, &tx, "me|sec-1", None, true, &mut backoff, &shared,
+                Instant::now(),
+            )
+            .await
+        );
+        assert!(storage.get_onenote_page_summary("me|p-stale").unwrap().is_none());
+        assert_eq!(storage.list_onenote_pages("me|sec-1").unwrap().len(), 500);
+
+        // 2. 501 pages at the 500-page cap: truncated, so nothing is pruned.
+        state.total.store(501, AtomicOrdering::SeqCst);
+        seed_stale(&storage);
+        assert!(
+            run_section_pages_refresh(
+                &budgeted, &storage, &tx, "me|sec-1", None, true, &mut backoff, &shared,
+                Instant::now(),
+            )
+            .await
+        );
+        assert!(storage.get_onenote_page_summary("me|p-stale").unwrap().is_some());
+        assert!(storage.get_onenote_page_summary("me|p-0500").unwrap().is_none());
+
+        // 3. An explicit refresh reads up to 2,000 pages: page 501 is cached and the
+        //    stale row is pruned.
+        assert!(
+            run_section_pages_refresh(
+                &graph, &storage, &tx, "me|sec-1", None, false, &mut backoff, &shared,
+                Instant::now(),
+            )
+            .await
+        );
+        assert!(storage.get_onenote_page_summary("me|p-0500").unwrap().is_some());
+        assert!(storage.get_onenote_page_summary("me|p-stale").unwrap().is_none());
+        assert_eq!(storage.list_onenote_pages("me|sec-1").unwrap().len(), 501);
+
         srv.abort();
     }
 }

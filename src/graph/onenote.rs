@@ -1609,8 +1609,24 @@ impl GraphClient {
         section_id: &str,
         limit: usize,
     ) -> Result<Vec<OnenotePageSummary>> {
+        Ok(self
+            .list_onenote_pages_with_more(scope, section_id, limit)
+            .await?
+            .0)
+    }
+
+    /// Same as `list_onenote_pages`, also reporting whether the section holds
+    /// more pages than `limit` (another row or a `nextLink` remained when the
+    /// limit was reached). Callers must not prune cached pages when it is true.
+    pub async fn list_onenote_pages_with_more(
+        &self,
+        scope: &OnenoteScope,
+        section_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<OnenotePageSummary>, bool)> {
         if limit == 0 {
-            return Ok(Vec::new());
+            // Nothing was fetched, so the list cannot be treated as complete.
+            return Ok((Vec::new(), true));
         }
         let sec_id = clean_raw_onenote_id(section_id);
         if sec_id.is_empty() {
@@ -1632,32 +1648,29 @@ impl GraphClient {
         };
 
         let mut pages = Vec::new();
-        for raw in first_page.value {
-            if !raw.id.trim().is_empty() {
+        let mut batch = first_page;
+        loop {
+            let next_link = batch.next_link;
+            let mut rows = batch
+                .value
+                .into_iter()
+                .filter(|raw| !raw.id.trim().is_empty());
+            for raw in rows.by_ref() {
                 let idx = pages.len() as i32;
                 pages.push(raw.into_page_summary(scope, Some(&sec_id), idx));
                 if pages.len() >= limit {
-                    return Ok(pages);
+                    break;
                 }
             }
-        }
-
-        let mut next_url = first_page.next_link;
-        while let Some(url) = next_url {
-            let page: GraphListPage<GraphOnenotePage> = self.get_json(&url).await?;
-            for raw in page.value {
-                if !raw.id.trim().is_empty() {
-                    let idx = pages.len() as i32;
-                    pages.push(raw.into_page_summary(scope, Some(&sec_id), idx));
-                    if pages.len() >= limit {
-                        return Ok(pages);
-                    }
-                }
+            if pages.len() >= limit {
+                let has_more = rows.next().is_some() || next_link.is_some();
+                return Ok((pages, has_more));
             }
-            next_url = page.next_link;
+            match next_link {
+                Some(url) => batch = self.get_json(&url).await?,
+                None => return Ok((pages, false)),
+            }
         }
-
-        Ok(pages)
     }
 
     pub async fn get_onenote_page_content_xhtml(

@@ -452,6 +452,38 @@ impl Storage {
         )
     }
 
+    pub fn search_onenote_pages_in_sections(
+        &self,
+        query: &str,
+        section_keys: &[String],
+        limit: usize,
+    ) -> Result<Vec<OnenoteSearchHit>> {
+        let conn = self.read_conn()?;
+        onenote::search_onenote_pages_in_sections(
+            &conn,
+            query,
+            section_keys,
+            limit,
+            self.trigram_enabled,
+        )
+    }
+
+    /// Cached pages that can match a page ID/title lookup for `query`.
+    pub fn list_onenote_page_lookup_candidates(
+        &self,
+        query: &str,
+    ) -> Result<Vec<OnenotePageSummary>> {
+        let conn = self.read_conn()?;
+        onenote::list_onenote_page_lookup_candidates(&conn, query)
+    }
+
+    pub fn list_onenote_page_section_refs(
+        &self,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        let conn = self.read_conn()?;
+        onenote::list_onenote_page_section_refs(&conn)
+    }
+
     // --- Sync Cursors ---
 
     pub fn get_sync_cursor(&self, scope_key: &str) -> Result<Option<SyncCursor>> {
