@@ -162,6 +162,7 @@ token_refresh_mins = 5
 | `ONENOTE_DATA_DIR` | Override SQLite cache (`cache.db`) directory |
 | `ONENOTE_NO_BROWSER` | Disable automatic browser launch during login (`1` / `true`) |
 | `ONENOTE_AUTO_DAEMON` | Auto-start/attach to the background sync daemon (`1` / `true`, default `false`) |
+| `ONENOTE_MAX_TEAMS` | Joined Teams queried for notebooks by `--include-teams` (default `100`, range `1`–`500`; one Graph request per Team). Background sync always uses `25` |
 | `ONENOTE_IMAGE_PROTOCOL` | Terminal image protocol override (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`) |
 | `ONENOTE_GITHUB_REPO` | Override GitHub `owner/repo` used by `onenote self-update` (default `BiteFoundry/onenote`) |
 | `ONENOTE_GITHUB_TOKEN` | GitHub token for private release checks in `onenote self-update` |

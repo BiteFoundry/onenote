@@ -16,7 +16,15 @@ use crate::models::{
     OutgoingOnenotePage,
 };
 
-const MAX_JOINED_TEAMS_FOR_ONENOTE: usize = 25;
+/// Joined Teams queried for notebooks by explicit CLI / MCP / HTTP calls.
+/// `ONENOTE_MAX_TEAMS` overrides it (clamped to 1..=`MAX_JOINED_TEAMS_LIMIT`).
+const DEFAULT_MAX_JOINED_TEAMS_FOR_ONENOTE: usize = 100;
+/// Background sync runs under the automatic request budget (one request per
+/// Team), so it keeps the smaller cap.
+const BUDGETED_MAX_JOINED_TEAMS_FOR_ONENOTE: usize = 25;
+const MAX_JOINED_TEAMS_LIMIT: usize = 500;
+/// Shown when Teams notebooks were asked for but the sign-in cannot list Teams.
+pub const TEAMS_SKIPPED_MISSING_ORG_SCOPES_WARNING: &str = "Teams notebooks were skipped: this sign-in has no Team.ReadBasic.All / Notes.Read.All permission. Sign in with your organization's tenant: onenote login --tenant-id <TENANT_ID>.";
 const ONENOTE_SCOPE_CONCURRENCY: usize = 4;
 const MAX_SECTION_GROUP_TRAVERSAL: usize = 256;
 
@@ -455,6 +463,51 @@ pub fn is_not_found_error(err: &anyhow::Error) -> bool {
 pub struct ScopedNotebooksResult {
     pub notebooks: Vec<OnenoteNotebook>,
     pub complete_scopes: HashSet<String>,
+    /// Human-readable notes about notebooks that may be missing from the
+    /// result (Teams skipped, Teams cap reached, Teams listing failed).
+    pub warnings: Vec<String>,
+}
+
+/// Whether `/me/joinedTeams` should be queried for the current sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinedTeamsDecision {
+    Query,
+    /// Personal Microsoft account: Teams do not exist, stay silent.
+    SkipConsumer,
+    /// Work or school token that carries scope claims but none that can list
+    /// Teams (typically a `/common` sign-in without the organization scopes).
+    SkipMissingOrgScopes,
+}
+
+pub(crate) fn joined_teams_decision(
+    tokens: Option<&crate::auth::StoredTokens>,
+) -> JoinedTeamsDecision {
+    let Some(tok) = tokens else {
+        return JoinedTeamsDecision::Query;
+    };
+    if crate::auth::is_consumer_msa_token(tok) {
+        return JoinedTeamsDecision::SkipConsumer;
+    }
+    let diag = crate::auth::diagnose_access_token_scopes(&tok.access_token);
+    if diag.has_scope_claims && !diag.can_read_groups {
+        return JoinedTeamsDecision::SkipMissingOrgScopes;
+    }
+    JoinedTeamsDecision::Query
+}
+
+/// The warning to show when Teams notebooks cannot be listed with this
+/// sign-in, or `None` when they can (or when the account has no Teams).
+pub fn teams_skipped_warning(tokens: Option<&crate::auth::StoredTokens>) -> Option<&'static str> {
+    (joined_teams_decision(tokens) == JoinedTeamsDecision::SkipMissingOrgScopes)
+        .then_some(TEAMS_SKIPPED_MISSING_ORG_SCOPES_WARNING)
+}
+
+/// Parses `ONENOTE_MAX_TEAMS`; anything missing or invalid gives the default.
+fn max_joined_teams_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, MAX_JOINED_TEAMS_LIMIT))
+        .unwrap_or(DEFAULT_MAX_JOINED_TEAMS_FOR_ONENOTE)
 }
 
 /// Scope-aware section fetch result tracking which scopes were completely fetched without error.
@@ -644,7 +697,12 @@ pub(crate) fn validate_page_creation_level(level: Option<i32>) -> Result<()> {
 }
 
 impl GraphClient {
-    async fn list_joined_teams_lite(&self, max_teams: usize) -> Result<Vec<(String, String)>> {
+    /// Lists up to `max_teams` joined Teams. The flag is `true` only when at
+    /// least one more Team (or another result page) exists beyond the cap.
+    async fn list_joined_teams_lite(
+        &self,
+        max_teams: usize,
+    ) -> Result<(Vec<(String, String)>, bool)> {
         let mut next_url = Some("/me/joinedTeams".to_string());
         let mut out = Vec::new();
 
@@ -654,20 +712,23 @@ impl GraphClient {
                 if raw.id.trim().is_empty() {
                     continue;
                 }
+                if out.len() >= max_teams {
+                    return Ok((out, true));
+                }
                 let name = raw
                     .display_name
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| raw.id.clone());
                 out.push((raw.id, name));
-                if out.len() >= max_teams {
-                    return Ok(out);
-                }
             }
             next_url = page.next_link;
+            if out.len() >= max_teams && next_url.is_some() {
+                return Ok((out, true));
+            }
         }
 
-        Ok(out)
+        Ok((out, false))
     }
 
     pub async fn list_onenote_notebooks(
@@ -690,18 +751,14 @@ impl GraphClient {
         Ok(notebooks)
     }
 
-    async fn should_query_joined_teams(&self) -> bool {
-        let Some(tok) = self.auth.current_tokens().await else {
-            return true;
-        };
-        if crate::auth::is_consumer_msa_token(&tok) {
-            return false;
+    /// Teams cap for this client: explicit calls use the configurable cap,
+    /// budgeted background sync keeps the small one.
+    fn max_joined_teams(&self) -> usize {
+        if self.request_allowance.is_some() {
+            BUDGETED_MAX_JOINED_TEAMS_FOR_ONENOTE
+        } else {
+            max_joined_teams_from(std::env::var("ONENOTE_MAX_TEAMS").ok().as_deref())
         }
-        let diag = crate::auth::diagnose_access_token_scopes(&tok.access_token);
-        if diag.has_scope_claims && !diag.can_read_groups {
-            return false;
-        }
-        true
     }
 
     pub async fn list_all_accessible_notebooks(
@@ -718,6 +775,15 @@ impl GraphClient {
         &self,
         include_teams: bool,
     ) -> Result<ScopedNotebooksResult> {
+        self.list_all_accessible_notebooks_with_team_cap(include_teams, self.max_joined_teams())
+            .await
+    }
+
+    async fn list_all_accessible_notebooks_with_team_cap(
+        &self,
+        include_teams: bool,
+        max_teams: usize,
+    ) -> Result<ScopedNotebooksResult> {
         let me_res = self.list_onenote_notebooks(&OnenoteScope::Me).await;
         if !include_teams {
             let notebooks = me_res?;
@@ -726,8 +792,10 @@ impl GraphClient {
             return Ok(ScopedNotebooksResult {
                 notebooks,
                 complete_scopes,
+                warnings: Vec::new(),
             });
         }
+        let mut warnings: Vec<String> = Vec::new();
 
         let mut merged: Vec<OnenoteNotebook> = Vec::new();
         let mut index_by_id: HashMap<String, usize> = HashMap::new();
@@ -753,38 +821,58 @@ impl GraphClient {
             }
         }
 
-        if self.should_query_joined_teams().await {
-            if let Ok(teams) = self
-                .list_joined_teams_lite(MAX_JOINED_TEAMS_FOR_ONENOTE)
-                .await
-            {
-                let scopes: Vec<OnenoteScope> = teams
-                    .into_iter()
-                    .map(|(group_id, group_name)| OnenoteScope::Group {
-                        group_id,
-                        group_name: Some(group_name),
-                    })
-                    .collect();
+        let tokens = self.auth.current_tokens().await;
+        let teams = match joined_teams_decision(tokens.as_ref()) {
+            JoinedTeamsDecision::Query => match self.list_joined_teams_lite(max_teams).await {
+                Ok((teams, truncated)) => {
+                    if truncated {
+                        warnings.push(format!(
+                            "Showing notebooks for the first {} of your joined Teams; set ONENOTE_MAX_TEAMS to raise the limit.",
+                            teams.len()
+                        ));
+                    }
+                    Some(teams)
+                }
+                Err(err) => {
+                    warnings.push(format!(
+                        "Teams notebooks were skipped: listing your joined Teams failed ({err})."
+                    ));
+                    None
+                }
+            },
+            JoinedTeamsDecision::SkipMissingOrgScopes => {
+                warnings.push(TEAMS_SKIPPED_MISSING_ORG_SCOPES_WARNING.to_string());
+                None
+            }
+            JoinedTeamsDecision::SkipConsumer => None,
+        };
+        if let Some(teams) = teams {
+            let scopes: Vec<OnenoteScope> = teams
+                .into_iter()
+                .map(|(group_id, group_name)| OnenoteScope::Group {
+                    group_id,
+                    group_name: Some(group_name),
+                })
+                .collect();
 
-                for chunk in scopes.chunks(ONENOTE_SCOPE_CONCURRENCY) {
-                    let futs = chunk.iter().map(|s| async move {
-                        let scope_key = s.scope_key();
-                        (scope_key, self.list_onenote_notebooks(s).await)
-                    });
-                    let results = join_all(futs).await;
-                    for (scope_key, res) in results {
-                        if let Ok(group_nbs) = res {
-                            complete_scopes.insert(scope_key);
-                            if !group_nbs.is_empty() {
-                                any_succeeded = true;
-                            }
-                            for nb in group_nbs {
-                                if let Some(&pos) = index_by_id.get(&nb.id) {
-                                    merge_duplicate_notebook(&mut merged[pos], nb);
-                                } else {
-                                    index_by_id.insert(nb.id.clone(), merged.len());
-                                    merged.push(nb);
-                                }
+            for chunk in scopes.chunks(ONENOTE_SCOPE_CONCURRENCY) {
+                let futs = chunk.iter().map(|s| async move {
+                    let scope_key = s.scope_key();
+                    (scope_key, self.list_onenote_notebooks(s).await)
+                });
+                let results = join_all(futs).await;
+                for (scope_key, res) in results {
+                    if let Ok(group_nbs) = res {
+                        complete_scopes.insert(scope_key);
+                        if !group_nbs.is_empty() {
+                            any_succeeded = true;
+                        }
+                        for nb in group_nbs {
+                            if let Some(&pos) = index_by_id.get(&nb.id) {
+                                merge_duplicate_notebook(&mut merged[pos], nb);
+                            } else {
+                                index_by_id.insert(nb.id.clone(), merged.len());
+                                merged.push(nb);
                             }
                         }
                     }
@@ -801,6 +889,7 @@ impl GraphClient {
         Ok(ScopedNotebooksResult {
             notebooks: merged,
             complete_scopes,
+            warnings,
         })
     }
 
@@ -956,14 +1045,21 @@ impl GraphClient {
         initial_groups: Vec<OnenoteSectionGroup>,
         fallback_notebook_id: Option<&str>,
         visited_sg_ids: &mut HashSet<String>,
-    ) -> (Vec<OnenoteSectionGroup>, Vec<OnenoteSection>) {
+    ) -> (Vec<OnenoteSectionGroup>, Vec<OnenoteSection>, bool) {
         let mut queue: VecDeque<OnenoteSectionGroup> = VecDeque::new();
         let mut collected_groups: Vec<OnenoteSectionGroup> = Vec::new();
         let mut collected_sections: Vec<OnenoteSection> = Vec::new();
         let mut seen_sections: HashSet<String> = HashSet::new();
+        // `false` as soon as any listing fails or the traversal cap stops the
+        // walk: the caller must then not prune cached sections.
+        let mut complete = true;
 
         for g in initial_groups {
+            if visited_sg_ids.contains(&g.id) {
+                continue;
+            }
             if visited_sg_ids.len() >= MAX_SECTION_GROUP_TRAVERSAL {
+                complete = false;
                 break;
             }
             if visited_sg_ids.insert(g.id.clone()) {
@@ -979,31 +1075,41 @@ impl GraphClient {
                 self.list_child_section_groups(scope, &sg.id, eff_nb_id)
             );
 
-            if let Ok(secs) = secs_res {
-                for mut sec in secs {
-                    if sec.parent_section_group_name.is_none() {
-                        sec.parent_section_group_name = Some(sg.display_name.clone());
-                    }
-                    if seen_sections.insert(sec.section_key.clone()) {
-                        collected_sections.push(sec);
+            match secs_res {
+                Ok(secs) => {
+                    for mut sec in secs {
+                        if sec.parent_section_group_name.is_none() {
+                            sec.parent_section_group_name = Some(sg.display_name.clone());
+                        }
+                        if seen_sections.insert(sec.section_key.clone()) {
+                            collected_sections.push(sec);
+                        }
                     }
                 }
+                Err(_) => complete = false,
             }
 
-            if let Ok(children) = child_groups_res {
-                for child in children {
-                    if visited_sg_ids.len() >= MAX_SECTION_GROUP_TRAVERSAL {
-                        break;
-                    }
-                    if visited_sg_ids.insert(child.id.clone()) {
-                        collected_groups.push(child.clone());
-                        queue.push_back(child);
+            match child_groups_res {
+                Ok(children) => {
+                    for child in children {
+                        if visited_sg_ids.contains(&child.id) {
+                            continue;
+                        }
+                        if visited_sg_ids.len() >= MAX_SECTION_GROUP_TRAVERSAL {
+                            complete = false;
+                            break;
+                        }
+                        if visited_sg_ids.insert(child.id.clone()) {
+                            collected_groups.push(child.clone());
+                            queue.push_back(child);
+                        }
                     }
                 }
+                Err(_) => complete = false,
             }
         }
 
-        (collected_groups, collected_sections)
+        (collected_groups, collected_sections, complete)
     }
 
     async fn collect_notebook_section_groups_and_sections(
@@ -1011,7 +1117,7 @@ impl GraphClient {
         scope: &OnenoteScope,
         nb_id: &str,
         visited_sg_ids: &mut HashSet<String>,
-    ) -> Result<(Vec<OnenoteSectionGroup>, Vec<OnenoteSection>)> {
+    ) -> Result<(Vec<OnenoteSectionGroup>, Vec<OnenoteSection>, bool)> {
         let (direct_secs_res, direct_groups_res) = tokio::join!(
             self.list_onenote_sections_direct(scope, Some(nb_id)),
             self.list_onenote_section_groups(scope, Some(nb_id))
@@ -1034,13 +1140,16 @@ impl GraphClient {
             }
         }
 
-        let (groups, grouped_secs) = match direct_groups_res {
+        let (groups, grouped_secs, groups_complete) = match direct_groups_res {
             Ok(top_groups) => {
                 self.traverse_section_groups(scope, top_groups, Some(nb_id), visited_sg_ids)
                     .await
             }
-            Err(_) => (Vec::new(), Vec::new()),
+            Err(_) => (Vec::new(), Vec::new(), false),
         };
+        // Partial when the direct section list failed (but grouped sections
+        // were found) or any part of the section-group walk failed.
+        let complete = direct_err.is_none() && groups_complete;
 
         for sec in grouped_secs {
             if seen_sections.insert(sec.section_key.clone()) {
@@ -1054,7 +1163,7 @@ impl GraphClient {
             }
         }
 
-        Ok((groups, sections))
+        Ok((groups, sections, complete))
     }
 
     pub async fn list_onenote_sections(
@@ -1062,19 +1171,34 @@ impl GraphClient {
         scope: &OnenoteScope,
         notebook_id: Option<&str>,
     ) -> Result<Vec<OnenoteSection>> {
+        Ok(self
+            .list_onenote_sections_scoped(scope, notebook_id)
+            .await?
+            .0)
+    }
+
+    /// Like [`Self::list_onenote_sections`], plus whether the list is complete.
+    /// `false` means some section or section-group request failed (or the
+    /// traversal cap was reached): the sections returned are valid, but
+    /// cached sections missing from the list must not be pruned.
+    pub async fn list_onenote_sections_scoped(
+        &self,
+        scope: &OnenoteScope,
+        notebook_id: Option<&str>,
+    ) -> Result<(Vec<OnenoteSection>, bool)> {
         let nb_clean = notebook_id
             .map(clean_raw_onenote_id)
             .filter(|s| !s.is_empty());
         match nb_clean.as_deref() {
             Some(nb_id) => {
                 let mut visited = HashSet::new();
-                let (mut groups, mut sections) = self
+                let (mut groups, mut sections, complete) = self
                     .collect_notebook_section_groups_and_sections(scope, nb_id, &mut visited)
                     .await?;
                 backfill_section_hierarchy(&[], &mut groups, &mut sections);
-                Ok(sections)
+                Ok((sections, complete))
             }
-            None => self.list_onenote_sections_direct(scope, None).await,
+            None => Ok((self.list_onenote_sections_direct(scope, None).await?, true)),
         }
     }
 
@@ -1249,8 +1373,11 @@ impl GraphClient {
                                     )
                                     .await
                                 {
-                                    Ok((nb_groups, nb_secs)) => {
+                                    Ok((nb_groups, nb_secs, nb_complete)) => {
                                         fallback_ok = true;
+                                        if !nb_complete {
+                                            all_nbs_ok = false;
+                                        }
                                         scope_groups.extend(nb_groups);
                                         scope_sections.extend(nb_secs);
                                     }
@@ -1266,7 +1393,7 @@ impl GraphClient {
                                     .filter(|g| !visited_sg_ids.contains(&g.id))
                                     .collect();
                                 if !remaining.is_empty() {
-                                    let (extra_groups, extra_secs) = self
+                                    let (extra_groups, extra_secs, extra_complete) = self
                                         .traverse_section_groups(
                                             &scope,
                                             remaining,
@@ -1274,6 +1401,9 @@ impl GraphClient {
                                             &mut visited_sg_ids,
                                         )
                                         .await;
+                                    if !extra_complete {
+                                        all_nbs_ok = false;
+                                    }
                                     if !extra_secs.is_empty() {
                                         fallback_ok = true;
                                     }
@@ -2742,5 +2872,336 @@ mod tests {
             err.to_string().contains("500"),
             "empty group notebooks must not mask /me/onenote/notebooks failure: {err}"
         );
+    }
+
+    fn stored_tokens(access_token: String, tenant_id: &str) -> StoredTokens {
+        StoredTokens {
+            access_token,
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: tenant_id.to_string(),
+            user_id: None,
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        }
+    }
+
+    #[test]
+    fn joined_teams_decision_separates_consumer_from_missing_org_scopes() {
+        // Work tenant, only Notes.* scopes (a `/common` sign-in): skipped with a hint.
+        let notes_only = stored_tokens(
+            make_test_jwt(&serde_json::json!({
+                "tid": "org-tenant-123",
+                "scp": "User.Read Notes.Read Notes.ReadWrite Notes.Create"
+            })),
+            "common",
+        );
+        assert_eq!(
+            joined_teams_decision(Some(&notes_only)),
+            JoinedTeamsDecision::SkipMissingOrgScopes
+        );
+        assert_eq!(
+            teams_skipped_warning(Some(&notes_only)),
+            Some(TEAMS_SKIPPED_MISSING_ORG_SCOPES_WARNING)
+        );
+        assert!(TEAMS_SKIPPED_MISSING_ORG_SCOPES_WARNING.contains("onenote login --tenant-id"));
+
+        // Personal Microsoft account: skipped silently.
+        let consumer = stored_tokens(
+            make_test_jwt(&serde_json::json!({
+                "tid": "9188040d-6c67-4c5b-b112-36a304b66dad",
+                "scp": "User.Read Notes.ReadWrite"
+            })),
+            "common",
+        );
+        assert_eq!(
+            joined_teams_decision(Some(&consumer)),
+            JoinedTeamsDecision::SkipConsumer
+        );
+        assert_eq!(teams_skipped_warning(Some(&consumer)), None);
+
+        // Team.ReadBasic.All present, opaque token, or no token at all: query.
+        let with_team = stored_tokens(
+            make_test_jwt(&serde_json::json!({
+                "tid": "org-tenant-123",
+                "scp": "User.Read Notes.ReadWrite Team.ReadBasic.All"
+            })),
+            "org-tenant-123",
+        );
+        assert_eq!(
+            joined_teams_decision(Some(&with_team)),
+            JoinedTeamsDecision::Query
+        );
+        let opaque = stored_tokens("opaque-token".to_string(), "org-tenant-123");
+        assert_eq!(joined_teams_decision(Some(&opaque)), JoinedTeamsDecision::Query);
+        assert_eq!(joined_teams_decision(None), JoinedTeamsDecision::Query);
+        assert_eq!(teams_skipped_warning(None), None);
+    }
+
+    #[test]
+    fn max_joined_teams_env_value_is_clamped() {
+        assert_eq!(max_joined_teams_from(None), 100);
+        assert_eq!(max_joined_teams_from(Some("")), 100);
+        assert_eq!(max_joined_teams_from(Some("abc")), 100);
+        assert_eq!(max_joined_teams_from(Some("-3")), 100);
+        assert_eq!(max_joined_teams_from(Some(" 40 ")), 40);
+        assert_eq!(max_joined_teams_from(Some("0")), 1);
+        assert_eq!(max_joined_teams_from(Some("100000")), 500);
+    }
+
+    #[tokio::test]
+    async fn joined_teams_cap_truncation_and_failures_are_reported() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let group_hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let group_hits_clone = group_hits.clone();
+        let fail_teams = Arc::new(AtomicBool::new(false));
+        let fail_teams_clone = fail_teams.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/notebooks",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{ "id": "nb-me", "displayName": "Personal", "isDefault": true }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(move || {
+                    let fail = fail_teams_clone.clone();
+                    async move {
+                        if fail.load(Ordering::SeqCst) {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(serde_json::json!({
+                                    "error": { "code": "Forbidden", "message": "no teams for you" }
+                                })),
+                            );
+                        }
+                        let teams: Vec<serde_json::Value> = (1..=30)
+                            .map(|i| {
+                                serde_json::json!({
+                                    "id": format!("team-{i:02}"),
+                                    "displayName": format!("Team {i:02}")
+                                })
+                            })
+                            .collect();
+                        (StatusCode::OK, Json(serde_json::json!({ "value": teams })))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/groups/{gid}/onenote/notebooks",
+                get(move |AxumPath(gid): AxumPath<String>| {
+                    let hits = group_hits_clone.clone();
+                    async move {
+                        hits.lock().unwrap().push(gid.clone());
+                        Json(serde_json::json!({
+                            "value": [{ "id": format!("nb-{gid}"), "displayName": format!("Notes {gid}") }]
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = test_graph_client(format!("http://{addr}/v1.0"));
+
+        // 30 joined Teams under the default cap of 100: all queried, no warning.
+        // (25 was the old cap, so Teams 26..30 used to be invisible.)
+        let all = client
+            .list_all_accessible_notebooks_with_team_cap(true, DEFAULT_MAX_JOINED_TEAMS_FOR_ONENOTE)
+            .await
+            .unwrap();
+        assert_eq!(all.notebooks.len(), 31);
+        assert_eq!(group_hits.lock().unwrap().len(), 30);
+        assert!(all.warnings.is_empty(), "{:?}", all.warnings);
+        assert!(all.complete_scopes.contains("group:team-30"));
+
+        // Exactly at the cap is not a truncation.
+        let exact = client
+            .list_all_accessible_notebooks_with_team_cap(true, 30)
+            .await
+            .unwrap();
+        assert!(exact.warnings.is_empty(), "{:?}", exact.warnings);
+
+        // Cap 2: two Teams queried and one warning naming the override.
+        group_hits.lock().unwrap().clear();
+        let capped = client
+            .list_all_accessible_notebooks_with_team_cap(true, 2)
+            .await
+            .unwrap();
+        assert_eq!(capped.notebooks.len(), 3);
+        assert_eq!(*group_hits.lock().unwrap(), ["team-01", "team-02"]);
+        assert_eq!(capped.warnings.len(), 1);
+        assert!(capped.warnings[0].contains("first 2 of your joined Teams"));
+        assert!(capped.warnings[0].contains("ONENOTE_MAX_TEAMS"));
+        assert!(!capped.complete_scopes.contains("group:team-03"));
+
+        // Background sync under the automatic request budget keeps the cap of 25.
+        let budgeted = client.with_automatic_budget(
+            &crate::graph::AutomaticRequestBudget::default(),
+            std::time::Instant::now(),
+            1_000,
+        );
+        assert_eq!(budgeted.max_joined_teams(), 25);
+        group_hits.lock().unwrap().clear();
+        let background = budgeted
+            .list_all_accessible_notebooks_scoped(true)
+            .await
+            .unwrap();
+        assert_eq!(group_hits.lock().unwrap().len(), 25);
+        assert_eq!(background.warnings.len(), 1);
+
+        // /me/joinedTeams fails: personal notebooks still come back, with a warning.
+        fail_teams.store(true, Ordering::SeqCst);
+        group_hits.lock().unwrap().clear();
+        let failed = client
+            .list_all_accessible_notebooks_with_team_cap(true, DEFAULT_MAX_JOINED_TEAMS_FOR_ONENOTE)
+            .await
+            .unwrap();
+        assert_eq!(failed.notebooks.len(), 1);
+        assert_eq!(failed.notebooks[0].notebook_key, "me|nb-me");
+        assert!(group_hits.lock().unwrap().is_empty());
+        assert_eq!(failed.warnings.len(), 1);
+        assert!(failed.warnings[0].contains("listing your joined Teams failed"));
+        assert!(failed.warnings[0].contains("403"), "{}", failed.warnings[0]);
+
+        // Without include_teams nothing Teams-related is reported.
+        let personal_only = client
+            .list_all_accessible_notebooks_with_team_cap(false, 2)
+            .await
+            .unwrap();
+        assert!(personal_only.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn section_listing_reports_partial_section_group_fetch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fail_group = Arc::new(AtomicBool::new(true));
+        let fail_group_clone = fail_group.clone();
+        let fail_direct = Arc::new(AtomicBool::new(false));
+        let fail_direct_clone = fail_direct.clone();
+        let server_error = || {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": { "code": "InternalServerError", "message": "backend down" }
+                })),
+            )
+        };
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/notebooks/{nb_id}/sections",
+                get(move || {
+                    let fail = fail_direct_clone.clone();
+                    async move {
+                        if fail.load(Ordering::SeqCst) {
+                            return server_error();
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "value": [{ "id": "sec-direct", "displayName": "Direct" }]
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/notebooks/{nb_id}/sectionGroups",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "sg-1",
+                            "displayName": "Group",
+                            "parentNotebook": { "id": "nb-1" }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sectionGroups/{sg_id}/sections",
+                get(move || {
+                    let fail = fail_group_clone.clone();
+                    async move {
+                        if fail.load(Ordering::SeqCst) {
+                            return server_error();
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "value": [{
+                                    "id": "sec-grouped",
+                                    "displayName": "Grouped",
+                                    "parentSectionGroup": { "id": "sg-1" }
+                                }]
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sectionGroups/{sg_id}/sectionGroups",
+                get(|| async { Json(serde_json::json!({ "value": [] })) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = test_graph_client(format!("http://{addr}/v1.0"));
+
+        // The section group's sections fail: what was fetched is returned, flagged partial.
+        let (sections, complete) = client
+            .list_onenote_sections_scoped(&OnenoteScope::Me, Some("nb-1"))
+            .await
+            .unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].section_key, "me|sec-direct");
+        assert!(!complete);
+        // The plain wrapper keeps returning just the list.
+        assert_eq!(
+            client
+                .list_onenote_sections(&OnenoteScope::Me, Some("nb-1"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Everything succeeds: complete.
+        fail_group.store(false, Ordering::SeqCst);
+        let (sections, complete) = client
+            .list_onenote_sections_scoped(&OnenoteScope::Me, Some("nb-1"))
+            .await
+            .unwrap();
+        assert_eq!(sections.len(), 2);
+        assert!(complete);
+
+        // Direct sections fail but grouped ones are found: partial, not an error.
+        fail_direct.store(true, Ordering::SeqCst);
+        let (sections, complete) = client
+            .list_onenote_sections_scoped(&OnenoteScope::Me, Some("nb-1"))
+            .await
+            .unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].section_key, "me|sec-grouped");
+        assert!(!complete);
+
+        // Nothing at all could be fetched: still an error, as before.
+        fail_group.store(true, Ordering::SeqCst);
+        assert!(client
+            .list_onenote_sections_scoped(&OnenoteScope::Me, Some("nb-1"))
+            .await
+            .is_err());
     }
 }

@@ -1547,6 +1547,57 @@ pub async fn load_onenote_notebooks_with_cache(
     offline: bool,
     cached: bool,
 ) -> Result<Vec<OnenoteNotebook>> {
+    Ok(
+        load_onenote_notebooks_with_warnings(storage, graph, include_teams, refresh, offline, cached)
+            .await?
+            .0,
+    )
+}
+
+/// Like [`load_onenote_notebooks_with_cache`], plus warnings about notebooks
+/// that may be missing (Teams skipped for this sign-in, Teams cap reached,
+/// Teams listing failed).
+pub async fn load_onenote_notebooks_with_warnings(
+    storage: &Storage,
+    graph: &GraphClient,
+    include_teams: bool,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+) -> Result<(Vec<OnenoteNotebook>, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let notebooks = load_onenote_notebooks_inner(
+        storage,
+        graph,
+        include_teams,
+        refresh,
+        offline,
+        cached,
+        &mut warnings,
+    )
+    .await?;
+    // A cache hit makes no Graph call, so repeat the sign-in hint here: it is
+    // derived from the token alone and explains why Teams notebooks are absent.
+    if include_teams && !offline {
+        let tokens = graph.auth().current_tokens().await;
+        if let Some(hint) = crate::graph::onenote::teams_skipped_warning(tokens.as_ref()) {
+            if !warnings.iter().any(|w| w == hint) {
+                warnings.push(hint.to_string());
+            }
+        }
+    }
+    Ok((notebooks, warnings))
+}
+
+async fn load_onenote_notebooks_inner(
+    storage: &Storage,
+    graph: &GraphClient,
+    include_teams: bool,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<OnenoteNotebook>> {
     let filter_nbs = |items: Vec<OnenoteNotebook>| -> Vec<OnenoteNotebook> {
         if include_teams {
             items
@@ -1596,6 +1647,7 @@ pub async fn load_onenote_notebooks_with_cache(
     if include_teams {
         record_sync_cursor(storage, CURSOR_NOTEBOOKS_ALL, None);
     }
+    warnings.extend(nb_res.warnings);
     Ok(nb_res.notebooks)
 }
 
@@ -1616,6 +1668,46 @@ pub async fn load_onenote_sections_with_cache(
     refresh: bool,
     offline: bool,
     cached: bool,
+) -> Result<(Option<OnenoteNotebook>, Vec<OnenoteSection>)> {
+    let (nb, sections, _warnings) =
+        load_onenote_sections_with_warnings(storage, graph, notebook_query, refresh, offline, cached)
+            .await?;
+    Ok((nb, sections))
+}
+
+/// Like [`load_onenote_sections_with_cache`], plus warnings about sections
+/// that could not be fetched. After a partial fetch nothing is pruned from the
+/// cache, so the returned list still contains the previously cached sections.
+pub async fn load_onenote_sections_with_warnings(
+    storage: &Storage,
+    graph: &GraphClient,
+    notebook_query: Option<&str>,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+) -> Result<(Option<OnenoteNotebook>, Vec<OnenoteSection>, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let (nb, sections) = load_onenote_sections_inner(
+        storage,
+        graph,
+        notebook_query,
+        refresh,
+        offline,
+        cached,
+        &mut warnings,
+    )
+    .await?;
+    Ok((nb, sections, warnings))
+}
+
+async fn load_onenote_sections_inner(
+    storage: &Storage,
+    graph: &GraphClient,
+    notebook_query: Option<&str>,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+    warnings: &mut Vec<String>,
 ) -> Result<(Option<OnenoteNotebook>, Vec<OnenoteSection>)> {
     let nb = if let Some(q) = notebook_query.map(str::trim).filter(|s| !s.is_empty()) {
         Some(resolver::resolve_notebook_with_refresh(graph, storage, q, offline, refresh).await?)
@@ -1647,10 +1739,18 @@ pub async fn load_onenote_sections_with_cache(
     }
 
     if let Some(ref target_nb) = nb {
-        let fetched = graph
-            .list_onenote_sections(&target_nb.scope, Some(&target_nb.id))
+        let (fetched, complete) = graph
+            .list_onenote_sections_scoped(&target_nb.scope, Some(&target_nb.id))
             .await?;
-        storage.reconcile_onenote_notebook_sections(&target_nb.notebook_key, &fetched, true)?;
+        // Prune cached sections only after a complete fetch: a section group
+        // that failed to load must not delete its cached sections and pages.
+        storage.reconcile_onenote_notebook_sections(&target_nb.notebook_key, &fetched, complete)?;
+        if !complete {
+            warnings.push(format!(
+                "Some sections of '{}' could not be fetched; cached sections were kept. Run the command again with --refresh.",
+                target_nb.display_name
+            ));
+        }
     } else {
         let mut notebooks = storage.list_onenote_notebooks()?;
         let mut nb_complete_scopes: Option<std::collections::HashSet<String>> = None;
@@ -1663,6 +1763,7 @@ pub async fn load_onenote_sections_with_cache(
             let nb_res = graph.list_all_accessible_notebooks_scoped(true).await?;
             notebooks = nb_res.notebooks;
             nb_complete_scopes = Some(nb_res.complete_scopes);
+            warnings.extend(nb_res.warnings);
             record_sync_cursor(storage, CURSOR_NOTEBOOKS_PERSONAL, None);
             record_sync_cursor(storage, CURSOR_NOTEBOOKS_ALL, None);
         }
@@ -2964,10 +3065,15 @@ async fn cmd_doctor(cfg: &AppConfig, online: bool, json_out: bool) -> Result<()>
         .and_then(|s| s.list_onenote_sections(None).ok())
         .map(|v| v.len())
         .unwrap_or(0);
-    let diag = tok
+    let mut diag = tok
         .as_ref()
         .map(|t| diagnose_access_token_scopes(&t.access_token))
         .unwrap_or_default();
+    if tok.is_some() {
+        if let Some(hint) = crate::graph::onenote::teams_skipped_warning(tok.as_ref()) {
+            diag.warnings.push(hint.to_string());
+        }
+    }
     let img_caps = img_preview::probe_terminal_graphics_caps(cfg.image_protocol);
     let daemon_st = daemon::query_daemon_status(cfg).await.unwrap_or_default();
 
@@ -3061,9 +3167,12 @@ async fn cmd_notebooks(
         IdentityMode::AllowNetwork
     };
     let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, mode).await?;
-    let all_notebooks =
-        load_onenote_notebooks_with_cache(&storage, &graph, include_teams, refresh, offline, cached)
+    let (all_notebooks, warnings) =
+        load_onenote_notebooks_with_warnings(&storage, &graph, include_teams, refresh, offline, cached)
             .await?;
+    for w in &warnings {
+        eprintln!("Warning: {w}");
+    }
     let effective = limit.map(|n| n as usize).or(json_out.then_some(50));
     let (notebooks, has_more, next) = match effective {
         Some(n) => {
@@ -3089,6 +3198,9 @@ async fn cmd_notebooks(
         });
         if offline {
             out["cache_synced_at"] = json!(notebooks_cache_synced_at(&storage));
+        }
+        if !warnings.is_empty() {
+            out["warnings"] = json!(warnings);
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if notebooks.is_empty() {
@@ -3149,9 +3261,12 @@ async fn cmd_sections(
         IdentityMode::AllowNetwork
     };
     let (_auth, graph, storage) = open_runtime_inner(cfg, !offline && !cached, mode).await?;
-    let (nb, all_sections) =
-        load_onenote_sections_with_cache(&storage, &graph, notebook, refresh, offline, cached)
+    let (nb, all_sections, warnings) =
+        load_onenote_sections_with_warnings(&storage, &graph, notebook, refresh, offline, cached)
             .await?;
+    for w in &warnings {
+        eprintln!("Warning: {w}");
+    }
     let effective = limit.map(|n| n as usize).or(json_out.then_some(50));
     let (sections, has_more, next) = match effective {
         Some(n) => {
@@ -3178,6 +3293,9 @@ async fn cmd_sections(
         });
         if offline {
             out["cache_synced_at"] = json!(sections_cache_synced_at(&storage, nb.as_ref()));
+        }
+        if !warnings.is_empty() {
+            out["warnings"] = json!(warnings);
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if sections.is_empty() {
