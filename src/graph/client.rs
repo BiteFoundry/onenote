@@ -804,6 +804,7 @@ impl GraphClient {
         let retry = follow_redirects || method == Method::GET;
         let mut unauthorized_retried = false;
         let mut throttle_attempt = 0usize;
+        let mut gateway_replayed = false;
         let mut transport_retried = false;
 
         loop {
@@ -882,15 +883,10 @@ impl GraphClient {
             }
 
             if retry
-                && matches!(
-                    status,
-                    StatusCode::TOO_MANY_REQUESTS
-                        | StatusCode::SERVICE_UNAVAILABLE
-                        | StatusCode::BAD_GATEWAY
-                        | StatusCode::GATEWAY_TIMEOUT
-                )
+                && should_retry_status(&method, status)
                 && throttle_attempt < MAX_THROTTLE_RETRIES
             {
+                gateway_replayed |= is_gateway_error(status);
                 let delay_secs = parse_retry_after_secs(resp.headers(), throttle_attempt);
                 throttle_attempt += 1;
                 drop(resp);
@@ -903,9 +899,21 @@ impl GraphClient {
                 continue;
             }
 
+            // A DELETE replayed after a gateway error that finds the resource gone
+            // means the first attempt was applied: that is what the caller asked for.
+            if method == Method::DELETE
+                && gateway_replayed
+                && matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE)
+            {
+                return Ok((resp, request));
+            }
+
             if !status.is_success() {
                 let err_body = resp.text().await.unwrap_or_default();
-                let detail = format_graph_error(status, &err_body);
+                let mut detail = format_graph_error(status, &err_body);
+                if is_gateway_error(status) && !is_replay_safe(&method) {
+                    detail.push_str(" The request may have been applied; check before retrying.");
+                }
                 return Err(anyhow::Error::new(GraphApiError {
                     status,
                     method: method.to_string(),
@@ -916,6 +924,31 @@ impl GraphClient {
 
             return Ok((resp, request));
         }
+    }
+}
+
+fn is_gateway_error(status: StatusCode) -> bool {
+    matches!(status, StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT)
+}
+
+/// Methods that can be sent again without applying a change twice.
+/// `POST` creates and OneNote `PATCH` appends, so neither is.
+fn is_replay_safe(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE
+    )
+}
+
+/// Whether a throttling or gateway status is retried for `method`.
+/// 429 and 503 are returned before the request is processed, so every method
+/// retries. After 502 or 504 the request may already have been applied, so only
+/// replay-safe methods retry.
+fn should_retry_status(method: &Method, status: StatusCode) -> bool {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => true,
+        StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => is_replay_safe(method),
+        _ => false,
     }
 }
 
@@ -1300,5 +1333,160 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeds in-memory limit"));
+    }
+
+    #[test]
+    fn retry_decision_depends_on_status_and_method() {
+        for method in [Method::GET, Method::HEAD, Method::PUT, Method::DELETE] {
+            for status in [
+                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::BAD_GATEWAY,
+                StatusCode::GATEWAY_TIMEOUT,
+            ] {
+                assert!(should_retry_status(&method, status), "{method} {status}");
+            }
+        }
+        for method in [Method::POST, Method::PATCH] {
+            assert!(should_retry_status(&method, StatusCode::TOO_MANY_REQUESTS));
+            assert!(should_retry_status(&method, StatusCode::SERVICE_UNAVAILABLE));
+            assert!(!should_retry_status(&method, StatusCode::BAD_GATEWAY), "{method}");
+            assert!(!should_retry_status(&method, StatusCode::GATEWAY_TIMEOUT), "{method}");
+        }
+        assert!(!should_retry_status(&Method::GET, StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!should_retry_status(&Method::GET, StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn gateway_errors_are_not_replayed_for_post_and_patch() {
+        use axum::{
+            http::StatusCode as HttpStatus,
+            routing::{delete, get, patch, post},
+            Json, Router,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        // Each route fails its first request with the given status, then succeeds.
+        fn counted(
+            hits: &Arc<AtomicUsize>,
+            first: HttpStatus,
+            then: HttpStatus,
+        ) -> impl Fn() -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = (HttpStatus, [(&'static str, &'static str); 1], Json<serde_json::Value>),
+                    > + Send,
+            >,
+        > + Clone
+               + Send
+               + 'static {
+            let hits = hits.clone();
+            move || {
+                let hits = hits.clone();
+                Box::pin(async move {
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    let status = if n == 0 { first } else { then };
+                    (
+                        status,
+                        [("Retry-After", "0")],
+                        Json(serde_json::json!({ "ok": true, "error": { "code": "Mock", "message": "mock" } })),
+                    )
+                })
+            }
+        }
+
+        let post_504 = Arc::new(AtomicUsize::new(0));
+        let post_429 = Arc::new(AtomicUsize::new(0));
+        let patch_502 = Arc::new(AtomicUsize::new(0));
+        let get_502 = Arc::new(AtomicUsize::new(0));
+        let delete_504 = Arc::new(AtomicUsize::new(0));
+        let delete_404 = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1.0/post-504",
+                post(counted(&post_504, HttpStatus::GATEWAY_TIMEOUT, HttpStatus::OK)),
+            )
+            .route(
+                "/v1.0/post-429",
+                post(counted(&post_429, HttpStatus::TOO_MANY_REQUESTS, HttpStatus::OK)),
+            )
+            .route(
+                "/v1.0/patch-502",
+                patch(counted(&patch_502, HttpStatus::BAD_GATEWAY, HttpStatus::OK)),
+            )
+            .route(
+                "/v1.0/get-502",
+                get(counted(&get_502, HttpStatus::BAD_GATEWAY, HttpStatus::OK)),
+            )
+            .route(
+                "/v1.0/delete-504",
+                delete(counted(&delete_504, HttpStatus::GATEWAY_TIMEOUT, HttpStatus::NOT_FOUND)),
+            )
+            .route(
+                "/v1.0/delete-404",
+                delete(counted(&delete_404, HttpStatus::NOT_FOUND, HttpStatus::NOT_FOUND)),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "retry-test-token".into(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".into(),
+            tenant_id: "tid".into(),
+            user_id: Some("u-1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let client = GraphClient::new(cfg.clone(), AuthManager::from_tokens(cfg, tok)).unwrap();
+        let body = serde_json::json!({ "title": "x" });
+
+        let (post_gw, post_throttled, patch_gw, get_gw, delete_gw, delete_plain) = tokio::join!(
+            client.post_json::<_, serde_json::Value>("/post-504", &body),
+            client.post_json::<_, serde_json::Value>("/post-429", &body),
+            client.patch_json("/patch-502", &body),
+            client.get_json::<serde_json::Value>("/get-502"),
+            client.delete_req("/delete-504"),
+            client.delete_req("/delete-404"),
+        );
+
+        // POST + 504: one request, an error, and the hint that it may have been applied.
+        let err = post_gw.unwrap_err();
+        assert_eq!(post_504.load(Ordering::SeqCst), 1);
+        assert!(
+            format!("{err:#}").contains("The request may have been applied; check before retrying."),
+            "unexpected error: {err:#}"
+        );
+        // PATCH + 502: the same.
+        let err = patch_gw.unwrap_err();
+        assert_eq!(patch_502.load(Ordering::SeqCst), 1);
+        assert!(format!("{err:#}").contains("The request may have been applied"));
+
+        // POST + 429 was rejected before processing: retried and succeeds.
+        assert_eq!(post_throttled.unwrap()["ok"], true);
+        assert_eq!(post_429.load(Ordering::SeqCst), 2);
+        // GET + 502: retried as before.
+        assert_eq!(get_gw.unwrap()["ok"], true);
+        assert_eq!(get_502.load(Ordering::SeqCst), 2);
+
+        // DELETE replayed after 504 that finds the resource gone has succeeded...
+        delete_gw.unwrap();
+        assert_eq!(delete_504.load(Ordering::SeqCst), 2);
+        // ...while a plain 404 on the first attempt is still an error without the hint.
+        let err = delete_plain.unwrap_err();
+        assert_eq!(delete_404.load(Ordering::SeqCst), 1);
+        assert!(!format!("{err:#}").contains("may have been applied"));
+
+        server.abort();
     }
 }

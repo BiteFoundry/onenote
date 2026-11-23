@@ -313,6 +313,10 @@ struct MockGraphState {
     patches_received: Arc<Mutex<Vec<String>>>,
     deleted_pages: Arc<Mutex<Vec<String>>>,
     notebook_list_hits: Arc<Mutex<usize>>,
+    /// Failure injection: statuses answered (first in, first out) by the next
+    /// `POST …/sections/{id}/pages` requests before the mock creates a page.
+    page_post_failures: Arc<Mutex<std::collections::VecDeque<u16>>>,
+    page_post_hits: Arc<Mutex<usize>>,
 }
 
 impl MockGraphState {
@@ -372,6 +376,8 @@ impl MockGraphState {
             patches_received: Arc::new(Mutex::new(Vec::new())),
             deleted_pages: Arc::new(Mutex::new(Vec::new())),
             notebook_list_hits: Arc::new(Mutex::new(0)),
+            page_post_failures: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            page_post_hits: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -491,6 +497,16 @@ async fn spawn_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<
                  AxumPath(sec_id): AxumPath<String>,
                  headers: HeaderMap,
                  body: Bytes| async move {
+                    use axum::response::IntoResponse;
+                    *st.page_post_hits.lock().unwrap() += 1;
+                    if let Some(code) = st.page_post_failures.lock().unwrap().pop_front() {
+                        return (
+                            StatusCode::from_u16(code).unwrap(),
+                            [("Retry-After", "0")],
+                            Json(json!({ "error": { "code": "Injected", "message": "injected failure" } })),
+                        )
+                            .into_response();
+                    }
                     let raw = String::from_utf8_lossy(&body).into_owned();
                     let ct = headers
                         .get("content-type")
@@ -513,7 +529,7 @@ async fn spawn_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<
                     });
                     st.pages.lock().unwrap().push(created.clone());
                     st.page_xhtml.lock().unwrap().insert(id, raw);
-                    (StatusCode::CREATED, Json(created))
+                    (StatusCode::CREATED, Json(created)).into_response()
                 },
             ),
         )
@@ -5165,4 +5181,56 @@ async fn search_with_plain_section_name_is_filtered_before_the_limit() {
             .unwrap();
     assert_eq!(all.len(), 10);
     assert_eq!(all_more, Some(true));
+}
+
+/// ON-20: a page creation answered with 504 may already have been applied, so it
+/// is not sent again; a 429 was rejected before processing and is retried.
+#[tokio::test]
+async fn e2e_create_page_is_not_replayed_after_gateway_timeout() {
+    let (base_url, mock_state, server) = spawn_mock_graph().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_cfg, graph, storage) = make_test_runtime(base_url, tmp.path());
+    cli::load_onenote_sections(&storage, &graph, None, true, false)
+        .await
+        .unwrap();
+    let pages_before = mock_state.pages.lock().unwrap().len();
+
+    mock_state.page_post_failures.lock().unwrap().push_back(504);
+    let err = cli::create_onenote_page_helper(
+        &storage,
+        &graph,
+        "Specs",
+        "Gateway timeout page",
+        "body",
+        Vec::new(),
+        None,
+    )
+    .await
+    .err()
+    .expect("a 504 on page creation must fail instead of being replayed");
+    assert_eq!(*mock_state.page_post_hits.lock().unwrap(), 1);
+    assert!(
+        format!("{err:#}").contains("The request may have been applied; check before retrying."),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(mock_state.pages.lock().unwrap().len(), pages_before);
+
+    mock_state.page_post_failures.lock().unwrap().push_back(429);
+    let (_sec, created) = cli::create_onenote_page_helper(
+        &storage,
+        &graph,
+        "Specs",
+        "Throttled page",
+        "body",
+        Vec::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!created.id.is_empty());
+    // One throttled attempt plus the retry that created the page.
+    assert_eq!(*mock_state.page_post_hits.lock().unwrap(), 3);
+    assert_eq!(mock_state.pages.lock().unwrap().len(), pages_before + 1);
+
+    server.abort();
 }
