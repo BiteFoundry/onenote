@@ -867,6 +867,7 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                 TerminalImageProtocol::Sixel => TerminalImageProtocol::Halfblock,
                 TerminalImageProtocol::Halfblock => TerminalImageProtocol::Kitty,
             };
+            ui.image_protocol_user_chosen = true;
             app.persist_config(ui);
             ui.info(format!(
                 "Image protocol: {}",

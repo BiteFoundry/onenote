@@ -183,6 +183,8 @@ pub struct UiState {
     pub theme_preset: ThemePreset,
     pub theme: Theme,
     pub graphics_caps: TerminalGraphicsCaps,
+    /// The user picked an image protocol in this session (settings / shortcut).
+    pub image_protocol_user_chosen: bool,
     pub kitty_keyboard_supported: bool,
     pub term_width: u16,
     pub term_height: u16,
@@ -219,6 +221,7 @@ impl UiState {
             theme_preset: cfg.theme,
             theme: Theme::detect(cfg.theme),
             graphics_caps: TerminalGraphicsCaps::default(),
+            image_protocol_user_chosen: false,
             kitty_keyboard_supported: false,
             term_width: w,
             term_height: h,
@@ -782,18 +785,7 @@ impl AppState {
     }
 
     pub fn persist_config(&mut self, ui: &UiState) {
-        self.config.show_nav_rail = ui.show_nav_rail;
-        self.config.notify = ui.notify;
-        self.config.inline_images = ui.inline_images;
-        self.config.show_inline_hrefs = ui.show_inline_hrefs;
-        self.config.density = ui.density;
-        self.config.theme = ui.theme_preset;
-        self.config.image_protocol = match ui.graphics_caps.protocol {
-            TerminalImageProtocol::Kitty => ImageProtocolPreference::Kitty,
-            TerminalImageProtocol::ITerm2 => ImageProtocolPreference::Iterm2,
-            TerminalImageProtocol::Sixel => ImageProtocolPreference::Sixel,
-            TerminalImageProtocol::Halfblock => ImageProtocolPreference::Halfblock,
-        };
+        apply_ui_settings(&mut self.config, ui);
         let _ = self.config.save();
     }
 
@@ -1599,6 +1591,27 @@ impl AppState {
     }
 }
 
+/// Copies the settings owned by the UI into `config` before a save. The detected
+/// image protocol replaces the stored preference only when the preference is
+/// already explicit or the user picked a protocol in this session, so `auto`
+/// survives unrelated setting changes.
+fn apply_ui_settings(config: &mut AppConfig, ui: &UiState) {
+    config.show_nav_rail = ui.show_nav_rail;
+    config.notify = ui.notify;
+    config.inline_images = ui.inline_images;
+    config.show_inline_hrefs = ui.show_inline_hrefs;
+    config.density = ui.density;
+    config.theme = ui.theme_preset;
+    if ui.image_protocol_user_chosen || config.image_protocol != ImageProtocolPreference::Auto {
+        config.image_protocol = match ui.graphics_caps.protocol {
+            TerminalImageProtocol::Kitty => ImageProtocolPreference::Kitty,
+            TerminalImageProtocol::ITerm2 => ImageProtocolPreference::Iterm2,
+            TerminalImageProtocol::Sixel => ImageProtocolPreference::Sixel,
+            TerminalImageProtocol::Halfblock => ImageProtocolPreference::Halfblock,
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2325,5 +2338,33 @@ mod tests {
         assert_eq!(app.active_page_key.as_deref(), Some("me|page-1"));
         assert!(app.page_details.contains_key("me|page-1"));
         assert_eq!(focus_rx.borrow_and_update().section_key.as_deref(), Some("me|sec-2"));
+    }
+
+    #[test]
+    fn apply_ui_settings_keeps_auto_image_protocol_until_the_user_picks_one() {
+        let mut config = AppConfig {
+            image_protocol: ImageProtocolPreference::Auto,
+            notify: true,
+            ..AppConfig::default()
+        };
+        let mut ui = UiState::from_config(&config);
+        ui.graphics_caps.protocol = TerminalImageProtocol::Sixel;
+        ui.notify = false;
+
+        // An unrelated setting change saves the UI flags but leaves `auto` alone.
+        apply_ui_settings(&mut config, &ui);
+        assert!(!config.notify);
+        assert_eq!(config.image_protocol, ImageProtocolPreference::Auto);
+
+        // Cycling the protocol in the UI is an explicit choice and is stored.
+        ui.image_protocol_user_chosen = true;
+        apply_ui_settings(&mut config, &ui);
+        assert_eq!(config.image_protocol, ImageProtocolPreference::Sixel);
+
+        // An explicit stored preference keeps tracking the protocol in use.
+        ui.image_protocol_user_chosen = false;
+        ui.graphics_caps.protocol = TerminalImageProtocol::Kitty;
+        apply_ui_settings(&mut config, &ui);
+        assert_eq!(config.image_protocol, ImageProtocolPreference::Kitty);
     }
 }

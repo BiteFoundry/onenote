@@ -471,7 +471,10 @@ fn is_user_compatible(expected_user_id: Option<&str>, actual_user_id: Option<&st
         actual_user_id.map(str::trim).filter(|s| !s.is_empty()),
     ) {
         (Some(expected), Some(actual)) => expected == actual,
-        _ => true,
+        // A caller that knows its user must not attach to a daemon that runs in the
+        // anonymous cache bucket: they would read different database files.
+        (Some(_), None) => false,
+        (None, _) => true,
     }
 }
 
@@ -1141,18 +1144,36 @@ async fn try_connect_tui_at(
 /// Runs the background sync daemon in the foreground until a `Shutdown` RPC or Ctrl+C arrives.
 pub async fn run_daemon_foreground(cfg: AppConfig) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
-    let Some(tokens) = auth.current_tokens().await else {
-        bail!("Not logged in. Run 'onenote login' first.");
-    };
-    let user_id = tokens.user_id.clone();
+    let (graph, user_id) = daemon_cache_identity(&cfg, auth).await?;
     let storage = Storage::open(&crate::config::db_path(user_id.as_deref()))?;
-    let mut graph = GraphClient::new(cfg.clone(), auth)?;
-    if let Some(ref uid) = user_id {
-        graph = graph.with_my_user_id(uid.clone());
-    }
 
     let paths = DaemonPaths::current();
     run_daemon_inner(cfg, paths, graph, storage, user_id, true, true).await
+}
+
+/// Graph client and cache user for the daemon, resolved exactly as the CLI/TUI
+/// does (token claim, identity map, then `GET /me`) so both open the same cache
+/// file. When the account cannot be identified this fails instead of syncing
+/// into the anonymous bucket.
+async fn daemon_cache_identity(
+    cfg: &AppConfig,
+    auth: AuthManager,
+) -> Result<(GraphClient, Option<String>)> {
+    if auth.current_tokens().await.is_none() {
+        bail!("Not logged in. Run 'onenote login' first.");
+    }
+    let graph = GraphClient::new(cfg.clone(), auth.clone())?;
+    let (user_id, _source) = crate::cli::resolve_cache_user_id(
+        &auth,
+        &graph,
+        crate::cli::IdentityMode::AllowNetwork,
+    )
+    .await?;
+    let graph = match &user_id {
+        Some(uid) => graph.with_my_user_id(uid.clone()),
+        None => graph,
+    };
+    Ok((graph, user_id))
 }
 
 async fn run_daemon_inner(
@@ -2013,5 +2034,124 @@ mod tests {
         assert!(stop_daemon_at(&paths).await.unwrap());
         let _ = daemon_handle.await;
         server_handle.abort();
+    }
+
+    #[test]
+    fn user_compatibility_requires_a_known_daemon_user_when_the_caller_has_one() {
+        assert!(is_user_compatible(Some("user-1"), Some("user-1")));
+        assert!(is_user_compatible(Some(" user-1 "), Some("user-1")));
+        assert!(!is_user_compatible(Some("user-1"), Some("user-2")));
+        // A daemon in the anonymous bucket is not the caller's daemon.
+        assert!(!is_user_compatible(Some("user-1"), None));
+        assert!(!is_user_compatible(Some("user-1"), Some("  ")));
+        // A caller that does not know its user accepts any daemon.
+        assert!(is_user_compatible(None, Some("user-1")));
+        assert!(is_user_compatible(None, None));
+        assert!(is_user_compatible(Some(""), None));
+    }
+
+    #[tokio::test]
+    async fn daemon_selects_the_same_cache_as_the_cli_for_tokens_without_a_user_id() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Json, Router,
+        };
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::auth::StoredTokens;
+        use crate::config::{db_path, EnvVarGuard, TEST_ENV_LOCK};
+
+        // The identity map lives under the data directory.
+        let _lock = TEST_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_string_lossy().into_owned();
+        let _env = EnvVarGuard::set(&[("ONENOTE_DATA_DIR", Some(&data_dir))]);
+
+        let me_hits = Arc::new(AtomicUsize::new(0));
+        let hits = me_hits.clone();
+        let app = Router::new().route(
+            "/v1.0/me",
+            get(move |headers: HeaderMap| {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let known = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        == Some("Bearer tok-known");
+                    if known {
+                        (StatusCode::OK, Json(json!({ "id": "user-from-me" })))
+                    } else {
+                        (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "error": { "code": "AccessDenied", "message": "Forbidden" } })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tokens = |access_token: &str, user_id: Option<&str>| StoredTokens {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: user_id.map(str::to_string),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+
+        // 1. No user ID in the token and none recorded: GET /me supplies it.
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens("tok-known", None));
+        let (graph, daemon_user) = daemon_cache_identity(&cfg, auth.clone()).await.unwrap();
+        assert_eq!(daemon_user.as_deref(), Some("user-from-me"));
+        assert_eq!(graph.my_user_id(), Some("user-from-me"));
+        assert_eq!(me_hits.load(Ordering::SeqCst), 1);
+
+        // 2. The CLI/TUI resolution for the same token picks the same database file,
+        //    now from the recorded identity without another request.
+        let cli_graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let (cli_user, _) = crate::cli::resolve_cache_user_id(
+            &auth,
+            &cli_graph,
+            crate::cli::IdentityMode::LocalOnly,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cli_user, daemon_user);
+        assert_eq!(db_path(cli_user.as_deref()), db_path(daemon_user.as_deref()));
+        assert_ne!(db_path(daemon_user.as_deref()), db_path(None));
+        let (_, again) = daemon_cache_identity(&cfg, auth).await.unwrap();
+        assert_eq!(again.as_deref(), Some("user-from-me"));
+        assert_eq!(me_hits.load(Ordering::SeqCst), 1);
+
+        // 3. An account that cannot be identified stops the daemon instead of
+        //    sending it to the anonymous bucket.
+        let unknown = AuthManager::from_tokens(cfg.clone(), tokens("tok-unknown", None));
+        let err = daemon_cache_identity(&cfg, unknown).await.err().unwrap();
+        assert!(
+            format!("{err:#}").contains("Cannot select a cache for the current token"),
+            "unexpected error: {err:#}"
+        );
+
+        // 4. A token that carries its user ID behaves as before, with no request.
+        let before = me_hits.load(Ordering::SeqCst);
+        let direct = AuthManager::from_tokens(cfg.clone(), tokens("tok-direct", Some("user-direct")));
+        let (_, direct_user) = daemon_cache_identity(&cfg, direct).await.unwrap();
+        assert_eq!(direct_user.as_deref(), Some("user-direct"));
+        assert_eq!(me_hits.load(Ordering::SeqCst), before);
+
+        server.abort();
     }
 }

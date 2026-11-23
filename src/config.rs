@@ -206,130 +206,138 @@ pub struct AppConfig {
     pub pinned_notebooks: Vec<String>,
 }
 
+/// Settings supplied by environment variables for this process. They take
+/// precedence over `config.toml` while the process runs and are never written
+/// back to it by `AppConfig::save`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EnvOverrides {
+    client_id: Option<String>,
+    tenant_id: Option<String>,
+    graph_base_url: Option<String>,
+    auth_base_url: Option<String>,
+    github_repo: Option<String>,
+    token_file: Option<String>,
+    token_refresh_cmd: Option<String>,
+    token_refresh_mins: Option<u64>,
+    share_m365_auth: Option<bool>,
+    cli_cache_ttl_secs: Option<u64>,
+    auto_daemon: Option<bool>,
+    image_protocol: Option<ImageProtocolPreference>,
+}
+
+impl EnvOverrides {
+    fn apply_to(&self, cfg: &mut AppConfig) {
+        macro_rules! overlay {
+            ($($field:ident),+ $(,)?) => {$(
+                if let Some(value) = &self.$field {
+                    cfg.$field = value.clone();
+                }
+            )+};
+        }
+        overlay!(
+            client_id,
+            tenant_id,
+            graph_base_url,
+            auth_base_url,
+            github_repo,
+            token_file,
+            token_refresh_cmd,
+            token_refresh_mins,
+            share_m365_auth,
+            cli_cache_ttl_secs,
+            auto_daemon,
+            image_protocol,
+        );
+    }
+}
+
+fn process_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+fn first_non_empty(lookup: &impl Fn(&str) -> Option<String>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        lookup(key)
+            .map(|val| val.trim().to_string())
+            .filter(|val| !val.is_empty())
+    })
+}
+
+/// Reads the environment-driven settings through `lookup` (the process
+/// environment in production, a closure in tests).
+pub(crate) fn env_overrides(lookup: impl Fn(&str) -> Option<String>) -> EnvOverrides {
+    EnvOverrides {
+        client_id: first_non_empty(
+            &lookup,
+            &["ONENOTE_CLIENT_ID", "TEAMS_CLIENT_ID", "AZURE_CLIENT_ID"],
+        ),
+        tenant_id: first_non_empty(
+            &lookup,
+            &["ONENOTE_TENANT_ID", "TEAMS_TENANT_ID", "AZURE_TENANT_ID"],
+        ),
+        graph_base_url: first_non_empty(&lookup, &["ONENOTE_GRAPH_BASE_URL"]),
+        auth_base_url: first_non_empty(&lookup, &["ONENOTE_AUTH_BASE_URL"]),
+        github_repo: first_non_empty(&lookup, &["ONENOTE_GITHUB_REPO"]),
+        token_file: first_non_empty(&lookup, &["ONENOTE_TOKEN_FILE"]),
+        token_refresh_cmd: first_non_empty(&lookup, &["ONENOTE_TOKEN_REFRESH_CMD"]),
+        token_refresh_mins: lookup("ONENOTE_TOKEN_REFRESH_MINS")
+            .and_then(|s| s.trim().parse::<u64>().ok()),
+        share_m365_auth: lookup("ONENOTE_SHARE_M365_AUTH").and_then(|s| parse_env_bool(&s)),
+        cli_cache_ttl_secs: lookup("ONENOTE_CLI_CACHE_SECS")
+            .and_then(|s| s.trim().parse::<u64>().ok()),
+        auto_daemon: lookup("ONENOTE_AUTO_DAEMON").and_then(|s| parse_env_bool(&s)),
+        image_protocol: first_non_empty(
+            &lookup,
+            &["ONENOTE_IMAGE_PROTOCOL", "TEAMS_IMAGE_PROTOCOL"],
+        )
+        .and_then(|s| ImageProtocolPreference::parse_str(&s)),
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
+        let mut cfg = Self::builtin_defaults();
+        env_overrides(process_env).apply_to(&mut cfg);
+        cfg
+    }
+}
+
+impl AppConfig {
+    /// Defaults with no environment variable applied.
+    fn builtin_defaults() -> Self {
         Self {
-            client_id: first_non_empty_env(&[
-                "ONENOTE_CLIENT_ID",
-                "TEAMS_CLIENT_ID",
-                "AZURE_CLIENT_ID",
-            ])
-            .unwrap_or_else(|| DEFAULT_PUBLIC_CLIENT_ID.to_string()),
-            tenant_id: first_non_empty_env(&[
-                "ONENOTE_TENANT_ID",
-                "TEAMS_TENANT_ID",
-                "AZURE_TENANT_ID",
-            ])
-            .unwrap_or_else(|| DEFAULT_TENANT_ID.to_string()),
+            client_id: DEFAULT_PUBLIC_CLIENT_ID.to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_string(),
             scopes: Vec::new(),
-            graph_base_url: first_non_empty_env(&["ONENOTE_GRAPH_BASE_URL"])
-                .unwrap_or_else(|| DEFAULT_GRAPH_BASE_URL.to_string()),
-            auth_base_url: first_non_empty_env(&["ONENOTE_AUTH_BASE_URL"])
-                .unwrap_or_else(|| DEFAULT_AUTH_BASE_URL.to_string()),
-            github_repo: first_non_empty_env(&["ONENOTE_GITHUB_REPO"])
-                .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string()),
+            graph_base_url: DEFAULT_GRAPH_BASE_URL.to_string(),
+            auth_base_url: DEFAULT_AUTH_BASE_URL.to_string(),
+            github_repo: DEFAULT_GITHUB_REPO.to_string(),
             notify: true,
             show_nav_rail: true,
             inline_images: true,
             show_inline_hrefs: false,
-            image_protocol: first_non_empty_env(&[
-                "ONENOTE_IMAGE_PROTOCOL",
-                "TEAMS_IMAGE_PROTOCOL",
-            ])
-            .and_then(|s| ImageProtocolPreference::parse_str(&s))
-            .unwrap_or_default(),
+            image_protocol: ImageProtocolPreference::default(),
             download_dir: String::new(),
             active_poll_ms: 15_000,
             hierarchy_poll_ms: 60_000,
-            token_file: std::env::var("ONENOTE_TOKEN_FILE")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default(),
-            token_refresh_cmd: std::env::var("ONENOTE_TOKEN_REFRESH_CMD")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default(),
-            token_refresh_mins: std::env::var("ONENOTE_TOKEN_REFRESH_MINS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(5),
-            share_m365_auth: std::env::var("ONENOTE_SHARE_M365_AUTH")
-                .ok()
-                .and_then(|s| parse_env_bool(&s))
-                .unwrap_or(true),
-            cli_cache_ttl_secs: std::env::var("ONENOTE_CLI_CACHE_SECS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0),
-            auto_daemon: std::env::var("ONENOTE_AUTO_DAEMON")
-                .ok()
-                .and_then(|s| parse_env_bool(&s))
-                .unwrap_or(false),
+            token_file: String::new(),
+            token_refresh_cmd: String::new(),
+            token_refresh_mins: 5,
+            share_m365_auth: true,
+            cli_cache_ttl_secs: 0,
+            auto_daemon: false,
             density: DensityMode::default(),
             theme: ThemePreset::default(),
             pinned_notebooks: Vec::new(),
         }
     }
-}
 
-impl AppConfig {
     pub fn load() -> Self {
         let Ok(mut cfg) = Self::load_from(&config_file_path()) else {
             return Self::default();
         };
         // Environment variables take precedence over file values when set.
-        if let Some(cid) =
-            first_non_empty_env(&["ONENOTE_CLIENT_ID", "TEAMS_CLIENT_ID", "AZURE_CLIENT_ID"])
-        {
-            cfg.client_id = cid;
-        }
-        if let Some(tid) =
-            first_non_empty_env(&["ONENOTE_TENANT_ID", "TEAMS_TENANT_ID", "AZURE_TENANT_ID"])
-        {
-            cfg.tenant_id = tid;
-        }
-        if let Some(gurl) = first_non_empty_env(&["ONENOTE_GRAPH_BASE_URL"]) {
-            cfg.graph_base_url = gurl;
-        }
-        if let Some(aurl) = first_non_empty_env(&["ONENOTE_AUTH_BASE_URL"]) {
-            cfg.auth_base_url = aurl;
-        }
-        if let Some(repo) = first_non_empty_env(&["ONENOTE_GITHUB_REPO"]) {
-            cfg.github_repo = repo;
-        }
-        if let Some(tf) = first_non_empty_env(&["ONENOTE_TOKEN_FILE"]) {
-            cfg.token_file = tf;
-        }
-        if let Some(rcmd) = first_non_empty_env(&["ONENOTE_TOKEN_REFRESH_CMD"]) {
-            cfg.token_refresh_cmd = rcmd;
-        }
-        if let Ok(rmins) = std::env::var("ONENOTE_TOKEN_REFRESH_MINS") {
-            if let Ok(parsed) = rmins.trim().parse::<u64>() {
-                cfg.token_refresh_mins = parsed;
-            }
-        }
-        if let Ok(share) = std::env::var("ONENOTE_SHARE_M365_AUTH") {
-            if let Some(parsed) = parse_env_bool(&share) {
-                cfg.share_m365_auth = parsed;
-            }
-        }
-        if let Ok(ttl) = std::env::var("ONENOTE_CLI_CACHE_SECS") {
-            if let Ok(parsed) = ttl.trim().parse::<u64>() {
-                cfg.cli_cache_ttl_secs = parsed;
-            }
-        }
-        if let Ok(ad) = std::env::var("ONENOTE_AUTO_DAEMON") {
-            if let Some(parsed) = parse_env_bool(&ad) {
-                cfg.auto_daemon = parsed;
-            }
-        }
-        if let Some(proto) =
-            first_non_empty_env(&["ONENOTE_IMAGE_PROTOCOL", "TEAMS_IMAGE_PROTOCOL"])
-        {
-            if let Some(parsed) = ImageProtocolPreference::parse_str(&proto) {
-                cfg.image_protocol = parsed;
-            }
-        }
+        env_overrides(process_env).apply_to(&mut cfg);
         cfg
     }
 
@@ -340,10 +348,55 @@ impl AppConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
+    /// Writes `config.toml` without making environment values permanent: see
+    /// `for_saving`.
     pub fn save(&self) -> Result<()> {
-        self.save_to(&config_file_path())
+        let path = config_file_path();
+        self.for_saving(&env_overrides(process_env), &path)
+            .save_to(&path)
     }
 
+    /// The config to write to `path`. A field whose value still equals an active
+    /// environment override was not chosen by the user, so the value already in
+    /// the file (or the built-in default when the file or key is missing) is kept.
+    /// A field the program set to anything else is written as it is.
+    pub(crate) fn for_saving(&self, env: &EnvOverrides, path: &Path) -> Self {
+        let raw = fs::read_to_string(path).ok();
+        let stored_keys: Option<toml::Table> = raw.as_deref().and_then(|r| r.parse().ok());
+        let stored: Option<Self> = raw.as_deref().and_then(|r| toml::from_str(r).ok());
+        let builtin = Self::builtin_defaults();
+        let mut out = self.clone();
+        macro_rules! keep_stored {
+            ($($field:ident),+ $(,)?) => {$(
+                if env.$field.as_ref() == Some(&self.$field) {
+                    let in_file = stored_keys
+                        .as_ref()
+                        .is_some_and(|keys| keys.contains_key(stringify!($field)));
+                    out.$field = match &stored {
+                        Some(file_cfg) if in_file => file_cfg.$field.clone(),
+                        _ => builtin.$field.clone(),
+                    };
+                }
+            )+};
+        }
+        keep_stored!(
+            client_id,
+            tenant_id,
+            graph_base_url,
+            auth_base_url,
+            github_repo,
+            token_file,
+            token_refresh_cmd,
+            token_refresh_mins,
+            share_m365_auth,
+            cli_cache_ttl_secs,
+            auto_daemon,
+            image_protocol,
+        );
+        out
+    }
+
+    /// Raw write of exactly this struct.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         ensure_parent(path)?;
         let raw = toml::to_string_pretty(self).context("Failed to serialize config")?;
@@ -797,18 +850,6 @@ pub fn save_drafts_to(drafts: &HashMap<String, String>, path: &Path) -> Result<(
     write_atomic_0600(path, &bytes)
 }
 
-fn first_non_empty_env(keys: &[&str]) -> Option<String> {
-    for &key in keys {
-        if let Ok(val) = std::env::var(key) {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
 fn parse_env_bool(input: &str) -> Option<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -1194,5 +1235,111 @@ mod tests {
             lookup_identity_in(dir.path(), "tok-69").as_deref(),
             Some("user-69")
         );
+    }
+
+    fn fake_env(vars: &'static [(&'static str, &'static str)]) -> EnvOverrides {
+        env_overrides(|key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn env_overrides_follow_key_precedence_and_ignore_unparsable_values() {
+        let env = fake_env(&[
+            ("ONENOTE_CLIENT_ID", "  "),
+            ("TEAMS_CLIENT_ID", " teams-client "),
+            ("AZURE_CLIENT_ID", "azure-client"),
+            ("ONENOTE_TOKEN_FILE", "C:/tok.txt"),
+            ("ONENOTE_TOKEN_REFRESH_MINS", "abc"),
+            ("ONENOTE_CLI_CACHE_SECS", " 30 "),
+            ("ONENOTE_AUTO_DAEMON", "on"),
+            ("ONENOTE_SHARE_M365_AUTH", "maybe"),
+            ("TEAMS_IMAGE_PROTOCOL", "sixel"),
+        ]);
+        assert_eq!(env.client_id.as_deref(), Some("teams-client"));
+        assert_eq!(env.tenant_id, None);
+        assert_eq!(env.token_file.as_deref(), Some("C:/tok.txt"));
+        assert_eq!(env.token_refresh_mins, None);
+        assert_eq!(env.cli_cache_ttl_secs, Some(30));
+        assert_eq!(env.auto_daemon, Some(true));
+        assert_eq!(env.share_m365_auth, None);
+        assert_eq!(env.image_protocol, Some(ImageProtocolPreference::Sixel));
+
+        let mut cfg = AppConfig::builtin_defaults();
+        env.apply_to(&mut cfg);
+        assert_eq!(cfg.client_id, "teams-client");
+        assert_eq!(cfg.tenant_id, DEFAULT_TENANT_ID);
+        assert_eq!(cfg.token_refresh_mins, 5);
+        assert!(cfg.auto_daemon);
+        assert!(cfg.share_m365_auth);
+        assert_eq!(fake_env(&[]), EnvOverrides::default());
+    }
+
+    #[test]
+    fn save_keeps_file_values_for_fields_that_only_came_from_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "token_file = \"\"\ngraph_base_url = \"https://graph.example/v1.0\"\nauto_daemon = false\nimage_protocol = \"auto\"\n",
+        )
+        .unwrap();
+        let env = fake_env(&[
+            ("ONENOTE_TOKEN_FILE", "C:/one-off/token.txt"),
+            ("ONENOTE_GRAPH_BASE_URL", "http://127.0.0.1:9/v1.0"),
+            ("ONENOTE_AUTO_DAEMON", "1"),
+            ("ONENOTE_IMAGE_PROTOCOL", "kitty"),
+            ("ONENOTE_TENANT_ID", "env-tenant"),
+        ]);
+
+        // What a process sees after `load`: file values with the overrides on top,
+        // plus a setting the user changed in the UI.
+        let mut running = AppConfig::load_from(&path).unwrap();
+        env.apply_to(&mut running);
+        running.notify = false;
+        assert_eq!(running.token_file, "C:/one-off/token.txt");
+
+        let written = running.for_saving(&env, &path);
+        assert_eq!(written.token_file, "");
+        assert_eq!(written.graph_base_url, "https://graph.example/v1.0");
+        assert!(!written.auto_daemon);
+        assert_eq!(written.image_protocol, ImageProtocolPreference::Auto);
+        // `tenant_id` is not in the file: the built-in default is written, not the env value.
+        assert_eq!(written.tenant_id, DEFAULT_TENANT_ID);
+        assert!(!written.notify, "the user's own change is still saved");
+
+        // A value set deliberately to something other than the env value is written.
+        running.token_file = "D:/chosen/token.txt".to_string();
+        running.tenant_id = "contoso.example".to_string();
+        let written = running.for_saving(&env, &path);
+        assert_eq!(written.token_file, "D:/chosen/token.txt");
+        assert_eq!(written.tenant_id, "contoso.example");
+    }
+
+    #[test]
+    fn save_without_a_file_or_without_env_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("config.toml");
+        let env = fake_env(&[
+            ("ONENOTE_TOKEN_FILE", "C:/one-off/token.txt"),
+            ("ONENOTE_CLI_CACHE_SECS", "45"),
+            ("ONENOTE_SHARE_M365_AUTH", "0"),
+        ]);
+        let mut running = AppConfig::builtin_defaults();
+        env.apply_to(&mut running);
+        assert_eq!(running.cli_cache_ttl_secs, 45);
+
+        // Missing file + env: built-in defaults are written.
+        assert_eq!(running.for_saving(&env, &missing), AppConfig::builtin_defaults());
+
+        // No env override active: the struct is written unchanged.
+        running.download_dir = "D:/notes".to_string();
+        assert_eq!(running.for_saving(&EnvOverrides::default(), &missing), running);
+        let path = dir.path().join("written.toml");
+        running.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_from(&path).unwrap().token_file, "C:/one-off/token.txt");
+        assert_eq!(running.for_saving(&EnvOverrides::default(), &path), running);
     }
 }

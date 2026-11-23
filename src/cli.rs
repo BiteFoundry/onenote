@@ -1323,14 +1323,17 @@ pub(crate) enum IdentityMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum IdentitySource {
+pub(crate) enum IdentitySource {
     NoToken,
     Token,
     IdentityMap,
     GraphMe,
 }
 
-async fn resolve_cache_user_id(
+/// Selects the cache bucket for the current token: token claim, then the local
+/// identity map, then `GET /me`. Shared by the CLI/TUI/MCP runtime and the daemon
+/// so they all open the same database file.
+pub(crate) async fn resolve_cache_user_id(
     auth: &AuthManager,
     graph: &GraphClient,
     mode: IdentityMode,
