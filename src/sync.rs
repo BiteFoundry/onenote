@@ -319,6 +319,9 @@ async fn sync_hierarchy_and_sections(
         .summary)
 }
 
+/// One section and the result of listing its pages (pages, whether more exist).
+type SectionPagesFetch = (OnenoteSection, Result<(Vec<OnenotePageSummary>, bool)>);
+
 async fn sync_hierarchy_and_sections_inner(
     graph: &GraphClient,
     storage: &Storage,
@@ -430,7 +433,7 @@ async fn sync_hierarchy_and_sections_inner(
 
     let attempted_sections = sections_to_sync.len();
     let page_limit = section_pages_limit(graph);
-    let results: Vec<(OnenoteSection, Result<(Vec<OnenotePageSummary>, bool)>)> =
+    let results: Vec<SectionPagesFetch> =
         stream::iter(sections_to_sync.into_iter().map(|sec| async move {
             let res = graph
                 .list_onenote_pages_with_more(&sec.scope, &sec.id, page_limit)
@@ -3444,8 +3447,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "sync-test-token".to_string(),
             refresh_token: None,

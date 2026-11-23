@@ -1371,20 +1371,15 @@ mod tests {
             Arc,
         };
 
+        type MockResponse = (HttpStatus, [(&'static str, &'static str); 1], Json<serde_json::Value>);
+        type MockFuture = std::pin::Pin<Box<dyn std::future::Future<Output = MockResponse> + Send>>;
+
         // Each route fails its first request with the given status, then succeeds.
         fn counted(
             hits: &Arc<AtomicUsize>,
             first: HttpStatus,
             then: HttpStatus,
-        ) -> impl Fn() -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = (HttpStatus, [(&'static str, &'static str); 1], Json<serde_json::Value>),
-                    > + Send,
-            >,
-        > + Clone
-               + Send
-               + 'static {
+        ) -> impl Fn() -> MockFuture + Clone + Send + 'static {
             let hits = hits.clone();
             move || {
                 let hits = hits.clone();
@@ -1437,8 +1432,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "retry-test-token".into(),
             refresh_token: None,

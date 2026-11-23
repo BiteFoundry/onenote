@@ -2098,8 +2098,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = |access_token: &str, user_id: Option<&str>| StoredTokens {
             access_token: access_token.to_string(),
             refresh_token: None,

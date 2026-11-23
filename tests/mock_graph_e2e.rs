@@ -5206,8 +5206,7 @@ async fn e2e_create_page_is_not_replayed_after_gateway_timeout() {
         None,
     )
     .await
-    .err()
-    .expect("a 504 on page creation must fail instead of being replayed");
+    .expect_err("a 504 on page creation must fail instead of being replayed");
     assert_eq!(*mock_state.page_post_hits.lock().unwrap(), 1);
     assert!(
         format!("{err:#}").contains("The request may have been applied; check before retrying."),
