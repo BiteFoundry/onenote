@@ -342,7 +342,7 @@ impl GraphOnenotePage {
             .title
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "(제목 없음)".to_string());
+            .unwrap_or_else(|| "(Untitled)".to_string());
 
         OnenotePageSummary {
             page_key,
@@ -2178,7 +2178,7 @@ mod tests {
             .unwrap();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].page_key, "me|pg-1");
-        assert_eq!(pages[0].title, "(제목 없음)");
+        assert_eq!(pages[0].title, "(Untitled)");
         assert_eq!(pages[0].section_id, "sec-1");
 
         // 5. Page detail fetch + XHTML parse

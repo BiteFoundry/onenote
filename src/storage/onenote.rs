@@ -1801,7 +1801,7 @@ fn build_onenote_snippet(
     } else {
         section_name
             .or(notebook_name)
-            .unwrap_or("(내용 없음)")
+            .unwrap_or("(No content)")
             .to_string()
     };
 

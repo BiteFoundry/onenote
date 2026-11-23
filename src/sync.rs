@@ -1322,7 +1322,7 @@ async fn run_open_page_content_poll(
                         section_name: None,
                         notebook_id: None,
                         notebook_name: None,
-                        title: "(제목 없음)".to_string(),
+                        title: "(Untitled)".to_string(),
                         level: 0,
                         order: 0,
                         created_at: None,

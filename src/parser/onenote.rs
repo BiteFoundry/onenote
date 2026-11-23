@@ -233,7 +233,7 @@ pub fn onenote_blocks_to_markdown(blocks: &[OnenoteBlock]) -> String {
             }
             OnenoteBlockKind::Attachment { name, src, .. } => {
                 let line = if src.trim().is_empty() {
-                    format!("[첨부: {name}]")
+                    format!("[Attachment: {name}]")
                 } else {
                     format!("[📎 {name}]({src})")
                 };
@@ -360,11 +360,11 @@ pub fn onenote_blocks_to_plain(blocks: &[OnenoteBlock]) -> String {
                 alt,
                 ..
             } => match alt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(a) => parts.push(format!("[이미지 #{}: {a}]", resource_index + 1)),
-                None => parts.push(format!("[이미지 #{}]", resource_index + 1)),
+                Some(a) => parts.push(format!("[Image #{}: {a}]", resource_index + 1)),
+                None => parts.push(format!("[Image #{}]", resource_index + 1)),
             },
             OnenoteBlockKind::Attachment { name, .. } => {
-                parts.push(format!("[첨부: {name}]"));
+                parts.push(format!("[Attachment: {name}]"));
             }
             OnenoteBlockKind::Divider => {
                 parts.push("---".to_string());
@@ -863,7 +863,7 @@ impl OnenoteXhtmlParser {
             }
             OnenoteBlockKind::Attachment { name, src, .. } => {
                 let text = if src.trim().is_empty() {
-                    format!("[첨부: {name}]")
+                    format!("[Attachment: {name}]")
                 } else {
                     format!("[📎 {name}]({src})")
                 };
@@ -4122,7 +4122,7 @@ mod tests {
   </body>
 </html>"#;
 
-        let detail = parse_onenote_page_xhtml(sample_summary("(제목 없음)"), raw_xhtml);
+        let detail = parse_onenote_page_xhtml(sample_summary("(Untitled)"), raw_xhtml);
 
         assert_eq!(detail.summary.title, "v0.3.0 아키텍처 회의록");
         assert!(detail.summary.has_todo);
@@ -4267,7 +4267,7 @@ mod tests {
         assert!(matches!(detail.blocks[10].kind, OnenoteBlockKind::Divider));
         assert!(detail.body_markdown.contains("- [ ] XHTML 파서 작성"));
         assert!(detail.body_markdown.contains("- [x] <u>*모델 정의*</u> 확정"));
-        assert!(detail.body_plain.contains("[첨부: spec.pdf]"));
+        assert!(detail.body_plain.contains("[Attachment: spec.pdf]"));
     }
 
     #[test]
