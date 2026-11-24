@@ -205,16 +205,16 @@ pub async fn handle_request_value(
 pub fn tool_definitions() -> Vec<Value> {
     let update_block = json!({
         "name": "update_block",
-        "description": "Replace a block with Markdown, edit a block text substring, or update the page title/body. Get current Graph element IDs and baseline content from get_page.",
+        "description": "Replace a block with Markdown, edit a block text substring, or update page title/body. Call get_page(fields: [\"blocks\"]) for current Graph element_ids without pulling full raw_xhtml.",
         "inputSchema": {
             "type": "object",
             "required": ["page"],
             "properties": {
-                "page": { "type": "string" },
+                "page": { "type": "string", "description": "Page ID, page_key, or exact title from list_pages" },
                 "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
-                "block_id": { "type": "string", "description": "Graph element ID from get_page (e.g. `p:{...}`)" },
-                "title": { "type": "string" },
-                "markdown": { "type": "string" },
+                "block_id": { "type": "string", "description": "Graph element_id from get_page(fields: [\"blocks\"]) (e.g. `p:{...}`)" },
+                "title": { "type": "string", "description": "New page title when renaming the page" },
+                "markdown": { "type": "string", "description": "Replacement Markdown for block_id or full page body" },
                 "replace_text": { "type": "string", "description": "Exact text to replace in block_id; provide with_text and omit markdown" },
                 "with_text": { "type": "string", "description": "New text for replace_text" },
                 "expected_content": { "type": "string", "description": "Baseline block/page content from prior read; aborts with conflict if remote changed" },
@@ -225,7 +225,7 @@ pub fn tool_definitions() -> Vec<Value> {
     });
     let mut update_page = update_block.clone();
     update_page["name"] = json!("update_page");
-    update_page["description"] = json!("Alias for update_block. Update a page title or body, replace a block, or edit text within a block.");
+    update_page["description"] = json!("Alias for update_block. Update a page title/body, replace a block, or edit block text; use get_page(fields: [\"blocks\"]) for current element_ids without pulling full raw_xhtml.");
     vec![
         json!({
             "name": "whoami",
@@ -239,7 +239,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "include_teams": { "type": "boolean", "description": "Include Microsoft Teams/Group shared notebooks (one extra Graph request per joined Team)" },
-                    "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 },
+                    "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000, "description": "Maximum notebooks to return per page (1-1000, default 50)" },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" },
                     "refresh": { "type": "boolean", "description": "Ignore any cached answer and refetch from Microsoft Graph. Costs extra Graph requests; use only when results look stale." },
                     "offline": { "type": "boolean", "description": "Read the local SQLite cache only: no network, may be stale." }
@@ -253,7 +253,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "notebook": { "type": "string", "description": "Optional notebook key, ID, or display name" },
-                    "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 },
+                    "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000, "description": "Maximum sections to return per page (1-1000, default 50)" },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" },
                     "refresh": { "type": "boolean", "description": "Ignore any cached answer and refetch from Microsoft Graph. Costs extra Graph requests; use only when results look stale." },
                     "offline": { "type": "boolean", "description": "Read the local SQLite cache only: no network, may be stale." }
@@ -267,8 +267,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "required": ["section"],
                 "properties": {
-                    "section": { "type": "string" },
-                    "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000 },
+                    "section": { "type": "string", "description": "Notebook/Section path, section name, ID, or scoped key from list_sections" },
+                    "limit": { "type": "integer", "default": 50, "minimum": 1, "maximum": 1000, "description": "Maximum pages to return per page (1-1000, default 50)" },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" },
                     "refresh": { "type": "boolean", "description": "Ignore any cached answer and refetch from Microsoft Graph. Costs extra Graph requests; use only when results look stale." },
                     "offline": { "type": "boolean", "description": "Read the local SQLite cache only: no network, may be stale." }
@@ -296,14 +296,14 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_notebook",
-            "description": "Create a new Microsoft OneNote notebook.",
+            "description": "Create a new OneNote notebook under /me by default, or in a Microsoft 365 Group or SharePoint site when group_id or site_id is set.",
             "inputSchema": {
                 "type": "object",
                 "required": ["name"],
                 "properties": {
-                    "name": { "type": "string" },
-                    "group_id": { "type": "string" },
-                    "site_id": { "type": "string" }
+                    "name": { "type": "string", "description": "Display name for the new notebook" },
+                    "group_id": { "type": "string", "description": "Optional Microsoft 365 Group/Team ID for a shared notebook (exclusive with site_id)" },
+                    "site_id": { "type": "string", "description": "Optional SharePoint site ID for a site notebook (exclusive with group_id)" }
                 }
             }
         }),
@@ -314,21 +314,21 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "required": ["drive_id", "item_id", "name"],
                 "properties": {
-                    "drive_id": { "type": "string" },
+                    "drive_id": { "type": "string", "description": "OneDrive or SharePoint drive ID hosting the notebook" },
                     "item_id": { "type": "string", "description": "DriveItem ID with package.type oneNote" },
-                    "name": { "type": "string" }
+                    "name": { "type": "string", "description": "New display name for the notebook" }
                 }
             }
         }),
         json!({
             "name": "create_section",
-            "description": "Create a new OneNote section inside a notebook.",
+            "description": "Create a new OneNote section inside an existing notebook (pass a notebook ID, key, or display name from list_notebooks).",
             "inputSchema": {
                 "type": "object",
                 "required": ["notebook", "name"],
                 "properties": {
-                    "notebook": { "type": "string" },
-                    "name": { "type": "string" }
+                    "notebook": { "type": "string", "description": "Target notebook ID, key, or display name from list_notebooks" },
+                    "name": { "type": "string", "description": "Display name for the new section" }
                 }
             }
         }),
@@ -353,7 +353,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["page_id", "level"],
                 "properties": {
                     "page_id": { "type": "string", "description": "Full Page ID from desktop GetHierarchy" },
-                    "level": { "type": "integer", "minimum": 0, "maximum": 2 }
+                    "level": { "type": "integer", "minimum": 0, "maximum": 2, "description": "Target subpage indentation level (0=top-level, 1=subpage, 2=sub-subpage)" }
                 }
             }
         }),
@@ -366,21 +366,21 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["section_id", "name"],
                 "properties": {
                     "section_id": { "type": "string", "description": "Full Section ID from desktop GetHierarchy" },
-                    "name": { "type": "string" }
+                    "name": { "type": "string", "description": "New display name for the section" }
                 }
             }
         }),
         json!({
             "name": "create_page",
-            "description": "Create a new OneNote page from Markdown with optional local inline image paths.",
+            "description": "Create a new OneNote page from Markdown and optional local images inside a target section (from list_sections).",
             "inputSchema": {
                 "type": "object",
                 "required": ["section", "title"],
                 "properties": {
-                    "section": { "type": "string" },
-                    "title": { "type": "string" },
-                    "markdown": { "type": "string" },
-                    "image_paths": { "type": "array", "items": { "type": "string" } },
+                    "section": { "type": "string", "description": "Target Notebook/Section path, section name, ID, or key from list_sections" },
+                    "title": { "type": "string", "description": "Display title for the new page" },
+                    "markdown": { "type": "string", "description": "Optional Markdown body content for the new page" },
+                    "image_paths": { "type": "array", "items": { "type": "string" }, "description": "Optional local file paths of images to embed inline" },
                     "level": { "type": "integer", "minimum": 0, "maximum": 0, "description": "Top-level page (0 or omitted)" }
                 }
             }
@@ -401,15 +401,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "append_page",
-            "description": "Append Markdown blocks and optional inline images to an existing OneNote page.",
+            "description": "Append Markdown and optional local images to the bottom of an existing page (target by page ID, page_key, or title from list_pages) without overwriting existing content.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page", "markdown"],
                 "properties": {
-                    "page": { "type": "string" },
+                    "page": { "type": "string", "description": "Page ID, page_key, or exact title from list_pages" },
                     "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
-                    "markdown": { "type": "string" },
-                    "image_paths": { "type": "array", "items": { "type": "string" } },
+                    "markdown": { "type": "string", "description": "Markdown content appended to the bottom of the page" },
+                    "image_paths": { "type": "array", "items": { "type": "string" }, "description": "Optional local file paths of images to append inline" },
                     "compact": { "type": "boolean", "default": true, "description": "Default true. Set false to include the full page object in the response." }
                 }
             }
@@ -418,15 +418,15 @@ pub fn tool_definitions() -> Vec<Value> {
         update_page,
         json!({
             "name": "toggle_todo",
-            "description": "Set or toggle a OneNote checkbox by block_id or zero-based todo_index.",
+            "description": "Set or toggle a OneNote checkbox by block_id or zero-based todo_index from get_page(fields: [\"blocks\"]).",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
                 "properties": {
-                    "page": { "type": "string" },
+                    "page": { "type": "string", "description": "Page ID, page_key, or exact title from list_pages" },
                     "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
-                    "block_id": { "type": "string" },
-                    "todo_index": { "type": "integer", "minimum": 0 },
+                    "block_id": { "type": "string", "description": "Graph element_id of the to-do block from get_page" },
+                    "todo_index": { "type": "integer", "minimum": 0, "description": "Zero-based index of the to-do item from get_page" },
                     "completed": { "type": "boolean", "description": "Set this state; omit to toggle" },
                     "expected_content": { "type": "string", "description": "Baseline to-do block content from prior read; aborts with conflict if remote changed" },
                     "force": { "type": "boolean", "description": "Override conflict check when true" },
@@ -436,14 +436,14 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "delete_page",
-            "description": "Delete a OneNote page. Requires `confirm: true` to prevent accidental deletion.",
+            "description": "Permanently delete a page in OneNote. Irreversible; requires confirm: true to prevent accidental deletion.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page", "confirm"],
                 "properties": {
-                    "page": { "type": "string" },
+                    "page": { "type": "string", "description": "Page ID, page_key, or exact title from list_pages" },
                     "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
-                    "confirm": { "type": "boolean" }
+                    "confirm": { "type": "boolean", "description": "Must be true to permanently delete the page" }
                 }
             }
         }),
@@ -454,10 +454,10 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "required": ["query"],
                 "properties": {
-                    "query": { "type": "string" },
+                    "query": { "type": "string", "description": "Full-text search query using local SQLite FTS5 syntax" },
                     "section": { "type": "string", "description": "Optional section name or Notebook/Section path to filter results" },
                     "refresh": { "type": "boolean", "description": "Run a full account sync before searching. Expensive: many Graph requests." },
-                    "limit": { "type": "integer", "default": 30, "minimum": 1, "maximum": 1000 },
+                    "limit": { "type": "integer", "default": 30, "minimum": 1, "maximum": 1000, "description": "Maximum search hits to return per page (1-1000, default 30)" },
                     "cursor": { "type": "string", "description": "next_cursor from the previous response" }
                 }
             }
@@ -469,8 +469,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "required": ["page"],
                 "properties": {
-                    "page": { "type": "string" },
-                    "index": { "type": "integer", "minimum": 0 },
+                    "page": { "type": "string", "description": "Page ID, page_key, or exact title from list_pages" },
+                    "index": { "type": "integer", "minimum": 0, "description": "Zero-based resource index from get_page(fields: [\"resources\"]) (default 0)" },
                     "out_dir": { "type": "string", "description": "Optional destination directory" }
                 }
             }
@@ -1180,6 +1180,38 @@ mod tests {
             .unwrap_or_default()
             .trim()
             .is_empty());
+    }
+
+    #[test]
+    fn every_tool_property_has_non_empty_description() {
+        let list = handle_protocol_value(&json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .expect("tools/list handled")
+        .expect("tools/list returns response");
+        let tools = list["result"]["tools"].as_array().expect("tools array");
+        assert!(!tools.is_empty());
+
+        for tool in tools {
+            let tool_name = tool["name"].as_str().expect("tool name");
+            let props = tool["inputSchema"]["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{tool_name} inputSchema.properties missing"));
+            for (prop_name, prop_schema) in props {
+                let desc = prop_schema
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                assert!(
+                    !desc.is_empty(),
+                    "{tool_name}.{prop_name} is missing a non-empty description"
+                );
+            }
+        }
     }
 
     fn sample_page_detail() -> crate::models::OnenotePageDetail {
