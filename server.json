@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.BiteFoundry/onenote",
+  "title": "Microsoft OneNote (TUI, CLI & MCP)",
+  "description": "Microsoft OneNote MCP server, CLI, and TUI in Rust with local SQLite FTS5 cache & block edits.",
+  "version": "0.4.2",
+  "websiteUrl": "https://bitefoundry.dev/#app-onenote",
+  "repository": {
+    "url": "https://github.com/BiteFoundry/onenote",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/bitefoundry/onenote:0.4.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ONENOTE_ACCESS_TOKEN",
+          "description": "Microsoft Graph delegated bearer token for Microsoft OneNote.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "TEAMS_TOKEN_FILE",
+          "description": "Optional shared Microsoft Graph token file path.",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
