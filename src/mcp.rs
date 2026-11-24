@@ -277,7 +277,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_page",
-            "description": "Read a OneNote page. Returns compact Markdown and identifiers by default; set compact:false for parsed blocks (element_id, data-tag), plain text, raw XHTML and embedded resources. Fetches the page content from Microsoft Graph on each call; offline:true returns the cached copy. compact:false responses can be large.",
+            "description": "Read a OneNote page. Returns compact Markdown by default; pass fields (e.g. [\"blocks\",\"resources\"]) to fetch specific fields without full raw_xhtml, or compact:false for everything. Fetches from Microsoft Graph unless offline:true; compact:false can be large.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -285,7 +285,12 @@ pub fn tool_definitions() -> Vec<Value> {
                     "page": { "type": "string", "description": "Page key, ID, or title" },
                     "section": { "type": "string", "description": "Optional section name, Notebook/Section path, ID, or scoped key to narrow title lookup" },
                     "offline": { "type": "boolean", "description": "Return the cached copy of the page without contacting Microsoft Graph." },
-                    "compact": { "type": "boolean", "default": true, "description": "Default true. Set false for blocks[].element_id, raw_xhtml and resources." }
+                    "compact": { "type": "boolean", "default": true, "description": "Default true. Set false for blocks[].element_id, raw_xhtml and resources." },
+                    "fields": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of specific page fields to return (e.g. blocks, resources, body_markdown, body_plain, raw_xhtml, primary_div_id, web_url, created_at, content_url, summary). Always includes id, page_key, and title; unknown names are returned in missing_fields."
+                    }
                 }
             }
         }),
@@ -559,16 +564,23 @@ async fn dispatch_tool(
             let page = required_str(args, "page")?;
             let section = args.get("section").and_then(Value::as_str);
             let offline = args.get("offline").and_then(Value::as_bool).unwrap_or(false);
+            let fields = parse_optional_string_array(args, "fields")?;
             let resolved_page =
                 cli::resolve_page_query_in_section(storage, graph, page, section, offline).await?;
             let detail = cli::load_onenote_page_detail(storage, graph, &resolved_page, offline).await?;
-            let compact = args
-                .get("compact")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            let page_json = match fields {
+                Some(ref selected) if !selected.is_empty() => project_page_fields(&detail, selected),
+                _ => {
+                    let compact = args
+                        .get("compact")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    cli::page_content_json(&detail, compact, cli::PageSurface::Mcp)
+                }
+            };
             Ok(json!({
                 "ok": true,
-                "page": cli::page_content_json(&detail, compact, cli::PageSurface::Mcp),
+                "page": page_json,
             }))
         }
         "create_notebook" | "onenote_create_notebook" => {
@@ -921,6 +933,81 @@ fn string_array(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn parse_optional_string_array(args: &Value, key: &str) -> Result<Option<Vec<String>>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(s) = item.as_str() else {
+                    bail!("{key} must be an array of strings");
+                };
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => bail!("{key} must be an array of strings"),
+    }
+}
+
+fn project_page_fields(detail: &crate::models::OnenotePageDetail, fields: &[String]) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("id".to_string(), json!(detail.summary.id));
+    map.insert("page_key".to_string(), json!(detail.summary.page_key));
+    map.insert("title".to_string(), json!(detail.summary.title));
+
+    let mut missing: Vec<String> = Vec::new();
+    for raw_field in fields {
+        let field = raw_field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let value = match field {
+            "id" | "summary.id" => Some(json!(detail.summary.id)),
+            "page_key" | "summary.page_key" => Some(json!(detail.summary.page_key)),
+            "title" | "summary.title" => Some(json!(detail.summary.title)),
+            "summary" => Some(json!(detail.summary)),
+            "scope" | "summary.scope" => Some(json!(detail.summary.scope)),
+            "section_id" | "summary.section_id" => Some(json!(detail.summary.section_id)),
+            "section_name" | "summary.section_name" => Some(json!(detail.summary.section_name)),
+            "notebook_id" | "summary.notebook_id" => Some(json!(detail.summary.notebook_id)),
+            "notebook_name" | "summary.notebook_name" => Some(json!(detail.summary.notebook_name)),
+            "level" | "summary.level" => Some(json!(detail.summary.level)),
+            "order" | "summary.order" => Some(json!(detail.summary.order)),
+            "created_at" | "summary.created_at" => Some(json!(detail.summary.created_at)),
+            "last_modified_at" | "summary.last_modified_at" => {
+                Some(json!(detail.summary.last_modified_at))
+            }
+            "content_url" | "summary.content_url" => Some(json!(detail.summary.content_url)),
+            "web_url" | "summary.web_url" => Some(json!(detail.summary.web_url)),
+            "preview_text" | "summary.preview_text" => Some(json!(detail.summary.preview_text)),
+            "has_todo" | "summary.has_todo" => Some(json!(detail.summary.has_todo)),
+            "raw_xhtml" => Some(json!(detail.raw_xhtml)),
+            "body_markdown" => Some(json!(detail.body_markdown)),
+            "body_plain" => Some(json!(detail.body_plain)),
+            "blocks" => Some(json!(detail.blocks)),
+            "resources" => Some(json!(detail.resources)),
+            "primary_div_id" => Some(json!(detail.primary_div_id)),
+            "synced_at" => Some(json!(detail.synced_at)),
+            _ => None,
+        };
+        if let Some(val) = value {
+            let out_key = field.strip_prefix("summary.").unwrap_or(field);
+            map.insert(out_key.to_string(), val);
+        } else if !missing.iter().any(|m| m == field) {
+            missing.push(field.to_string());
+        }
+    }
+
+    if !missing.is_empty() {
+        map.insert("missing_fields".to_string(), json!(missing));
+    }
+    Value::Object(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,5 +1170,189 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("full binary"));
+
+        let get_page = find("get_page");
+        let fields_prop = &get_page["inputSchema"]["properties"]["fields"];
+        assert_eq!(fields_prop["type"], "array");
+        assert_eq!(fields_prop["items"]["type"], "string");
+        assert!(!fields_prop["description"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .is_empty());
+    }
+
+    fn sample_page_detail() -> crate::models::OnenotePageDetail {
+        use crate::models::{
+            OnenoteBlock, OnenoteBlockKind, OnenotePageDetail, OnenotePageSummary,
+            OnenoteResource, OnenoteScope, OnenoteTagKind, RichSpan,
+        };
+        OnenotePageDetail {
+            summary: OnenotePageSummary {
+                page_key: "me|page-42".to_string(),
+                id: "page-42".to_string(),
+                scope: OnenoteScope::Me,
+                section_id: "sec-1".to_string(),
+                section_name: Some("Notes".to_string()),
+                notebook_id: Some("nb-1".to_string()),
+                notebook_name: Some("Work".to_string()),
+                title: "Architecture Spec".to_string(),
+                level: 0,
+                order: 3,
+                created_at: Some("2026-01-01T00:00:00Z".to_string()),
+                last_modified_at: Some("2026-01-02T12:00:00Z".to_string()),
+                content_url: Some("https://graph.microsoft.com/v1.0/me/onenote/pages/page-42/content".to_string()),
+                web_url: Some("https://onedrive.live.com/page-42".to_string()),
+                preview_text: Some("Short preview".to_string()),
+                has_todo: true,
+            },
+            raw_xhtml: "<html><body><p id=\"p:{1}\">Huge raw HTML</p></body></html>".to_string(),
+            body_markdown: "# Architecture Spec\n- [ ] Ship fields projection".to_string(),
+            body_plain: "Architecture Spec\nShip fields projection".to_string(),
+            blocks: vec![OnenoteBlock {
+                element_id: Some("p:{1}".to_string()),
+                tag: Some(OnenoteTagKind::Todo { completed: false }),
+                raw_html: Some("<p id=\"p:{1}\" data-tag=\"to-do\">Ship fields projection</p>".to_string()),
+                kind: OnenoteBlockKind::Paragraph {
+                    spans: vec![RichSpan::plain("Ship fields projection")],
+                },
+            }],
+            resources: vec![OnenoteResource {
+                element_id: Some("img:{2}".to_string()),
+                resource_url: "https://graph.microsoft.com/v1.0/me/onenote/resources/res-1/$value".to_string(),
+                fullres_url: None,
+                mime_type: "image/png".to_string(),
+                file_name: Some("diagram.png".to_string()),
+                is_image: true,
+                alt_text: Some("System diagram".to_string()),
+            }],
+            primary_div_id: Some("div:{root}".to_string()),
+            synced_at: Some("2026-01-02T12:05:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn get_page_fields_projection_returns_requested_fields_without_raw_xhtml() {
+        let detail = sample_page_detail();
+        let projected = project_page_fields(
+            &detail,
+            &[
+                "blocks".to_string(),
+                "resources".to_string(),
+                "summary.created_at".to_string(),
+                "web_url".to_string(),
+                "primary_div_id".to_string(),
+            ],
+        );
+
+        assert_eq!(projected["id"], "page-42");
+        assert_eq!(projected["page_key"], "me|page-42");
+        assert_eq!(projected["title"], "Architecture Spec");
+        assert_eq!(projected["blocks"].as_array().unwrap().len(), 1);
+        assert_eq!(projected["blocks"][0]["element_id"], "p:{1}");
+        assert_eq!(projected["resources"].as_array().unwrap().len(), 1);
+        assert_eq!(projected["resources"][0]["file_name"], "diagram.png");
+        assert_eq!(projected["created_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(projected["web_url"], "https://onedrive.live.com/page-42");
+        assert_eq!(projected["primary_div_id"], "div:{root}");
+
+        assert!(projected.get("raw_xhtml").is_none());
+        assert!(projected.get("body_markdown").is_none());
+        assert!(projected.get("body_plain").is_none());
+        assert!(projected.get("missing_fields").is_none());
+    }
+
+    #[test]
+    fn get_page_fields_projection_reports_unknown_fields_in_missing_fields() {
+        let detail = sample_page_detail();
+        let projected = project_page_fields(
+            &detail,
+            &[
+                "body_markdown".to_string(),
+                "client_url".to_string(),
+                "created_by".to_string(),
+                "client_url".to_string(),
+            ],
+        );
+
+        assert_eq!(projected["id"], "page-42");
+        assert_eq!(projected["title"], "Architecture Spec");
+        assert_eq!(
+            projected["body_markdown"],
+            "# Architecture Spec\n- [ ] Ship fields projection"
+        );
+        assert_eq!(projected["missing_fields"], json!(["client_url", "created_by"]));
+        assert!(projected.get("raw_xhtml").is_none());
+    }
+
+    #[test]
+    fn parse_optional_string_array_validates_types() {
+        assert_eq!(parse_optional_string_array(&json!({}), "fields").unwrap(), None);
+        assert_eq!(
+            parse_optional_string_array(&json!({"fields": null}), "fields").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_optional_string_array(&json!({"fields": [" blocks ", "", "web_url"]}), "fields")
+                .unwrap(),
+            Some(vec!["blocks".to_string(), "web_url".to_string()])
+        );
+        assert!(parse_optional_string_array(&json!({"fields": "blocks"}), "fields").is_err());
+        assert!(parse_optional_string_array(&json!({"fields": ["blocks", 42]}), "fields").is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_get_page_handler_supports_offline_fields_projection() {
+        let detail = sample_page_detail();
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_onenote_page_detail(&detail).unwrap();
+
+        let cfg = AppConfig::default();
+        let auth = crate::auth::AuthManager::from_tokens(
+            cfg.clone(),
+            crate::auth::StoredTokens {
+                access_token: "test-token".to_string(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".to_string(),
+                tenant_id: "tid".to_string(),
+                user_id: Some("user-1".to_string()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "access_token".to_string(),
+            },
+        );
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+
+        let resp = handle_request_value(
+            &cfg,
+            &graph,
+            &storage,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_page",
+                    "arguments": {
+                        "page": "me|page-42",
+                        "offline": true,
+                        "fields": ["blocks", "web_url", "nonexistent_meta"]
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("tools/call returns response");
+
+        assert_eq!(resp["result"]["isError"], false);
+        let page = &resp["result"]["structuredContent"]["page"];
+        assert_eq!(page["id"], "page-42");
+        assert_eq!(page["title"], "Architecture Spec");
+        assert_eq!(page["blocks"].as_array().unwrap().len(), 1);
+        assert_eq!(page["web_url"], "https://onedrive.live.com/page-42");
+        assert_eq!(page["missing_fields"], json!(["nonexistent_meta"]));
+        assert!(page.get("raw_xhtml").is_none());
+        assert!(page.get("body_markdown").is_none());
     }
 }

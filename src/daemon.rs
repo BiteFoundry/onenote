@@ -574,41 +574,67 @@ fn cleanup_owned_files(paths: &DaemonPaths, our_secret: &str, sock_path: Option<
     let _ = sock_path;
 }
 
+#[cfg(any(unix, windows, test))]
+fn config_dir_short_hash(config_dir: &Path) -> String {
+    let canonical = crate::config::canonicalize_existing_ancestor(config_dir);
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(canonical.to_string_lossy().as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    digest[..12].to_string()
+}
+
 #[cfg(windows)]
 fn select_windows_pipe_name(config_dir: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(config_dir.to_string_lossy().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
+    let short_hash = config_dir_short_hash(config_dir);
     format!(r"\\.\pipe\onenote-cli-daemon-{short_hash}")
 }
 
-#[cfg(unix)]
-fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
+#[cfg(any(unix, test))]
+fn path_byte_len(path: &Path) -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().len()
+    }
+    #[cfg(not(unix))]
+    {
+        path.as_os_str().len()
+    }
+}
 
+#[cfg(any(unix, test))]
+fn select_unix_socket_path_with_xdg(config_dir: &Path, xdg_runtime_dir: Option<&str>) -> PathBuf {
     let candidate = config_dir.join("onenote-daemon.sock");
-    if candidate.as_os_str().as_bytes().len() <= 90 {
+    if path_byte_len(&candidate) <= 90 {
         return candidate;
     }
 
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            let xdg_candidate = PathBuf::from(trimmed)
-                .join("onenote-cli")
-                .join("onenote-daemon.sock");
-            if xdg_candidate.as_os_str().as_bytes().len() <= 90 {
-                return xdg_candidate;
-            }
+    let short_hash = config_dir_short_hash(config_dir);
+
+    if let Some(trimmed) = xdg_runtime_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        let xdg_candidate = PathBuf::from(trimmed)
+            .join("onenote-cli")
+            .join(format!("onenote-daemon-{short_hash}.sock"));
+        if path_byte_len(&xdg_candidate) <= 90 {
+            return xdg_candidate;
         }
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(config_dir.as_os_str().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
     PathBuf::from(format!("/tmp/onenote-cli-{short_hash}/onenote-daemon.sock"))
+}
+
+#[cfg(any(unix, test))]
+fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    select_unix_socket_path_with_xdg(config_dir, xdg.as_deref())
 }
 
 #[cfg(unix)]
@@ -2155,5 +2181,54 @@ mod tests {
         assert_eq!(me_hits.load(Ordering::SeqCst), before);
 
         server.abort();
+    }
+
+    #[test]
+    fn unix_socket_path_isolates_long_profiles_in_xdg_and_tmp_using_canonical_hash() {
+        let short = Path::new("/tmp/short-cfg");
+        assert_eq!(
+            select_unix_socket_path_with_xdg(short, Some("/run/user/1000")),
+            short.join("onenote-daemon.sock")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let deep = "a".repeat(85);
+        let profile_a = dir.path().join(&deep).join("profile-a");
+        let profile_b = dir.path().join(&deep).join("profile-b");
+
+        let xdg_a = select_unix_socket_path_with_xdg(&profile_a, Some("/run/user/1000"));
+        let xdg_b = select_unix_socket_path_with_xdg(&profile_b, Some("/run/user/1000"));
+        assert_ne!(xdg_a, xdg_b, "distinct long-path profiles must not collide in XDG_RUNTIME_DIR");
+        let hash_a = config_dir_short_hash(&profile_a);
+        let hash_b = config_dir_short_hash(&profile_b);
+        assert_ne!(hash_a, hash_b);
+        assert_eq!(
+            xdg_a,
+            PathBuf::from("/run/user/1000")
+                .join("onenote-cli")
+                .join(format!("onenote-daemon-{hash_a}.sock"))
+        );
+        assert_eq!(
+            xdg_b,
+            PathBuf::from("/run/user/1000")
+                .join("onenote-cli")
+                .join(format!("onenote-daemon-{hash_b}.sock"))
+        );
+
+        // Fallback to /tmp when XDG_RUNTIME_DIR is absent or too long.
+        let tmp_a = select_unix_socket_path_with_xdg(&profile_a, None);
+        assert_eq!(
+            tmp_a,
+            PathBuf::from(format!("/tmp/onenote-cli-{hash_a}/onenote-daemon.sock"))
+        );
+        let huge_xdg = format!("/{}", "r".repeat(80));
+        assert_eq!(
+            select_unix_socket_path_with_xdg(&profile_a, Some(&huge_xdg)),
+            tmp_a
+        );
+
+        // Direct env-based wrapper runs cleanly as well.
+        let via_env = select_unix_socket_path(&profile_a);
+        assert!(via_env.to_string_lossy().contains(&hash_a));
     }
 }

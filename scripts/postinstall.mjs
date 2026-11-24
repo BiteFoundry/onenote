@@ -252,7 +252,18 @@ export function runPostinstall(options = {}) {
   return { skipped: false, platform, linked };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function resolveRealPath(targetPath) {
+  try {
+    return fs.realpathSync(targetPath);
+  } catch {
+    return path.resolve(targetPath);
+  }
+}
+
+if (
+  process.argv[1] &&
+  resolveRealPath(process.argv[1]) === resolveRealPath(fileURLToPath(import.meta.url))
+) {
   try {
     runPostinstall();
   } catch {
