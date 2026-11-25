@@ -60,6 +60,7 @@ pub enum Action {
     OverlaySubmit,
     CloseOverlay,
     StartInlineEdit,
+    InlineToggleMode,
     InlineSave,
     InlineClose,
     OpenOverlay(OverlayKind),
@@ -217,6 +218,12 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     // Route actions to the active in-place inline canvas editor when no modal overlay is open.
     if ui.overlays.is_empty() && ui.inline_editor.is_some() {
         match &action {
+            Action::InlineToggleMode => {
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.toggle_mode();
+                }
+                return false;
+            }
             Action::InlineSave => {
                 app.flush_inline_editor(ui, false);
                 return false;
@@ -236,6 +243,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             } => {
                 if let Some(ref mut ed) = ui.inline_editor {
                     ed.handle_click(*col, *row);
+                }
+                return false;
+            }
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::InlineToggleMode),
+                ..
+            } => {
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.toggle_mode();
                 }
                 return false;
             }
@@ -1199,6 +1215,12 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
             app.open_inline_editor(ui, Some(ui.onenote_selected_block));
             false
         }
+        Action::InlineToggleMode => {
+            if let Some(ref mut ed) = ui.inline_editor {
+                ed.toggle_mode();
+            }
+            false
+        }
         Action::InlineSave => {
             app.flush_inline_editor(ui, false);
             false
@@ -1454,6 +1476,12 @@ fn handle_mouse_click(
                         form.focus_cancel_button();
                     }
                     dispatch(Action::CloseOverlay, app, ui)
+                }
+                ButtonId::InlineToggleMode => {
+                    if let Some(ref mut ed) = ui.inline_editor {
+                        ed.toggle_mode();
+                    }
+                    false
                 }
                 ButtonId::InlineSave => {
                     app.flush_inline_editor(ui, false);

@@ -64,6 +64,9 @@ pub fn key_to_action(
         if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
             return Some(Action::InlineSave);
         }
+        if ctrl && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) {
+            return Some(Action::InlineToggleMode);
+        }
         if ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z')) {
             return Some(Action::Undo);
         }

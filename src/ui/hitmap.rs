@@ -39,6 +39,7 @@ pub enum ButtonId {
     FormSubmit,
     FormCancel,
     // Inline canvas editor buttons
+    InlineToggleMode,
     InlineSave,
     InlineDone,
 }
