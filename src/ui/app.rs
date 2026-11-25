@@ -171,6 +171,7 @@ pub enum UiMsg {
         seq: u64,
         page_key: String,
         title: String,
+        mime_type: Option<String>,
         html: String,
     },
     HtmlServed {
@@ -361,6 +362,20 @@ pub struct AppState {
 pub fn is_html_resource_meta(mime_type: Option<&str>, file_name: Option<&str>) -> bool {
     bitefoundry_html::sniff_content_kind(mime_type, file_name, None)
         == bitefoundry_html::ContentKind::Html
+}
+
+/// Returns `true` when MIME type or file name identifies a Markdown resource (`.md`/`.markdown`/`.mdx` or `text/markdown`).
+pub fn is_markdown_resource_meta(mime_type: Option<&str>, file_name: Option<&str>) -> bool {
+    bitefoundry_html::sniff_content_kind(mime_type, file_name, None)
+        == bitefoundry_html::ContentKind::Markdown
+}
+
+/// Returns `true` when MIME type or file name identifies a previewable HTML or Markdown resource.
+pub fn is_markup_resource_meta(mime_type: Option<&str>, file_name: Option<&str>) -> bool {
+    matches!(
+        bitefoundry_html::sniff_content_kind(mime_type, file_name, None),
+        bitefoundry_html::ContentKind::Html | bitefoundry_html::ContentKind::Markdown
+    )
 }
 
 /// Sniffs downloaded preview bytes via `bitefoundry_html::sniff_content_kind`; returns decoded HTML string
@@ -894,7 +909,7 @@ impl AppState {
         });
     }
 
-    /// Fetches a `.html`/`.htm` OneNote resource and opens it in `Overlay::HtmlPreview`.
+    /// Fetches a `.html`/`.htm`/`.md` OneNote resource and opens it in `Overlay::HtmlPreview`.
     pub fn spawn_load_html_resource(&mut self, resource_idx: usize, ui: &mut UiState) {
         let Some(detail) = self.active_page_detail() else {
             ui.warn("No page loaded");
@@ -911,6 +926,7 @@ impl AppState {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&res.resource_url)
             .to_string();
+        let is_md = is_markdown_resource_meta(Some(&res.mime_type), res.file_name.as_deref());
         let title = res
             .file_name
             .as_deref()
@@ -918,29 +934,49 @@ impl AppState {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| format!("resource-{}.html", resource_idx + 1));
+            .unwrap_or_else(|| {
+                if is_md {
+                    format!("resource-{}.md", resource_idx + 1)
+                } else {
+                    format!("resource-{}.html", resource_idx + 1)
+                }
+            });
+        let res_mime = res.mime_type.clone();
         self.html_resource_seq = self.html_resource_seq.wrapping_add(1);
         let seq = self.html_resource_seq;
         self.active_html_resource_req = Some((seq, page_key.clone()));
-        let task_id = ui.tasks.start(format!("Loading HTML '{title}'"));
+        let kind_label = if is_md { "Markdown" } else { "HTML" };
+        let task_id = ui.tasks.start(format!("Loading {kind_label} '{title}'"));
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             match graph.fetch_onenote_resource_bytes(&url).await {
-                Ok((_, bytes)) => {
+                Ok((fetched_mime, bytes)) => {
+                    let effective_mime = if fetched_mime.trim().is_empty()
+                        || fetched_mime.eq_ignore_ascii_case("application/octet-stream")
+                    {
+                        if res_mime.trim().is_empty() {
+                            None
+                        } else {
+                            Some(res_mime)
+                        }
+                    } else {
+                        Some(fetched_mime)
+                    };
                     let html = String::from_utf8_lossy(&bytes).into_owned();
                     let _ = tx.send(UiMsg::HtmlResourceLoaded {
                         task_id,
                         seq,
                         page_key,
                         title,
+                        mime_type: effective_mime,
                         html,
                     });
                 }
                 Err(err) => {
                     let _ = tx.send(UiMsg::TaskFailed {
                         task_id,
-                        error: format!("Failed to load HTML resource: {err}"),
+                        error: format!("Failed to load {kind_label} resource: {err}"),
                     });
                 }
             }
@@ -1918,6 +1954,7 @@ impl AppState {
                 seq,
                 page_key,
                 title,
+                mime_type,
                 html,
             } => {
                 ui.tasks.finish(task_id);
@@ -1928,12 +1965,23 @@ impl AppState {
                     && self.active_page_key.as_deref() == Some(page_key.as_str());
                 if is_current {
                     self.active_html_resource_req = None;
-                    ui.overlays.push(Overlay::HtmlPreview(
+                    let kind = bitefoundry_html::sniff_content_kind(
+                        mime_type.as_deref(),
+                        Some(title.as_str()),
+                        Some(html.as_bytes()),
+                    );
+                    let overlay = if kind == bitefoundry_html::ContentKind::Markdown {
+                        crate::ui::overlays::html_preview::HtmlPreviewOverlay::new_markdown(
+                            Some(title),
+                            html,
+                        )
+                    } else {
                         crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
                             Some(title),
                             html,
-                        ),
-                    ));
+                        )
+                    };
+                    ui.overlays.push(Overlay::HtmlPreview(overlay));
                 }
             }
             UiMsg::HtmlServed { url } => match open::that(&url) {

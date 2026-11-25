@@ -3,6 +3,10 @@
 use std::borrow::Cow;
 
 use anyhow::{bail, Context, Result};
+use bitefoundry_html::pulldown_cmark::{
+    BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+    TextMergeStream,
+};
 use chrono::Utc;
 use scraper::{ElementRef, Html, Node, Selector};
 use uuid::Uuid;
@@ -1909,7 +1913,7 @@ fn tag_inline_prefix_plain(tag: &OnenoteTagKind) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 2. GFM Markdown -> Valid OneNote XHTML Fragment Compiler
+// 2. GFM Markdown -> Valid OneNote XHTML Fragment Compiler (pulldown-cmark)
 // ---------------------------------------------------------------------------
 
 /// Converts GitHub-flavored Markdown + inline image references into a clean,
@@ -1919,204 +1923,17 @@ pub fn markdown_to_onenote_html_fragment(
     inline_images: &[InlineImageUpload],
 ) -> String {
     let normalized = markdown.replace("\r\n", "\n");
-    let lines: Vec<&str> = normalized.split('\n').collect();
-    let mut blocks: Vec<String> = Vec::new();
-    let mut i = 0;
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_GFM;
 
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed_start = line.trim_start();
-        let trimmed = line.trim();
-
-        // Blank line
-        if trimmed.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Fenced code block: ```lang ... ```
-        if let Some(fence_rest) = trimmed_start.strip_prefix("```") {
-            let lang = fence_rest.trim();
-            i += 1;
-            let mut code_lines = Vec::new();
-            while i < lines.len() {
-                if lines[i].trim_start().starts_with("```") {
-                    i += 1;
-                    break;
-                }
-                code_lines.push(lines[i]);
-                i += 1;
-            }
-            let escaped_code = escape_xml(&code_lines.join("\n"));
-            if lang.is_empty() {
-                blocks.push(format!("<pre><code>{escaped_code}</code></pre>"));
-            } else {
-                blocks.push(format!(
-                    "<pre><code class=\"language-{}\">{escaped_code}</code></pre>",
-                    escape_xml_attr(lang)
-                ));
-            }
-            continue;
-        }
-
-        // GFM Pipe Table: | A | B | \n | --- | --- |
-        if i + 1 < lines.len() && is_gfm_table_start(line, lines[i + 1]) {
-            let header_cells = split_gfm_table_cells(line);
-            let col_count = header_cells.len();
-            i += 2; // consume header + separator line
-
-            let mut table_html = String::from("<table border=\"1\"><tr>");
-            for hc in &header_cells {
-                table_html.push_str("<th>");
-                table_html.push_str(&render_onenote_inline(hc));
-                table_html.push_str("</th>");
-            }
-            table_html.push_str("</tr>");
-
-            while i < lines.len() {
-                let row_line = lines[i];
-                if row_line.trim().is_empty()
-                    || !row_line.contains('|')
-                    || row_line.trim_start().starts_with("```")
-                {
-                    break;
-                }
-                let row_cells = split_gfm_table_cells(row_line);
-                table_html.push_str("<tr>");
-                for col_idx in 0..col_count {
-                    table_html.push_str("<td>");
-                    if let Some(cell_text) = row_cells.get(col_idx) {
-                        table_html.push_str(&render_onenote_inline(cell_text));
-                    }
-                    table_html.push_str("</td>");
-                }
-                table_html.push_str("</tr>");
-                i += 1;
-            }
-            table_html.push_str("</table>");
-            blocks.push(table_html);
-            continue;
-        }
-
-        // Horizontal rule: ---, ***, ___
-        if is_horizontal_rule(trimmed) {
-            blocks.push("<hr />".to_string());
-            i += 1;
-            continue;
-        }
-
-        // ATX Heading: # .. ######
-        if let Some((level, heading_body)) = parse_atx_heading(trimmed_start) {
-            let (tag_attr, clean_body) = match parse_tag_prefix(heading_body) {
-                Some((data_tag, rest)) => (format!(" data-tag=\"{data_tag}\""), rest),
-                None => (String::new(), heading_body),
-            };
-            blocks.push(format!(
-                "<h{level}{tag_attr}>{}</h{level}>",
-                render_onenote_inline(clean_body)
-            ));
-            i += 1;
-            continue;
-        }
-
-        // Top-level task list item: - [ ] text / * [ ] text / - [x] text / - [X] text
-        if leading_indent_spaces(line) < 2 {
-            if let Some((completed, task_text)) = parse_task_list_line(trimmed_start) {
-                let tag_val = if completed {
-                    "to-do:completed"
-                } else {
-                    "to-do"
-                };
-                blocks.push(format!(
-                    "<p data-tag=\"{tag_val}\">{}</p>",
-                    render_onenote_inline(task_text)
-                ));
-                i += 1;
-                continue;
-            }
-        }
-
-        // Tag prefix paragraph: [★] / [!IMPORTANT] / [?] / etc.
-        if let Some((data_tag, rest_text)) = parse_tag_prefix(trimmed_start) {
-            blocks.push(format!(
-                "<p data-tag=\"{data_tag}\">{}</p>",
-                render_onenote_inline(rest_text)
-            ));
-            i += 1;
-            continue;
-        }
-
-        // Blockquote: > ...
-        if trimmed_start.starts_with("> ") || trimmed_start == ">" {
-            let mut quote_lines = Vec::new();
-            while i < lines.len() {
-                let qt = lines[i].trim_start();
-                if qt.starts_with("> ") || qt == ">" {
-                    let content = qt
-                        .strip_prefix("> ")
-                        .or_else(|| qt.strip_prefix('>'))
-                        .unwrap_or("");
-                    quote_lines.push(render_onenote_inline(content));
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            blocks.push(format!(
-                "<blockquote>{}</blockquote>",
-                quote_lines.join("<br />")
-            ));
-            continue;
-        }
-
-        // Unordered or ordered list (including nested indented items)
-        if parse_list_item_line(line, false).is_some() {
-            let mut list_items = Vec::new();
-            while i < lines.len() {
-                let allow_top_task = false;
-                if let Some(item) = parse_list_item_line(lines[i], allow_top_task) {
-                    list_items.push(item);
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            let mut cursor = 0;
-            while cursor < list_items.len() {
-                let base_indent = list_items[cursor].indent;
-                blocks.push(build_nested_list_xhtml(&list_items, &mut cursor, base_indent));
-            }
-            continue;
-        }
-
-        // Standard paragraph until next block boundary
-        let mut para_lines = Vec::new();
-        while i < lines.len() {
-            let cur = lines[i];
-            let cur_ts = cur.trim_start();
-            let cur_t = cur.trim();
-            if cur_t.is_empty()
-                || cur_ts.starts_with("```")
-                || is_horizontal_rule(cur_t)
-                || parse_atx_heading(cur_ts).is_some()
-                || (leading_indent_spaces(cur) < 2 && parse_task_list_line(cur_ts).is_some())
-                || parse_tag_prefix(cur_ts).is_some()
-                || cur_ts.starts_with("> ")
-                || cur_ts == ">"
-                || parse_list_item_line(cur, false).is_some()
-                || (i + 1 < lines.len() && is_gfm_table_start(cur, lines[i + 1]))
-            {
-                break;
-            }
-            para_lines.push(render_onenote_inline(cur.trim_end()));
-            i += 1;
-        }
-        if !para_lines.is_empty() {
-            blocks.push(format!("<p>{}</p>", para_lines.join("<br />")));
-        }
+    let mut compiler = OnenoteXhtmlCompiler::default();
+    let stream = TextMergeStream::new(Parser::new_ext(&normalized, opts));
+    for event in stream {
+        compiler.handle_event(event);
     }
-
-    let mut fragment = blocks.join("");
+    let mut fragment = compiler.finish();
 
     // Append any inline_images not already referenced via `name:{temp_id}`
     for img in inline_images {
@@ -2143,45 +1960,835 @@ pub fn markdown_to_onenote_html_fragment(
 }
 
 #[derive(Debug)]
-struct ParsedListLine<'a> {
-    indent: usize,
-    ordered: bool,
+struct RenderedListItem {
     task_tag: Option<&'static str>,
-    content: &'a str,
+    html: String,
+    has_nested_block: bool,
 }
 
-fn leading_indent_spaces(line: &str) -> usize {
-    let mut count = 0;
-    for ch in line.chars() {
-        match ch {
-            ' ' => count += 1,
-            '\t' => count += 2,
-            _ => break,
-        }
-    }
-    count
+#[derive(Debug)]
+struct ParagraphState {
+    segments: Vec<(Option<&'static str>, String)>,
+    current_tag: Option<&'static str>,
+    current_html: String,
+    at_line_start: bool,
+    pending_soft_break: bool,
+    allow_tag_split: bool,
+    open_u: usize,
 }
 
-fn parse_task_list_line(trimmed_start: &str) -> Option<(bool, &str)> {
-    let after_bullet = trimmed_start
-        .strip_prefix("- ")
-        .or_else(|| trimmed_start.strip_prefix("* "))
-        .or_else(|| trimmed_start.strip_prefix("+ "))?;
-    let rest_trim = after_bullet.trim_start();
-    if let Some(after_box) = rest_trim.strip_prefix("[ ]") {
-        if after_box.is_empty() || after_box.starts_with(char::is_whitespace) {
-            return Some((false, after_box.trim_start()));
+impl ParagraphState {
+    fn new(allow_tag_split: bool) -> Self {
+        Self {
+            segments: Vec::new(),
+            current_tag: None,
+            current_html: String::new(),
+            at_line_start: true,
+            pending_soft_break: false,
+            allow_tag_split,
+            open_u: 0,
         }
     }
-    if let Some(after_box) = rest_trim
-        .strip_prefix("[x]")
-        .or_else(|| rest_trim.strip_prefix("[X]"))
-    {
-        if after_box.is_empty() || after_box.starts_with(char::is_whitespace) {
-            return Some((true, after_box.trim_start()));
+
+    fn flush_pending_break(&mut self) {
+        if self.pending_soft_break {
+            self.current_html.push_str("<br />");
+            self.pending_soft_break = false;
+        }
+    }
+
+    fn close_open_u(&mut self) {
+        while self.open_u > 0 {
+            self.current_html.push_str("</u>");
+            self.open_u -= 1;
+        }
+    }
+
+    fn finish(mut self) -> Vec<(Option<&'static str>, String)> {
+        self.close_open_u();
+        if !self.current_html.is_empty() || self.current_tag.is_some() || self.segments.is_empty() {
+            self.segments.push((self.current_tag, self.current_html));
+        }
+        self.segments
+    }
+}
+
+#[derive(Debug)]
+struct BlockQuoteState {
+    kind: Option<BlockQuoteKind>,
+    buf: String,
+    para_count: usize,
+    has_non_para_block: bool,
+    first_para_inner: Option<String>,
+    seen_any_content: bool,
+}
+
+#[derive(Debug)]
+struct ListState {
+    ordered: bool,
+    start: Option<u64>,
+    is_top_level: bool,
+    items: Vec<RenderedListItem>,
+}
+
+#[derive(Debug)]
+struct ListItemState {
+    task_tag: Option<&'static str>,
+    buf: String,
+    para_count: usize,
+    has_nested_block: bool,
+    open_u: usize,
+}
+
+#[derive(Debug)]
+struct HeadingState {
+    level: u8,
+    tag_attr: Option<&'static str>,
+    buf: String,
+    at_start: bool,
+    open_u: usize,
+}
+
+#[derive(Debug)]
+struct CodeBlockState {
+    lang: String,
+    buf: String,
+}
+
+#[derive(Debug)]
+struct ImageCapture {
+    dest_url: String,
+    alt: String,
+}
+
+#[derive(Debug)]
+enum ContainerFrame {
+    BlockQuote(BlockQuoteState),
+    List(ListState),
+    ListItem(ListItemState),
+    Heading(HeadingState),
+    Paragraph(ParagraphState),
+    CodeBlock(CodeBlockState),
+    Table {
+        buf: String,
+        in_head: bool,
+        cell_open_u: usize,
+    },
+}
+
+#[derive(Default)]
+struct OnenoteXhtmlCompiler {
+    root: String,
+    frames: Vec<ContainerFrame>,
+    inline_depth: usize,
+    link_open_stack: Vec<bool>,
+    image_capture: Option<ImageCapture>,
+}
+
+impl OnenoteXhtmlCompiler {
+    fn finish(mut self) -> String {
+        while let Some(frame) = self.frames.pop() {
+            self.finalize_frame(frame);
+        }
+        self.root
+    }
+
+    fn append_block_html(&mut self, html: &str) {
+        if let Some(parent) = self.frames.last_mut() {
+            match parent {
+                ContainerFrame::BlockQuote(bq) => {
+                    bq.seen_any_content = true;
+                    bq.has_non_para_block = true;
+                    bq.buf.push_str(html);
+                }
+                ContainerFrame::ListItem(item) => {
+                    item.has_nested_block = true;
+                    item.buf.push_str(html);
+                }
+                ContainerFrame::Table { buf, .. } => buf.push_str(html),
+                ContainerFrame::Paragraph(p) => {
+                    p.flush_pending_break();
+                    p.at_line_start = false;
+                    p.current_html.push_str(html);
+                }
+                ContainerFrame::Heading(h) => {
+                    h.at_start = false;
+                    h.buf.push_str(html);
+                }
+                ContainerFrame::CodeBlock(cb) => cb.buf.push_str(html),
+                ContainerFrame::List(_) => self.root.push_str(html),
+            }
+        } else {
+            self.root.push_str(html);
+        }
+    }
+
+    fn append_inline_raw(&mut self, html: &str) {
+        if let Some(frame) = self.frames.last_mut() {
+            match frame {
+                ContainerFrame::Paragraph(p) => {
+                    p.flush_pending_break();
+                    p.at_line_start = false;
+                    p.current_html.push_str(html);
+                }
+                ContainerFrame::Heading(h) => {
+                    h.at_start = false;
+                    h.buf.push_str(html);
+                }
+                ContainerFrame::ListItem(item) => {
+                    item.buf.push_str(html);
+                }
+                ContainerFrame::Table { buf, .. } => {
+                    buf.push_str(html);
+                }
+                ContainerFrame::BlockQuote(bq) => {
+                    bq.seen_any_content = true;
+                    bq.buf.push_str(html);
+                }
+                ContainerFrame::CodeBlock(cb) => cb.buf.push_str(html),
+                ContainerFrame::List(_) => self.root.push_str(html),
+            }
+        } else {
+            self.root.push_str(html);
+        }
+    }
+
+    fn open_u_mut(&mut self) -> Option<&mut usize> {
+        match self.frames.last_mut() {
+            Some(ContainerFrame::Paragraph(p)) => Some(&mut p.open_u),
+            Some(ContainerFrame::Heading(h)) => Some(&mut h.open_u),
+            Some(ContainerFrame::ListItem(item)) => Some(&mut item.open_u),
+            Some(ContainerFrame::Table { cell_open_u, .. }) => Some(cell_open_u),
+            _ => None,
+        }
+    }
+
+    fn handle_event(&mut self, event: Event<'_>) {
+        // When capturing image alt text, collect plain text/code into `image_capture.alt`.
+        if self.image_capture.is_some() {
+            match event {
+                Event::Text(t) | Event::Code(t) => {
+                    if let Some(ref mut img) = self.image_capture {
+                        img.alt.push_str(&t);
+                    }
+                    return;
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if let Some(ref mut img) = self.image_capture {
+                        img.alt.push(' ');
+                    }
+                    return;
+                }
+                Event::End(TagEnd::Image) => {
+                    if let Some(img) = self.image_capture.take() {
+                        if is_safe_onenote_image_src(&img.dest_url) {
+                            let tag = format!(
+                                "<img src=\"{}\" alt=\"{}\" />",
+                                escape_xml_attr(&img.dest_url),
+                                escape_xml_attr(&img.alt)
+                            );
+                            self.append_inline_raw(&tag);
+                        } else if !img.alt.is_empty() {
+                            self.append_inline_raw(&escape_xml(&img.alt));
+                        }
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        match event {
+            Event::Start(tag) => self.handle_start_tag(tag),
+            Event::End(tag_end) => self.handle_end_tag(tag_end),
+            Event::Text(text) => self.handle_text(&text),
+            Event::Code(code) => {
+                let html = format!("<code>{}</code>", escape_xml(&code));
+                self.append_inline_raw(&html);
+            }
+            Event::SoftBreak => {
+                if let Some(ContainerFrame::Paragraph(p)) = self.frames.last_mut() {
+                    if p.allow_tag_split && self.inline_depth == 0 {
+                        p.pending_soft_break = true;
+                        p.at_line_start = true;
+                    } else if !p.current_html.is_empty() || !p.at_line_start {
+                        p.current_html.push_str("<br />");
+                    }
+                } else if matches!(self.frames.last(), Some(ContainerFrame::CodeBlock(_))) {
+                    if let Some(ContainerFrame::CodeBlock(cb)) = self.frames.last_mut() {
+                        cb.buf.push('\n');
+                    }
+                } else {
+                    self.append_inline_raw("<br />");
+                }
+            }
+            Event::HardBreak => {
+                self.append_inline_raw("<br />");
+            }
+            Event::Rule => {
+                self.append_block_html("<hr />");
+            }
+            Event::TaskListMarker(checked) => {
+                let tag = if checked {
+                    "to-do:completed"
+                } else {
+                    "to-do"
+                };
+                for frame in self.frames.iter_mut().rev() {
+                    if let ContainerFrame::ListItem(item) = frame {
+                        if item.task_tag.is_none() {
+                            item.task_tag = Some(tag);
+                        }
+                        break;
+                    }
+                }
+            }
+            Event::InlineHtml(raw) => {
+                let trimmed = raw.trim();
+                if is_inline_br_tag(trimmed) {
+                    self.append_inline_raw("<br />");
+                } else if trimmed.eq_ignore_ascii_case("<u>") {
+                    self.append_inline_raw("<u>");
+                    if let Some(u) = self.open_u_mut() {
+                        *u += 1;
+                    }
+                } else if trimmed.eq_ignore_ascii_case("</u>") {
+                    let can_close = self.open_u_mut().is_some_and(|u| {
+                        if *u > 0 {
+                            *u -= 1;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if can_close {
+                        self.append_inline_raw("</u>");
+                    }
+                } else {
+                    self.append_inline_raw(&escape_xml(&raw));
+                }
+            }
+            Event::Html(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                if is_inline_br_tag(trimmed) {
+                    if self.frames.is_empty() {
+                        self.append_block_html("<p><br /></p>");
+                    } else {
+                        self.append_inline_raw("<br />");
+                    }
+                } else if self.frames.is_empty()
+                    || matches!(
+                        self.frames.last(),
+                        Some(ContainerFrame::BlockQuote(_) | ContainerFrame::ListItem(_))
+                    )
+                {
+                    let escaped = format!("<p>{}</p>", escape_xml(trimmed));
+                    self.append_block_html(&escaped);
+                } else {
+                    self.append_inline_raw(&escape_xml(&raw));
+                }
+            }
+            Event::InlineMath(math) | Event::DisplayMath(math) => {
+                let html = format!("<code>{}</code>", escape_xml(&math));
+                self.append_inline_raw(&html);
+            }
+            Event::FootnoteReference(label) => {
+                let html = format!("<sup>[{}]</sup>", escape_xml(&label));
+                self.append_inline_raw(&html);
+            }
+        }
+    }
+
+    fn handle_start_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => {
+                let allow_tag_split = self.frames.is_empty();
+                self.frames
+                    .push(ContainerFrame::Paragraph(ParagraphState::new(allow_tag_split)));
+            }
+            Tag::Heading { level, .. } => {
+                let lvl = match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                };
+                self.frames.push(ContainerFrame::Heading(HeadingState {
+                    level: lvl,
+                    tag_attr: None,
+                    buf: String::new(),
+                    at_start: true,
+                    open_u: 0,
+                }));
+            }
+            Tag::BlockQuote(kind) => {
+                self.frames.push(ContainerFrame::BlockQuote(BlockQuoteState {
+                    kind,
+                    buf: String::new(),
+                    para_count: 0,
+                    has_non_para_block: false,
+                    first_para_inner: None,
+                    seen_any_content: false,
+                }));
+            }
+            Tag::CodeBlock(kind) => {
+                let lang = match kind {
+                    CodeBlockKind::Fenced(info) => info
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+                self.frames.push(ContainerFrame::CodeBlock(CodeBlockState {
+                    lang,
+                    buf: String::new(),
+                }));
+            }
+            Tag::List(start) => {
+                let is_top_level = self.frames.is_empty();
+                self.frames.push(ContainerFrame::List(ListState {
+                    ordered: start.is_some(),
+                    start,
+                    is_top_level,
+                    items: Vec::new(),
+                }));
+            }
+            Tag::Item => {
+                self.frames.push(ContainerFrame::ListItem(ListItemState {
+                    task_tag: None,
+                    buf: String::new(),
+                    para_count: 0,
+                    has_nested_block: false,
+                    open_u: 0,
+                }));
+            }
+            Tag::Table(_) => {
+                self.frames.push(ContainerFrame::Table {
+                    buf: String::from("<table border=\"1\">"),
+                    in_head: false,
+                    cell_open_u: 0,
+                });
+            }
+            Tag::TableHead => {
+                if let Some(ContainerFrame::Table { buf, in_head, .. }) = self.frames.last_mut() {
+                    *in_head = true;
+                    buf.push_str("<tr>");
+                }
+            }
+            Tag::TableRow => {
+                if let Some(ContainerFrame::Table { buf, .. }) = self.frames.last_mut() {
+                    buf.push_str("<tr>");
+                }
+            }
+            Tag::TableCell => {
+                if let Some(ContainerFrame::Table {
+                    buf,
+                    in_head,
+                    cell_open_u,
+                }) = self.frames.last_mut()
+                {
+                    *cell_open_u = 0;
+                    buf.push_str(if *in_head { "<th>" } else { "<td>" });
+                }
+            }
+            Tag::Strong => {
+                self.append_inline_raw("<strong>");
+                self.inline_depth += 1;
+            }
+            Tag::Emphasis => {
+                self.append_inline_raw("<em>");
+                self.inline_depth += 1;
+            }
+            Tag::Strikethrough => {
+                self.append_inline_raw("<s>");
+                self.inline_depth += 1;
+            }
+            Tag::Link { dest_url, .. } => {
+                let url = dest_url.trim();
+                if !url.is_empty() && is_safe_onenote_link_url(url) {
+                    let open = format!("<a href=\"{}\">", escape_xml_attr(url));
+                    self.append_inline_raw(&open);
+                    self.link_open_stack.push(true);
+                } else {
+                    self.link_open_stack.push(false);
+                }
+                self.inline_depth += 1;
+            }
+            Tag::Image { dest_url, .. } => {
+                self.image_capture = Some(ImageCapture {
+                    dest_url: dest_url.trim().to_string(),
+                    alt: String::new(),
+                });
+            }
+            Tag::HtmlBlock
+            | Tag::FootnoteDefinition(_)
+            | Tag::MetadataBlock(_)
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+            | Tag::Superscript
+            | Tag::Subscript => {}
+        }
+    }
+
+    fn handle_end_tag(&mut self, tag_end: TagEnd) {
+        match tag_end {
+            TagEnd::Strong => {
+                self.inline_depth = self.inline_depth.saturating_sub(1);
+                self.append_inline_raw("</strong>");
+            }
+            TagEnd::Emphasis => {
+                self.inline_depth = self.inline_depth.saturating_sub(1);
+                self.append_inline_raw("</em>");
+            }
+            TagEnd::Strikethrough => {
+                self.inline_depth = self.inline_depth.saturating_sub(1);
+                self.append_inline_raw("</s>");
+            }
+            TagEnd::Link => {
+                self.inline_depth = self.inline_depth.saturating_sub(1);
+                if self.link_open_stack.pop() == Some(true) {
+                    self.append_inline_raw("</a>");
+                }
+            }
+            TagEnd::Image => {}
+            TagEnd::TableHead => {
+                if let Some(ContainerFrame::Table { buf, in_head, .. }) = self.frames.last_mut() {
+                    buf.push_str("</tr>");
+                    *in_head = false;
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(ContainerFrame::Table { buf, .. }) = self.frames.last_mut() {
+                    buf.push_str("</tr>");
+                }
+            }
+            TagEnd::TableCell => {
+                if let Some(ContainerFrame::Table {
+                    buf,
+                    in_head,
+                    cell_open_u,
+                }) = self.frames.last_mut()
+                {
+                    while *cell_open_u > 0 {
+                        buf.push_str("</u>");
+                        *cell_open_u -= 1;
+                    }
+                    buf.push_str(if *in_head { "</th>" } else { "</td>" });
+                }
+            }
+            TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::Table => {
+                if let Some(frame) = self.frames.pop() {
+                    self.finalize_frame(frame);
+                }
+            }
+            TagEnd::HtmlBlock
+            | TagEnd::FootnoteDefinition
+            | TagEnd::MetadataBlock(_)
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::Superscript
+            | TagEnd::Subscript => {}
+        }
+    }
+
+    fn handle_text(&mut self, text: &str) {
+        if let Some(ContainerFrame::CodeBlock(cb)) = self.frames.last_mut() {
+            cb.buf.push_str(text);
+            return;
+        }
+
+        if let Some(ContainerFrame::Heading(h)) = self.frames.last_mut() {
+            if h.at_start && self.inline_depth == 0 {
+                h.at_start = false;
+                if let Some((tag, rest)) = parse_tag_prefix(text.trim_start()) {
+                    h.tag_attr = Some(tag);
+                    h.buf.push_str(&escape_xml(rest));
+                    return;
+                }
+            }
+            h.at_start = false;
+            h.buf.push_str(&escape_xml(text));
+            return;
+        }
+
+        // Check for inline GFM callout prefix (`> [!note] ...`) at the start of a BlockQuote(None)
+        let in_untyped_blockquote_start = self.frames.len() >= 2
+            && matches!(self.frames.last(), Some(ContainerFrame::Paragraph(p)) if p.at_line_start && p.current_html.is_empty() && p.segments.is_empty())
+            && matches!(
+                &self.frames[self.frames.len() - 2],
+                ContainerFrame::BlockQuote(bq) if bq.kind.is_none() && !bq.seen_any_content
+            );
+        if in_untyped_blockquote_start && self.inline_depth == 0 {
+            if let Some((callout_kind, rest)) = parse_gfm_callout_prefix(text.trim_start()) {
+                let bq_idx = self.frames.len() - 2;
+                if let ContainerFrame::BlockQuote(ref mut bq) = self.frames[bq_idx] {
+                    bq.kind = Some(callout_kind);
+                    bq.seen_any_content = true;
+                }
+                if let Some(ContainerFrame::Paragraph(p)) = self.frames.last_mut() {
+                    if !rest.is_empty() {
+                        p.at_line_start = false;
+                        p.current_html.push_str(&escape_xml(rest));
+                    }
+                }
+                return;
+            }
+        }
+
+        if let Some(ContainerFrame::Paragraph(p)) = self.frames.last_mut() {
+            if p.allow_tag_split && p.at_line_start && self.inline_depth == 0 {
+                if let Some((tag, rest)) = parse_tag_prefix(text.trim_start()) {
+                    if p.pending_soft_break {
+                        p.close_open_u();
+                        let prev_tag = p.current_tag.take();
+                        let prev_html = std::mem::take(&mut p.current_html);
+                        if !prev_html.is_empty() || prev_tag.is_some() {
+                            p.segments.push((prev_tag, prev_html));
+                        }
+                        p.pending_soft_break = false;
+                    }
+                    p.current_tag = Some(tag);
+                    p.at_line_start = false;
+                    p.current_html.push_str(&escape_xml(rest));
+                    return;
+                }
+            }
+            p.flush_pending_break();
+            p.at_line_start = false;
+            p.current_html.push_str(&escape_xml(text));
+            return;
+        }
+
+        self.append_inline_raw(&escape_xml(text));
+    }
+
+    fn finalize_frame(&mut self, frame: ContainerFrame) {
+        match frame {
+            ContainerFrame::Paragraph(p) => {
+                let segments = p.finish();
+                match self.frames.last_mut() {
+                    Some(ContainerFrame::BlockQuote(bq)) => {
+                        bq.seen_any_content = true;
+                        for (tag, inner) in segments {
+                            if inner.is_empty() && tag.is_none() {
+                                continue;
+                            }
+                            if bq.para_count == 0 && tag.is_none() {
+                                bq.first_para_inner = Some(inner.clone());
+                            }
+                            bq.para_count += 1;
+                            if let Some(t) = tag {
+                                bq.buf.push_str(&format!("<p data-tag=\"{t}\">{inner}</p>"));
+                            } else {
+                                bq.buf.push_str(&format!("<p>{inner}</p>"));
+                            }
+                        }
+                    }
+                    Some(ContainerFrame::ListItem(item)) => {
+                        for (tag, inner) in segments {
+                            if inner.is_empty() && tag.is_none() {
+                                continue;
+                            }
+                            if item.para_count == 0 && item.buf.is_empty() && tag.is_none() {
+                                item.buf.push_str(&inner);
+                            } else if let Some(t) = tag {
+                                item.has_nested_block = true;
+                                item.buf
+                                    .push_str(&format!("<p data-tag=\"{t}\">{inner}</p>"));
+                            } else {
+                                item.buf.push_str("<br />");
+                                item.buf.push_str(&inner);
+                            }
+                            item.para_count += 1;
+                        }
+                    }
+                    _ => {
+                        let mut out = String::new();
+                        for (tag, inner) in segments {
+                            if inner.is_empty() && tag.is_none() {
+                                continue;
+                            }
+                            if let Some(t) = tag {
+                                out.push_str(&format!("<p data-tag=\"{t}\">{inner}</p>"));
+                            } else {
+                                out.push_str(&format!("<p>{inner}</p>"));
+                            }
+                        }
+                        self.append_block_html(&out);
+                    }
+                }
+            }
+            ContainerFrame::Heading(mut h) => {
+                while h.open_u > 0 {
+                    h.buf.push_str("</u>");
+                    h.open_u -= 1;
+                }
+                let tag_attr = match h.tag_attr {
+                    Some(t) => format!(" data-tag=\"{t}\""),
+                    None => String::new(),
+                };
+                let html = format!("<h{}{tag_attr}>{}</h{}>", h.level, h.buf, h.level);
+                self.append_block_html(&html);
+            }
+            ContainerFrame::BlockQuote(bq) => {
+                let html = if let Some(kind) = bq.kind {
+                    let (slug, label, border, bg) = gfm_callout_style(kind);
+                    format!(
+                        "<blockquote data-callout=\"{slug}\" style=\"border-left:4px solid {border};background-color:{bg};padding:8px 12px\"><p><strong>{label}</strong></p>{}</blockquote>",
+                        bq.buf
+                    )
+                } else if !bq.has_non_para_block && bq.para_count == 1 {
+                    let inner = bq.first_para_inner.unwrap_or(bq.buf);
+                    format!("<blockquote>{inner}</blockquote>")
+                } else {
+                    format!("<blockquote>{}</blockquote>", bq.buf)
+                };
+                self.append_block_html(&html);
+            }
+            ContainerFrame::CodeBlock(cb) => {
+                let body = cb.buf.strip_suffix('\n').unwrap_or(&cb.buf);
+                let escaped = escape_xml(body);
+                let html = if cb.lang.is_empty() {
+                    format!("<pre><code>{escaped}</code></pre>")
+                } else {
+                    format!(
+                        "<pre><code class=\"language-{}\">{escaped}</code></pre>",
+                        escape_xml_attr(&cb.lang)
+                    )
+                };
+                self.append_block_html(&html);
+            }
+            ContainerFrame::ListItem(mut item) => {
+                while item.open_u > 0 {
+                    item.buf.push_str("</u>");
+                    item.open_u -= 1;
+                }
+                let rendered = RenderedListItem {
+                    task_tag: item.task_tag,
+                    html: item.buf,
+                    has_nested_block: item.has_nested_block,
+                };
+                if let Some(ContainerFrame::List(list)) = self.frames.last_mut() {
+                    list.items.push(rendered);
+                } else {
+                    let tag_attr = rendered
+                        .task_tag
+                        .map(|t| format!(" data-tag=\"{t}\""))
+                        .unwrap_or_default();
+                    self.append_block_html(&format!("<li{tag_attr}>{}</li>", rendered.html));
+                }
+            }
+            ContainerFrame::List(list) => {
+                let mut html = String::new();
+                if list.is_top_level && !list.ordered {
+                    let mut ul_open = false;
+                    for item in list.items {
+                        if let Some(task_tag) = item.task_tag {
+                            if !item.has_nested_block {
+                                if ul_open {
+                                    html.push_str("</ul>");
+                                    ul_open = false;
+                                }
+                                html.push_str(&format!(
+                                    "<p data-tag=\"{task_tag}\">{}</p>",
+                                    item.html
+                                ));
+                                continue;
+                            }
+                        }
+                        if !ul_open {
+                            html.push_str("<ul>");
+                            ul_open = true;
+                        }
+                        let tag_attr = item
+                            .task_tag
+                            .map(|t| format!(" data-tag=\"{t}\""))
+                            .unwrap_or_default();
+                        html.push_str(&format!("<li{tag_attr}>{}</li>", item.html));
+                    }
+                    if ul_open {
+                        html.push_str("</ul>");
+                    }
+                } else {
+                    let open_tag = if list.ordered {
+                        match list.start {
+                            Some(n) if n != 1 => format!("<ol start=\"{n}\">"),
+                            _ => "<ol>".to_string(),
+                        }
+                    } else {
+                        "<ul>".to_string()
+                    };
+                    html.push_str(&open_tag);
+                    for item in list.items {
+                        let tag_attr = item
+                            .task_tag
+                            .map(|t| format!(" data-tag=\"{t}\""))
+                            .unwrap_or_default();
+                        html.push_str(&format!("<li{tag_attr}>{}</li>", item.html));
+                    }
+                    html.push_str(if list.ordered { "</ol>" } else { "</ul>" });
+                }
+                self.append_block_html(&html);
+            }
+            ContainerFrame::Table { mut buf, .. } => {
+                buf.push_str("</table>");
+                self.append_block_html(&buf);
+            }
+        }
+    }
+}
+
+fn gfm_callout_style(kind: BlockQuoteKind) -> (&'static str, &'static str, &'static str, &'static str) {
+    match kind {
+        BlockQuoteKind::Note => ("note", "NOTE", "#0969da", "#ddf4ff"),
+        BlockQuoteKind::Tip => ("tip", "TIP", "#1a7f37", "#dafbe1"),
+        BlockQuoteKind::Important => ("important", "IMPORTANT", "#8250df", "#fbefff"),
+        BlockQuoteKind::Warning => ("warning", "WARNING", "#9a6700", "#fff8c5"),
+        BlockQuoteKind::Caution => ("caution", "CAUTION", "#cf222e", "#ffebe9"),
+    }
+}
+
+fn parse_gfm_callout_prefix(trimmed_start: &str) -> Option<(BlockQuoteKind, &str)> {
+    const CALLOUTS: &[(&str, BlockQuoteKind)] = &[
+        ("[!NOTE]", BlockQuoteKind::Note),
+        ("[!TIP]", BlockQuoteKind::Tip),
+        ("[!IMPORTANT]", BlockQuoteKind::Important),
+        ("[!WARNING]", BlockQuoteKind::Warning),
+        ("[!CAUTION]", BlockQuoteKind::Caution),
+    ];
+    for &(pfx, kind) in CALLOUTS {
+        let matched = trimmed_start
+            .get(..pfx.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(pfx));
+        if matched {
+            let after = &trimmed_start[pfx.len()..];
+            if after.is_empty() || after.starts_with(char::is_whitespace) {
+                return Some((kind, after.trim_start()));
+            }
         }
     }
     None
+}
+
+fn is_inline_br_tag(trimmed: &str) -> bool {
+    trimmed.eq_ignore_ascii_case("<br>")
+        || trimmed.eq_ignore_ascii_case("<br/>")
+        || trimmed.eq_ignore_ascii_case("<br />")
 }
 
 fn parse_tag_prefix(trimmed_start: &str) -> Option<(&'static str, &str)> {
@@ -2217,418 +2824,6 @@ fn parse_tag_prefix(trimmed_start: &str) -> Option<(&'static str, &str)> {
     None
 }
 
-fn parse_atx_heading(trimmed_start: &str) -> Option<(u8, &str)> {
-    let hashes = trimmed_start.bytes().take_while(|&b| b == b'#').count();
-    if !(1..=6).contains(&hashes) {
-        return None;
-    }
-    let after = &trimmed_start[hashes..];
-    if after.is_empty() {
-        return Some((hashes as u8, ""));
-    }
-    if after.starts_with(char::is_whitespace) {
-        let content = after.trim().trim_end_matches('#').trim_end();
-        return Some((hashes as u8, content));
-    }
-    None
-}
-
-fn is_horizontal_rule(trimmed: &str) -> bool {
-    if trimmed.len() < 3 {
-        return false;
-    }
-    let mut marker: Option<char> = None;
-    let mut count = 0usize;
-    for ch in trimmed.chars() {
-        if ch == ' ' || ch == '\t' {
-            continue;
-        }
-        if matches!(ch, '-' | '*' | '_') {
-            if let Some(m) = marker {
-                if m != ch {
-                    return false;
-                }
-            } else {
-                marker = Some(ch);
-            }
-            count += 1;
-        } else {
-            return false;
-        }
-    }
-    count >= 3
-}
-
-fn parse_list_item_line(line: &str, allow_top_level_task: bool) -> Option<ParsedListLine<'_>> {
-    let indent = leading_indent_spaces(line);
-    let trimmed = line.trim_start();
-
-    // Unordered bullet
-    if let Some(after_bullet) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-        .or_else(|| trimmed.strip_prefix("+ "))
-    {
-        if let Some((completed, task_body)) = parse_checkbox_prefix(after_bullet) {
-            if indent < 2 && !allow_top_level_task {
-                return None;
-            }
-            return Some(ParsedListLine {
-                indent,
-                ordered: false,
-                task_tag: Some(if completed { "to-do:completed" } else { "to-do" }),
-                content: task_body,
-            });
-        }
-        return Some(ParsedListLine {
-            indent,
-            ordered: false,
-            task_tag: None,
-            content: after_bullet.trim_end(),
-        });
-    }
-
-    // Ordered bullet: `1. text` or `1) text`
-    let digit_count = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
-    if (1..=9).contains(&digit_count) {
-        let after_digits = &trimmed[digit_count..];
-        if let Some(after_marker) = after_digits
-            .strip_prefix(". ")
-            .or_else(|| after_digits.strip_prefix(") "))
-        {
-            if let Some((completed, task_body)) = parse_checkbox_prefix(after_marker) {
-                return Some(ParsedListLine {
-                    indent,
-                    ordered: true,
-                    task_tag: Some(if completed { "to-do:completed" } else { "to-do" }),
-                    content: task_body,
-                });
-            }
-            return Some(ParsedListLine {
-                indent,
-                ordered: true,
-                task_tag: None,
-                content: after_marker.trim_end(),
-            });
-        }
-    }
-
-    None
-}
-
-fn parse_checkbox_prefix(s: &str) -> Option<(bool, &str)> {
-    let ts = s.trim_start();
-    if let Some(rest) = ts.strip_prefix("[ ]") {
-        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-            return Some((false, rest.trim_start().trim_end()));
-        }
-    }
-    if let Some(rest) = ts.strip_prefix("[x]").or_else(|| ts.strip_prefix("[X]")) {
-        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-            return Some((true, rest.trim_start().trim_end()));
-        }
-    }
-    None
-}
-
-fn build_nested_list_xhtml(
-    items: &[ParsedListLine<'_>],
-    idx: &mut usize,
-    base_indent: usize,
-) -> String {
-    let list_ordered = items[*idx].ordered;
-    let list_tag = if list_ordered { "ol" } else { "ul" };
-    let mut out = format!("<{list_tag}>");
-
-    while *idx < items.len() {
-        let cur = &items[*idx];
-        if cur.indent < base_indent {
-            break;
-        }
-        if cur.indent == base_indent && cur.ordered != list_ordered {
-            break;
-        }
-
-        let item_indent = cur.indent;
-        let tag_attr = match cur.task_tag {
-            Some(t) => format!(" data-tag=\"{t}\""),
-            None => String::new(),
-        };
-        let rendered_body = render_onenote_inline(cur.content);
-        *idx += 1;
-
-        out.push_str(&format!("<li{tag_attr}>{rendered_body}"));
-        while *idx < items.len() && items[*idx].indent > item_indent {
-            let child_indent = items[*idx].indent;
-            out.push_str(&build_nested_list_xhtml(items, idx, child_indent));
-        }
-        out.push_str("</li>");
-    }
-
-    out.push_str(&format!("</{list_tag}>"));
-    out
-}
-
-fn is_gfm_table_start(header_line: &str, sep_line: &str) -> bool {
-    if !header_line.contains('|') || !sep_line.contains('|') {
-        return false;
-    }
-    let headers = split_gfm_table_cells(header_line);
-    let seps = split_gfm_table_cells(sep_line);
-    if headers.is_empty() || headers.len() != seps.len() {
-        return false;
-    }
-    seps.iter().all(|cell| {
-        let t = cell.trim();
-        let without_left = t.strip_prefix(':').unwrap_or(t);
-        let core = without_left.strip_suffix(':').unwrap_or(without_left);
-        !core.is_empty() && core.chars().all(|c| c == '-')
-    })
-}
-
-fn split_gfm_table_cells(line: &str) -> Vec<String> {
-    let mut s = line.trim();
-    if let Some(stripped) = s.strip_prefix('|') {
-        s = stripped;
-    }
-    if s.ends_with('|') && !s.ends_with("\\|") {
-        s = &s[..s.len() - 1];
-    }
-
-    let mut cells = Vec::new();
-    let mut cur = String::new();
-    let mut chars = s.chars().peekable();
-    let mut in_code = false;
-
-    while let Some(ch) = chars.next() {
-        if ch == '`' {
-            in_code = !in_code;
-            cur.push(ch);
-        } else if ch == '\\' && !in_code && chars.peek() == Some(&'|') {
-            chars.next();
-            cur.push('|');
-        } else if ch == '|' && !in_code {
-            cells.push(cur.trim().to_string());
-            cur.clear();
-        } else {
-            cur.push(ch);
-        }
-    }
-    cells.push(cur.trim().to_string());
-    cells
-}
-
-fn render_onenote_inline(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-
-    while i < input.len() {
-        let rest = &input[i..];
-
-        // Double-backtick inline code: ``code``
-        if let Some(after_ticks) = rest.strip_prefix("``") {
-            if let Some(end_idx) = after_ticks.find("``") {
-                let raw_code = &after_ticks[..end_idx];
-                let trimmed = raw_code
-                    .strip_prefix(' ')
-                    .and_then(|s| s.strip_suffix(' '))
-                    .unwrap_or(raw_code);
-                out.push_str("<code>");
-                out.push_str(&escape_xml(trimmed));
-                out.push_str("</code>");
-                i += 2 + end_idx + 2;
-                continue;
-            }
-        }
-
-        // Single-backtick inline code: `code`
-        if let Some(after_tick) = rest.strip_prefix('`') {
-            if let Some(end_idx) = after_tick.find('`') {
-                let raw_code = &after_tick[..end_idx];
-                out.push_str("<code>");
-                out.push_str(&escape_xml(raw_code));
-                out.push_str("</code>");
-                i += 1 + end_idx + 1;
-                continue;
-            }
-        }
-
-        // Explicit inline <br>, <br/>, <br /> (useful inside GFM table cells)
-        if let Some(consumed_br) = match_inline_br_tag(rest) {
-            out.push_str("<br />");
-            i += consumed_br;
-            continue;
-        }
-
-        // Explicit safe <u>...</u> underline round-trip
-        if let Some(after_u) = rest.strip_prefix("<u>") {
-            if let Some(end_idx) = after_u.find("</u>") {
-                if end_idx > 0 {
-                    let inner = &after_u[..end_idx];
-                    out.push_str("<u>");
-                    out.push_str(&render_onenote_inline(inner));
-                    out.push_str("</u>");
-                    i += 3 + end_idx + 4;
-                    continue;
-                }
-            }
-        }
-
-        // Markdown inline image: ![alt](url)
-        if let Some(after_bang) = rest.strip_prefix('!') {
-            if after_bang.starts_with('[') {
-                if let Some((alt, url, consumed)) = parse_markdown_link_or_image(after_bang, true) {
-                    if is_safe_onenote_image_src(url) {
-                        out.push_str(&format!(
-                            "<img src=\"{}\" alt=\"{}\" />",
-                            escape_xml_attr(url),
-                            escape_xml_attr(alt)
-                        ));
-                        i += 1 + consumed;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Markdown link: [label](url)
-        if rest.starts_with('[') {
-            if let Some((label, url, consumed)) = parse_markdown_link_or_image(rest, false) {
-                if is_safe_onenote_link_url(url) {
-                    out.push_str(&format!(
-                        "<a href=\"{}\">{}</a>",
-                        escape_xml_attr(url),
-                        render_onenote_inline(label)
-                    ));
-                    i += consumed;
-                    continue;
-                }
-            }
-        }
-
-        // Bold + Italic: ***...***
-        if let Some(after_3) = rest.strip_prefix("***") {
-            if let Some(end_idx) = after_3.find("***") {
-                if end_idx > 0 {
-                    let inner = &after_3[..end_idx];
-                    out.push_str("<b><i>");
-                    out.push_str(&render_onenote_inline(inner));
-                    out.push_str("</i></b>");
-                    i += 3 + end_idx + 3;
-                    continue;
-                }
-            }
-        }
-
-        // Bold: **...**
-        if let Some(after_stars) = rest.strip_prefix("**") {
-            if let Some(end_idx) = after_stars.find("**") {
-                if end_idx > 0 {
-                    let inner = &after_stars[..end_idx];
-                    out.push_str("<b>");
-                    out.push_str(&render_onenote_inline(inner));
-                    out.push_str("</b>");
-                    i += 2 + end_idx + 2;
-                    continue;
-                }
-            }
-        }
-
-        // Strikethrough: ~~...~~
-        if let Some(after_tilde) = rest.strip_prefix("~~") {
-            if let Some(end_idx) = after_tilde.find("~~") {
-                if end_idx > 0 {
-                    let inner = &after_tilde[..end_idx];
-                    out.push_str("<s>");
-                    out.push_str(&render_onenote_inline(inner));
-                    out.push_str("</s>");
-                    i += 2 + end_idx + 2;
-                    continue;
-                }
-            }
-        }
-
-        // Italic: *...* (single asterisk, not **)
-        if rest.starts_with('*') && !rest.starts_with("**") {
-            if let Some(end_idx) = find_closing_single_asterisk(&rest[1..]) {
-                if end_idx > 0 {
-                    let inner = &rest[1..1 + end_idx];
-                    out.push_str("<i>");
-                    out.push_str(&render_onenote_inline(inner));
-                    out.push_str("</i>");
-                    i += 1 + end_idx + 1;
-                    continue;
-                }
-            }
-        }
-
-        let ch = rest.chars().next().unwrap();
-        push_xml_escaped_char(&mut out, ch);
-        i += ch.len_utf8();
-    }
-
-    out
-}
-
-fn match_inline_br_tag(rest: &str) -> Option<usize> {
-    const BR_FORMS: &[&str] = &["<br />", "<br/>", "<br>"];
-    for form in BR_FORMS {
-        if rest
-            .get(..form.len())
-            .map(|h| h.eq_ignore_ascii_case(form))
-            .unwrap_or(false)
-        {
-            return Some(form.len());
-        }
-    }
-    None
-}
-
-fn parse_markdown_link_or_image(
-    rest: &str,
-    allow_empty_label: bool,
-) -> Option<(&str, &str, usize)> {
-    let after_open = rest.strip_prefix('[')?;
-    let close_bracket = after_open.find("](")?;
-    let label = &after_open[..close_bracket];
-    if !allow_empty_label && label.is_empty() {
-        return None;
-    }
-    let after_mid = &after_open[close_bracket + 2..];
-    let close_paren = find_link_url_end(after_mid)?;
-    let url = after_mid[..close_paren].trim();
-    if url.is_empty() {
-        return None;
-    }
-    let consumed = 1 + close_bracket + 2 + close_paren + 1;
-    Some((label, url, consumed))
-}
-
-/// Byte index of the `)` that closes a Markdown link/image URL.
-///
-/// Parentheses inside the URL are matched, so
-/// `https://en.wikipedia.org/wiki/Rust_(programming_language)` keeps its closing
-/// paren. A backslash escapes the next character. If the parentheses are not
-/// balanced on the current line, the first `)` ends the URL (the behaviour
-/// before balanced matching), so unbalanced input never parses worse.
-fn find_link_url_end(after_mid: &str) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut chars = after_mid.char_indices();
-    while let Some((idx, ch)) = chars.next() {
-        match ch {
-            '\\' => {
-                chars.next();
-            }
-            '\n' => break,
-            '(' => depth += 1,
-            ')' if depth == 0 => return Some(idx),
-            ')' => depth -= 1,
-            _ => {}
-        }
-    }
-    after_mid.find(')')
-}
-
 fn is_safe_onenote_link_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.starts_with("https://")
@@ -2643,23 +2838,6 @@ fn is_safe_onenote_image_src(url: &str) -> bool {
         || lower.starts_with("http://")
         || lower.starts_with("name:")
         || lower.starts_with("data:image/")
-}
-
-fn find_closing_single_asterisk(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx] == b'*' {
-            let next_is_star = idx + 1 < bytes.len() && bytes[idx + 1] == b'*';
-            if !next_is_star {
-                return Some(idx);
-            }
-            idx += 2;
-            continue;
-        }
-        idx += 1;
-    }
-    None
 }
 
 fn push_xml_escaped_char(out: &mut String, ch: char) {
@@ -4446,7 +4624,7 @@ let ok = 1 < 2 && 3 > 1;
         assert!(xhtml_frag.contains("<h1>스프린트 계획</h1>"));
         assert!(xhtml_frag.contains(r#"<p data-tag="to-do">API 스펙 확정</p>"#));
         assert!(xhtml_frag.contains(
-            r#"<p data-tag="to-do:completed"><b>DB 스키마</b> 리뷰 <i>완료</i> <s>보류</s> <code>v0.3</code> <a href="https://example.com?x=1&amp;y=2">링크</a></p>"#
+            r#"<p data-tag="to-do:completed"><strong>DB 스키마</strong> 리뷰 <em>완료</em> <s>보류</s> <code>v0.3</code> <a href="https://example.com?x=1&amp;y=2">링크</a></p>"#
         ));
         assert!(xhtml_frag.contains(r#"<p data-tag="important">배포 일정 엄수</p>"#));
         assert!(xhtml_frag.contains(r#"<p data-tag="question">권한 스코프 추가 필요?</p>"#));
@@ -4786,7 +4964,7 @@ let ok = 1 < 2 && 3 > 1;
         let block_patch = build_replace_block_patch("p:{guid}{99}", "**수정됨**");
         assert_eq!(block_patch.target, "p:{guid}{99}");
         assert_eq!(block_patch.action, "replace");
-        assert_eq!(block_patch.content, "<p><b>수정됨</b></p>");
+        assert_eq!(block_patch.content, "<p><strong>수정됨</strong></p>");
 
         let detail = parse_onenote_page_xhtml(
             sample_summary("기존 제목"),
@@ -4923,46 +5101,37 @@ let ok = 1 < 2 && 3 > 1;
     #[test]
     fn markdown_link_url_keeps_balanced_parentheses() {
         // Balanced parentheses stay inside the URL; trailing text is untouched.
-        let input = "[Rust](https://en.wikipedia.org/wiki/Rust_(programming_language)) is fast";
-        let (label, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
-        assert_eq!(label, "Rust");
-        assert_eq!(
-            url,
-            "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+        let html = markdown_to_onenote_html_fragment(
+            "[Rust](https://en.wikipedia.org/wiki/Rust_(programming_language)) is fast",
+            &[],
         );
-        assert_eq!(&input[consumed..], " is fast");
+        assert_eq!(
+            html,
+            r#"<p><a href="https://en.wikipedia.org/wiki/Rust_(programming_language)">Rust</a> is fast</p>"#
+        );
 
-        // No parentheses in the URL: identical to the previous behaviour.
-        let input = "[a](https://example.com/u) and (note)";
-        let (label, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
-        assert_eq!((label, url), ("a", "https://example.com/u"));
-        assert_eq!(&input[consumed..], " and (note)");
+        // No parentheses in the URL.
+        let html = markdown_to_onenote_html_fragment("[a](https://example.com/u) and (note)", &[]);
+        assert_eq!(
+            html,
+            r#"<p><a href="https://example.com/u">a</a> and (note)</p>"#
+        );
 
         // Nested parentheses.
-        let input = "[n](https://h/((x)))!";
-        let (_, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
-        assert_eq!(url, "https://h/((x))");
-        assert_eq!(&input[consumed..], "!");
+        let html = markdown_to_onenote_html_fragment("[n](https://h/((x)))!", &[]);
+        assert_eq!(html, r#"<p><a href="https://h/((x))">n</a>!</p>"#);
 
-        // Unbalanced: falls back to the first `)`, as before.
-        let input = "[a](http://x/(y) tail";
-        let (_, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
-        assert_eq!(url, "http://x/(y");
-        assert_eq!(&input[consumed..], " tail");
+        // Escaped paren inside destination.
+        let html = markdown_to_onenote_html_fragment(r"[e](https://h/a\)b) rest", &[]);
+        assert_eq!(html, r#"<p><a href="https://h/a)b">e</a> rest</p>"#);
 
-        // An escaped paren does not open or close a group.
-        let input = r"[e](https://h/a\)b) rest";
-        let (_, url, consumed) = parse_markdown_link_or_image(input, false).unwrap();
-        assert_eq!(url, r"https://h/a\)b");
-        assert_eq!(&input[consumed..], " rest");
+        // Image form with balanced parens.
+        let html = markdown_to_onenote_html_fragment("![alt](https://h/a_(1).png)", &[]);
+        assert_eq!(html, r#"<p><img src="https://h/a_(1).png" alt="alt" /></p>"#);
 
-        // Image form (empty alt allowed) and surrounding whitespace trimmed.
-        let (alt, url, _) =
-            parse_markdown_link_or_image("[alt]( https://h/a_(1).png )", true).unwrap();
-        assert_eq!((alt, url), ("alt", "https://h/a_(1).png"));
-
-        assert!(parse_markdown_link_or_image("[a]()", false).is_none());
-        assert!(parse_markdown_link_or_image("[a](no-close", false).is_none());
+        // Empty URL does not emit an unsafe empty <a>.
+        let html = markdown_to_onenote_html_fragment("[a]()", &[]);
+        assert!(!html.contains("<a "), "{html}");
     }
 
     #[test]

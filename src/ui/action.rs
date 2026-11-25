@@ -418,7 +418,7 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                                 ..
                             } = blk.kind
                             {
-                                if crate::ui::app::is_html_resource_meta(
+                                if crate::ui::app::is_markup_resource_meta(
                                     Some(mime_type),
                                     Some(name),
                                 ) {
@@ -511,7 +511,7 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
         Action::OpenImagePreviewAt(res_idx) => {
             if let Some(detail) = app.active_page_detail() {
                 if let Some(res) = detail.resources.get(res_idx) {
-                    if crate::ui::app::is_html_resource_meta(
+                    if crate::ui::app::is_markup_resource_meta(
                         Some(&res.mime_type),
                         res.file_name.as_deref(),
                     ) {
@@ -581,7 +581,7 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
         }
         Action::ServeHtmlPreviewInBrowser => {
             let payload = if let Some(Overlay::HtmlPreview(preview)) = ui.overlays.last() {
-                Some((preview.title(), preview.raw_html().to_string()))
+                Some((preview.title(), preview.serve_html()))
             } else {
                 None
             };
@@ -1303,7 +1303,7 @@ fn handle_mouse_click(
                 .map(|r| (r.is_image, r.mime_type.clone(), r.file_name.clone()));
             match res_meta {
                 Some((_, mime, name))
-                    if crate::ui::app::is_html_resource_meta(Some(&mime), name.as_deref()) =>
+                    if crate::ui::app::is_markup_resource_meta(Some(&mime), name.as_deref()) =>
                 {
                     dispatch(Action::OpenHtmlResource(res_idx), app, ui)
                 }
@@ -1886,6 +1886,173 @@ mod tests {
         assert!(!app.inflight_images.contains(&expected_key));
         assert_eq!(ui.overlays.len(), 1);
         assert!(matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))));
+    }
+
+    #[tokio::test]
+    async fn test_markdown_resource_preview_routing_and_raw_toggle() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        let summary = app.pages[0].clone();
+        let page_key = summary.page_key.clone();
+        app.page_details.insert(
+            page_key.clone(),
+            crate::models::OnenotePageDetail {
+                summary,
+                raw_xhtml: "<html><body><p>Page</p></body></html>".to_string(),
+                body_markdown: "Page".to_string(),
+                body_plain: "Page".to_string(),
+                blocks: vec![crate::models::OnenoteBlock {
+                    element_id: Some("obj:md0".to_string()),
+                    tag: None,
+                    raw_html: None,
+                    kind: crate::models::OnenoteBlockKind::Attachment {
+                        resource_index: 0,
+                        name: "README.md".to_string(),
+                        mime_type: "text/markdown".to_string(),
+                        src: "https://example.com/README.md".to_string(),
+                    },
+                }],
+                resources: vec![
+                    crate::models::OnenoteResource {
+                        element_id: Some("obj:md0".to_string()),
+                        resource_url: "https://example.com/README.md".to_string(),
+                        fullres_url: None,
+                        mime_type: "text/markdown".to_string(),
+                        file_name: Some("README.md".to_string()),
+                        is_image: false,
+                        alt_text: None,
+                    },
+                    crate::models::OnenoteResource {
+                        element_id: Some("obj:md1".to_string()),
+                        resource_url: "https://example.com/NOTES.md".to_string(),
+                        fullres_url: None,
+                        mime_type: "application/octet-stream".to_string(),
+                        file_name: Some("NOTES.md".to_string()),
+                        is_image: false,
+                        alt_text: None,
+                    },
+                ],
+                primary_div_id: None,
+                synced_at: None,
+            },
+        );
+
+        // 1. Both text/markdown and application/octet-stream (.md) show [MD] badge
+        let rows = crate::ui::overlays::attachments::rows_from_onenote_page(
+            app.active_page_detail().unwrap(),
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_markdown);
+        assert!(rows[0].label().starts_with("[MD] README.md"));
+        assert!(rows[1].is_markdown);
+        assert!(rows[1].label().starts_with("[MD] NOTES.md"));
+
+        // 2. Enter / v / H in attachments tray dispatch OpenHtmlResource (NOT DownloadResource)
+        let mut tray = crate::ui::overlays::attachments::AttachmentsState::default();
+        assert_eq!(
+            tray.handle(&Action::Activate, &app),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
+        );
+        assert_eq!(
+            tray.handle(&Action::Input('v'), &app),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
+        );
+        assert_eq!(
+            tray.handle(&Action::Input('H'), &app),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
+        );
+        tray.select(1);
+        assert_eq!(
+            tray.handle(&Action::Activate, &app),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(1))
+        );
+
+        // 3. Clicking resource chip dispatches OpenHtmlResource (starts HTML/MD load task, not download)
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::OnenoteResource(0),
+                col: 4,
+                row: 4,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(
+            ui.tasks
+                .first_running()
+                .is_some_and(|t| t.label.contains("Loading Markdown 'README.md'")),
+            "expected resource chip click to trigger Markdown preview load"
+        );
+
+        // 4. Delivering UiMsg::HtmlResourceLoaded opens Overlay::HtmlPreview with SourceKind::Markdown
+        let md_payload = "# Title\n\n**bold** | [link](https://example.com)".to_string();
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::HtmlResourceLoaded {
+                task_id: 1,
+                seq: 1,
+                page_key,
+                title: "README.md".to_string(),
+                mime_type: Some("application/octet-stream".to_string()),
+                html: md_payload,
+            },
+        );
+        let html_theme = ui.theme.to_html_theme();
+        {
+            let Some(Overlay::HtmlPreview(ref mut preview)) = ui.overlays.last_mut() else {
+                panic!("expected Overlay::HtmlPreview to open for .md resource");
+            };
+            assert_eq!(
+                preview.session.source_kind(),
+                bitefoundry_html::SourceKind::Markdown
+            );
+            assert!(!preview.session.js_active);
+
+            // Rendered mode: 0 raw `**` and 0 raw HTML tags, contains rendered text
+            let rendered_text: String = preview
+                .session
+                .render(80, &html_theme, false)
+                .lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered_text.contains("Title"), "{rendered_text}");
+            assert!(rendered_text.contains("bold"), "{rendered_text}");
+            assert!(!rendered_text.contains("**"), "raw ** leaked:\n{rendered_text}");
+            assert!(!rendered_text.contains("<h1>"), "raw <h1> leaked:\n{rendered_text}");
+
+            // serve_html() compiles Markdown into standalone HTML document for `o`
+            let served = preview.serve_html();
+            assert!(served.contains("<!DOCTYPE html>"), "{served}");
+            assert!(served.contains("<strong>bold</strong>"), "{served}");
+        }
+
+        // Pressing `r` toggles Raw Markdown mode showing raw `# Title`
+        dispatch(Action::Input('r'), &mut app, &mut ui);
+        let Some(Overlay::HtmlPreview(ref mut preview)) = ui.overlays.last_mut() else {
+            panic!("expected Overlay::HtmlPreview to stay open after `r`");
+        };
+        assert!(preview.session.raw_mode);
+        let raw_text: String = preview
+            .session
+            .render(80, &html_theme, false)
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(raw_text.contains("# Title"), "expected raw '# Title':\n{raw_text}");
+        assert!(raw_text.contains("**bold**"), "expected raw '**bold**':\n{raw_text}");
     }
 
     #[test]

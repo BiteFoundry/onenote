@@ -25,12 +25,15 @@ pub struct ResourceRow {
     pub mime_type: String,
     pub is_image: bool,
     pub is_html: bool,
+    pub is_markdown: bool,
 }
 
 impl ResourceRow {
     pub fn label(&self) -> String {
         let icon = if self.is_html {
             "[HTML]"
+        } else if self.is_markdown {
+            "[MD]"
         } else if self.is_image {
             "[IMG]"
         } else {
@@ -60,17 +63,20 @@ pub fn rows_from_onenote_page(detail: &OnenotePageDetail) -> Vec<ResourceRow> {
                         format!("resource-{}", resource_index + 1)
                     }
                 });
-            let is_html = bitefoundry_html::sniff_content_kind(
+            let kind = bitefoundry_html::sniff_content_kind(
                 Some(&res.mime_type),
                 res.file_name.as_deref().or(Some(name.as_str())),
                 None,
-            ) == bitefoundry_html::ContentKind::Html;
+            );
+            let is_html = kind == bitefoundry_html::ContentKind::Html;
+            let is_markdown = kind == bitefoundry_html::ContentKind::Markdown;
             ResourceRow {
                 resource_index,
                 name,
                 mime_type: res.mime_type.clone(),
-                is_image: res.is_image && !is_html,
+                is_image: res.is_image && !is_html && !is_markdown,
                 is_html,
+                is_markdown,
             }
         })
         .collect()
@@ -105,7 +111,7 @@ impl AttachmentsState {
             Action::Activate => {
                 let idx = self.selected.min(items.len().saturating_sub(1));
                 match items.get(idx) {
-                    Some(row) if row.is_html => OverlayOutcome::CloseAndDispatch(
+                    Some(row) if row.is_html || row.is_markdown => OverlayOutcome::CloseAndDispatch(
                         Action::OpenHtmlResource(row.resource_index),
                     ),
                     Some(row) => OverlayOutcome::CloseAndDispatch(Action::DownloadResource(
@@ -129,7 +135,7 @@ impl AttachmentsState {
             | Action::Input('H') => {
                 let idx = self.selected.min(items.len().saturating_sub(1));
                 match items.get(idx) {
-                    Some(row) if row.is_html => OverlayOutcome::CloseAndDispatch(
+                    Some(row) if row.is_html || row.is_markdown => OverlayOutcome::CloseAndDispatch(
                         Action::OpenHtmlResource(row.resource_index),
                     ),
                     Some(row) if row.is_image => OverlayOutcome::CloseAndDispatch(

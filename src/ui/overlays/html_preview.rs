@@ -11,7 +11,7 @@
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
-use bitefoundry_html::{HtmlEffect, HtmlViewSession};
+use bitefoundry_html::{ContentKind, HtmlEffect, HtmlViewSession, SourceKind};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -84,6 +84,25 @@ impl HtmlPreviewOverlay {
         }
     }
 
+    pub fn new_markdown(title: Option<String>, raw_md: String) -> Self {
+        let session = HtmlViewSession::new_markdown(title, raw_md);
+        Self {
+            session,
+            content_rect: Rect::default(),
+            total_lines: 0,
+            last_width: 80,
+            follow_focus: false,
+            graphic_cache: HashMap::new(),
+        }
+    }
+
+    pub fn from_content(title: Option<String>, kind: ContentKind, raw: String) -> Self {
+        match kind {
+            ContentKind::Markdown => Self::new_markdown(title, raw),
+            _ => Self::new(title, raw),
+        }
+    }
+
     pub fn from_onenote_page(detail: &OnenotePageDetail) -> Self {
         let title = if detail.summary.title.trim().is_empty() {
             "OneNote Page".to_string()
@@ -103,15 +122,23 @@ impl HtmlPreviewOverlay {
     }
 
     pub fn title(&self) -> String {
+        let fallback = match self.session.source_kind() {
+            SourceKind::Markdown => "Markdown Preview",
+            SourceKind::Html => "HTML Preview",
+        };
         self.session
             .title()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or("HTML Preview")
+            .unwrap_or(fallback)
             .to_string()
     }
 
     pub fn raw_html(&self) -> &str {
         self.session.raw_html()
+    }
+
+    pub fn serve_html(&self) -> String {
+        self.session.serve_html()
     }
 
     pub fn accepts_text(&self) -> bool {
@@ -253,7 +280,11 @@ impl HtmlPreviewOverlay {
                 let effects = self.session.activate_focused();
                 self.apply_effects(effects)
             }
-            Action::Input('m') | Action::Input('M') => {
+            Action::Input('m')
+            | Action::Input('M')
+            | Action::Input('r')
+            | Action::Input('R')
+            | Action::RefreshAll => {
                 self.toggle_raw_mode();
                 OverlayOutcome::Handled
             }
@@ -357,8 +388,14 @@ impl HtmlPreviewOverlay {
             .saturating_sub(2 + if show_pills { pills_total_w + 1 } else { 0 })
             as usize;
 
+        let is_markdown = self.session.source_kind() == SourceKind::Markdown;
+        let kind_badge = if is_markdown { "MD" } else { "HTML" };
         let mode_badge = if self.session.raw_mode {
-            "RAW HTML"
+            if is_markdown {
+                "RAW MD"
+            } else {
+                "RAW HTML"
+            }
         } else {
             "RENDERED"
         };
@@ -368,7 +405,7 @@ impl HtmlPreviewOverlay {
             ""
         };
         let title = format!(
-            " HTML · {} [{mode_badge}{js_badge}] ",
+            " {kind_badge} · {} [{mode_badge}{js_badge}] ",
             crate::ui::truncate_width(&self.title(), 32)
         );
 
@@ -631,8 +668,13 @@ impl HtmlPreviewOverlay {
                     " Control {focus_num}/{control_count}: {lbl} · Enter/Space Activate · Tab Next · m Raw · o Browser · Esc Close"
                 )
             } else if self.session.raw_mode {
+                let raw_label = if is_markdown {
+                    "Raw Markdown"
+                } else {
+                    "Raw HTML"
+                };
                 format!(
-                    " Raw HTML ({total_lines} lines) · m Rendered · o Browser · j/k/Wheel Scroll · Esc Close"
+                    " {raw_label} ({total_lines} lines) · m/r Rendered · o Browser · j/k/Wheel Scroll · Esc Close"
                 )
             } else {
                 format!(

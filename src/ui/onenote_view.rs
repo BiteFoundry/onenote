@@ -843,13 +843,26 @@ pub fn build_page_canvas_lines_with_opts(
     ))));
 
     if detail.blocks.is_empty() {
-        if !detail.body_plain.trim().is_empty() {
-            for raw in detail.body_plain.lines() {
-                for wrapped in wrap_text_to_width(raw, width.saturating_sub(2)) {
-                    lines.push(RenderedLine::plain(Line::from(Span::raw(format!(
-                        "  {wrapped}"
-                    )))));
+        let fallback_src = if !detail.body_plain.trim().is_empty() {
+            detail.body_plain.as_str()
+        } else if !detail.body_markdown.trim().is_empty() {
+            detail.body_markdown.as_str()
+        } else {
+            ""
+        };
+        if !fallback_src.is_empty() {
+            let html_theme = theme.to_html_theme();
+            let render_width = width.saturating_sub(2).clamp(12, u16::MAX as usize) as u16;
+            for mut line in bitefoundry_html::markdown::render_markdown(
+                fallback_src,
+                render_width,
+                &html_theme,
+                show_inline_hrefs,
+            ) {
+                if !line.spans.is_empty() {
+                    line.spans.insert(0, Span::raw("  "));
                 }
+                lines.push(RenderedLine::plain(line));
             }
         } else {
             lines.push(RenderedLine::plain(Line::from(Span::styled(
@@ -1280,8 +1293,11 @@ fn render_block_into(
             ..
         } => {
             let is_html = crate::ui::app::is_html_resource_meta(Some(mime_type), Some(name));
+            let is_md = crate::ui::app::is_markdown_resource_meta(Some(mime_type), Some(name));
             let chip = if is_html {
                 format!("[HTML {name} ({mime_type}) — Enter/click preview]")
+            } else if is_md {
+                format!("[MD {name} ({mime_type}) — Enter/click preview]")
             } else {
                 format!("[FILE {name} ({mime_type}) — A download]")
             };
@@ -2034,6 +2050,77 @@ mod tests {
         assert_eq!(
             block_to_markdown(&detail.blocks[2]),
             "- [x] Verify XHTML parser"
+        );
+    }
+
+    #[test]
+    fn fallback_markdown_and_outbound_underscore_callout() {
+        // 1. Plain-text fallback when blocks is empty renders Markdown via bitefoundry_html::markdown
+        let detail = OnenotePageDetail {
+            summary: sample_summary("Fallback Page", 0, false),
+            raw_xhtml: String::new(),
+            body_markdown: String::new(),
+            body_plain: "# H1\n**bold**".to_string(),
+            blocks: Vec::new(),
+            resources: Vec::new(),
+            primary_div_id: None,
+            synced_at: None,
+        };
+
+        let (lines, ranges) = build_page_canvas_lines(
+            &detail,
+            None,
+            &HashMap::new(),
+            &Theme::default(),
+            80,
+        );
+        assert!(ranges.is_empty());
+        // Skip the 3 header lines (page title `# Fallback Page`, metadata, divider) to inspect body
+        let body_text: String = lines
+            .iter()
+            .skip(3)
+            .map(|r| {
+                r.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body_text.contains("H1"), "expected H1 in fallback:\n{body_text}");
+        assert!(body_text.contains("bold"), "expected bold in fallback:\n{body_text}");
+        assert!(!body_text.contains("# "), "raw '#' leaked in fallback:\n{body_text}");
+        assert!(!body_text.contains("**"), "raw '**' leaked in fallback:\n{body_text}");
+
+        // 2. Outbound Markdown -> OneNote XHTML via pulldown-cmark:
+        //    underscore _italic_ / __bold__, backslash escapes, and GFM Callout (> [!note])
+        let outbound_md = "_italic_ __bold__ \\*escaped\\*\n\n> [!note]\n> Callout body text\n\n> [!warning] Inline warning";
+        let xhtml = crate::parser::markdown_to_onenote_html_fragment(outbound_md, &[]);
+        assert!(
+            xhtml.contains("<em>italic</em>"),
+            "expected <em>italic</em>, got: {xhtml}"
+        );
+        assert!(
+            xhtml.contains("<strong>bold</strong>"),
+            "expected <strong>bold</strong>, got: {xhtml}"
+        );
+        assert!(
+            xhtml.contains("*escaped*") && !xhtml.contains("\\*escaped"),
+            "expected backslash escape resolved, got: {xhtml}"
+        );
+        assert!(
+            xhtml.contains(r#"data-callout="note""#)
+                && xhtml.contains("border-left:4px solid")
+                && xhtml.contains("<strong>NOTE</strong>")
+                && xhtml.contains("Callout body text"),
+            "expected styled GFM note callout, got: {xhtml}"
+        );
+        assert!(
+            xhtml.contains(r#"data-callout="warning""#)
+                && xhtml.contains("<strong>WARNING</strong>")
+                && xhtml.contains("Inline warning"),
+            "expected styled GFM warning callout, got: {xhtml}"
         );
     }
 }
