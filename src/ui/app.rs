@@ -186,6 +186,23 @@ pub enum UiMsg {
         task_id: u64,
         error: String,
     },
+    MutationFailed {
+        task_id: u64,
+        page_key: String,
+        error: String,
+        rollback_detail: Option<Box<OnenotePageDetail>>,
+    },
+    InlineSaved {
+        task_id: u64,
+        detail: Box<OnenotePageDetail>,
+        cleared_draft_key: Option<String>,
+    },
+    InlineConflict {
+        task_id: u64,
+        detail: Box<OnenotePageDetail>,
+        draft_to_preserve: Option<(String, NoteDraftEntry)>,
+        message: String,
+    },
     Info(String),
     Error(String),
 }
@@ -217,6 +234,7 @@ pub struct UiState {
     pub onenote_scroll: usize,
     pub onenote_selected_block: usize,
     pub onenote_follow_selection: bool,
+    pub inline_editor: Option<crate::ui::inline_editor::OnenoteInlineEditor>,
     pub pending_pixel_graphics: Vec<PendingPixelGraphic>,
     pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
 }
@@ -254,6 +272,7 @@ impl UiState {
             onenote_scroll: 0,
             onenote_selected_block: 0,
             onenote_follow_selection: false,
+            inline_editor: None,
             pending_pixel_graphics: Vec::new(),
             active_pixel_graphic: None,
         }
@@ -268,9 +287,13 @@ impl UiState {
     }
 
     pub fn accepts_text_input(&self) -> bool {
-        self.overlays
-            .last()
-            .is_some_and(Overlay::accepts_text)
+        if !self.overlays.is_empty() {
+            self.overlays
+                .last()
+                .is_some_and(Overlay::accepts_text)
+        } else {
+            self.inline_editor.is_some()
+        }
     }
 
     pub fn info(&mut self, msg: impl Into<String>) {
@@ -697,6 +720,9 @@ impl AppState {
     }
 
     pub fn select_notebook(&mut self, notebook_key: String, ui: &mut UiState) {
+        if ui.inline_editor.is_some() {
+            self.flush_inline_editor(ui, true);
+        }
         self.active_html_resource_req = None;
         self.active_notebook_key = Some(notebook_key);
         self.active_section_key = None;
@@ -713,6 +739,9 @@ impl AppState {
     }
 
     pub fn select_section(&mut self, section_key: String, ui: &mut UiState) {
+        if ui.inline_editor.is_some() {
+            self.flush_inline_editor(ui, true);
+        }
         self.active_html_resource_req = None;
         if let Some(sec) = self
             .sections
@@ -739,12 +768,286 @@ impl AppState {
     }
 
     pub fn select_page(&mut self, page_key: String, ui: &mut UiState) {
+        if ui
+            .inline_editor
+            .as_ref()
+            .is_some_and(|ed| ed.page_key != page_key)
+        {
+            self.flush_inline_editor(ui, true);
+        }
         self.active_html_resource_req = None;
         self.set_active_page(Some(page_key.clone()));
         ui.onenote_scroll = 0;
         ui.onenote_selected_block = 0;
         self.request_page_detail(page_key);
         self.push_focus_to_sync();
+    }
+
+    /// Opens the direct in-place Note Canvas editor for the active page (no modal popup).
+    pub fn open_inline_editor(&mut self, ui: &mut UiState, preferred_block: Option<usize>) {
+        let Some(detail) = self.active_page_detail().cloned() else {
+            ui.warn("Open a OneNote page first");
+            return;
+        };
+        if ui
+            .inline_editor
+            .as_ref()
+            .is_some_and(|ed| ed.page_key == detail.summary.page_key)
+        {
+            ui.focus = Focus::Canvas;
+            ui.narrow_pane = NarrowPane::Canvas;
+            return;
+        }
+        let mut editor =
+            crate::ui::inline_editor::OnenoteInlineEditor::open_for_page(&detail, preferred_block);
+        let draft_key = format!("inline:{}", detail.summary.page_key);
+        if let Some(draft) = self.drafts.get_note(&draft_key) {
+            if !draft.body.is_empty() && draft.body != editor.composer.text() {
+                editor.composer.load_text(&draft.body);
+                editor.mark_dirty();
+            }
+        }
+        ui.focus = Focus::Canvas;
+        ui.narrow_pane = NarrowPane::Canvas;
+        ui.inline_editor = Some(editor);
+    }
+
+    /// Flushes any dirty inline canvas edits optimistically in 0ms and syncs to Graph in the background.
+    pub fn flush_inline_editor(&mut self, ui: &mut UiState, close_after: bool) {
+        let Some(ed) = ui.inline_editor.as_mut() else {
+            return;
+        };
+        if !ed.dirty {
+            if close_after {
+                ui.inline_editor = None;
+            }
+            return;
+        }
+
+        let page_key = ed.page_key.clone();
+        let page_title = ed.page_title.clone();
+        let edited_md = ed.composer.text().to_string();
+        let target = ed.target.clone();
+        let draft_key = format!("inline:{page_key}");
+
+        let unchanged = match &target {
+            crate::ui::inline_editor::InlineEditTarget::PageBody { base_markdown } => {
+                edited_md.replace("\r\n", "\n").trim()
+                    == base_markdown.replace("\r\n", "\n").trim()
+            }
+            crate::ui::inline_editor::InlineEditTarget::Block { base_content, .. } => {
+                edited_md.replace("\r\n", "\n").trim()
+                    == base_content.replace("\r\n", "\n").trim()
+            }
+            crate::ui::inline_editor::InlineEditTarget::Append => edited_md.trim().is_empty(),
+        };
+        if unchanged {
+            ed.dirty = false;
+            ed.dirty_since = None;
+            ed.save_status = crate::ui::inline_editor::InlineSaveStatus::Saved;
+            self.clear_draft(&draft_key);
+            if close_after {
+                ui.inline_editor = None;
+            }
+            return;
+        }
+
+        ed.mark_syncing();
+        if close_after {
+            ui.inline_editor = None;
+        }
+
+        // Apply 0ms optimistic local preview immediately so exiting or saving feels instant.
+        let rollback_detail = self.page_details.get(&page_key).cloned();
+        if let Some(current) = rollback_detail.as_ref() {
+            let optimistic_md = match &target {
+                crate::ui::inline_editor::InlineEditTarget::PageBody { .. } => {
+                    Some(edited_md.clone())
+                }
+                crate::ui::inline_editor::InlineEditTarget::Append => {
+                    if current.body_markdown.trim().is_empty() {
+                        Some(edited_md.clone())
+                    } else {
+                        Some(format!("{}\n\n{}", current.body_markdown.trim_end(), edited_md))
+                    }
+                }
+                crate::ui::inline_editor::InlineEditTarget::Block { .. } => None,
+            };
+            if let Some(md) = optimistic_md {
+                let outgoing = OutgoingOnenotePage {
+                    title: current.summary.title.clone(),
+                    markdown_body: md,
+                    inline_images: Vec::new(),
+                    level: None,
+                };
+                let xhtml = crate::parser::onenote::compile_new_page_xhtml(&outgoing);
+                let preview =
+                    crate::parser::onenote::parse_onenote_page_xhtml(current.summary.clone(), &xhtml);
+                self.page_details.insert(page_key.clone(), preview);
+            }
+        }
+
+        let task_id = ui.tasks.start("Syncing note");
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            match target {
+                crate::ui::inline_editor::InlineEditTarget::PageBody { base_markdown } => {
+                    if base_markdown.trim().is_empty() {
+                        match crate::cli::append_onenote_page_helper(
+                            &storage,
+                            &graph,
+                            &page_key,
+                            &edited_md,
+                            &[],
+                        )
+                        .await
+                        {
+                            Ok(detail) => {
+                                storage.record_page_mutated(&detail.summary.page_key);
+                                let _ = tx.send(UiMsg::InlineSaved {
+                                    task_id,
+                                    detail: Box::new(detail),
+                                    cleared_draft_key: Some(draft_key),
+                                });
+                            }
+                            Err(err) => {
+                                let _ = tx.send(UiMsg::MutationFailed {
+                                    task_id,
+                                    page_key,
+                                    error: format!("Failed to save note: {err}"),
+                                    rollback_detail: rollback_detail.map(Box::new),
+                                });
+                            }
+                        }
+                    } else {
+                        match crate::cli::update_onenote_page_guarded(
+                            &storage,
+                            &graph,
+                            &page_key,
+                            None,
+                            Some(&edited_md),
+                            None,
+                            Some(&base_markdown),
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(crate::cli::GuardedUpdateResult::Updated(detail)) => {
+                                storage.record_page_mutated(&detail.summary.page_key);
+                                let _ = tx.send(UiMsg::InlineSaved {
+                                    task_id,
+                                    detail: Box::new(detail),
+                                    cleared_draft_key: Some(draft_key),
+                                });
+                            }
+                            Ok(crate::cli::GuardedUpdateResult::Conflict { latest, message }) => {
+                                let _ = tx.send(UiMsg::InlineConflict {
+                                    task_id,
+                                    detail: Box::new(latest),
+                                    draft_to_preserve: Some((
+                                        draft_key,
+                                        NoteDraftEntry {
+                                            title: page_title,
+                                            body: edited_md,
+                                            base_content: Some(base_markdown),
+                                        },
+                                    )),
+                                    message: format!("{message} Local draft preserved."),
+                                });
+                            }
+                            Err(err) => {
+                                let _ = tx.send(UiMsg::MutationFailed {
+                                    task_id,
+                                    page_key,
+                                    error: format!("Failed to save note: {err}"),
+                                    rollback_detail: rollback_detail.map(Box::new),
+                                });
+                            }
+                        }
+                    }
+                }
+                crate::ui::inline_editor::InlineEditTarget::Block {
+                    element_id,
+                    base_content,
+                    ..
+                } => {
+                    match crate::cli::update_onenote_page_guarded(
+                        &storage,
+                        &graph,
+                        &page_key,
+                        None,
+                        Some(&edited_md),
+                        Some(&element_id),
+                        Some(&base_content),
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(crate::cli::GuardedUpdateResult::Updated(detail)) => {
+                            storage.record_page_mutated(&detail.summary.page_key);
+                            let _ = tx.send(UiMsg::InlineSaved {
+                                task_id,
+                                detail: Box::new(detail),
+                                cleared_draft_key: Some(draft_key),
+                            });
+                        }
+                        Ok(crate::cli::GuardedUpdateResult::Conflict { latest, message }) => {
+                            let _ = tx.send(UiMsg::InlineConflict {
+                                task_id,
+                                detail: Box::new(latest),
+                                draft_to_preserve: Some((
+                                    draft_key,
+                                    NoteDraftEntry {
+                                        title: page_title,
+                                        body: edited_md,
+                                        base_content: Some(base_content),
+                                    },
+                                )),
+                                message: format!("{message} Local draft preserved."),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(UiMsg::MutationFailed {
+                                task_id,
+                                page_key,
+                                error: format!("Failed to save block: {err}"),
+                                rollback_detail: rollback_detail.map(Box::new),
+                            });
+                        }
+                    }
+                }
+                crate::ui::inline_editor::InlineEditTarget::Append => {
+                    match crate::cli::append_onenote_page_helper(
+                        &storage,
+                        &graph,
+                        &page_key,
+                        &edited_md,
+                        &[],
+                    )
+                    .await
+                    {
+                        Ok(detail) => {
+                            storage.record_page_mutated(&detail.summary.page_key);
+                            let _ = tx.send(UiMsg::InlineSaved {
+                                task_id,
+                                detail: Box::new(detail),
+                                cleared_draft_key: Some(draft_key),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(UiMsg::MutationFailed {
+                                task_id,
+                                page_key,
+                                error: format!("Failed to append content: {err}"),
+                                rollback_detail: rollback_detail.map(Box::new),
+                            });
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub fn request_section_pages(&mut self, section_key: String) {
@@ -1135,6 +1438,29 @@ impl AppState {
         inline_images: Vec<InlineImageUpload>,
         ui: &mut UiState,
     ) {
+        // Optimistic 0ms preview on canvas while Graph PATCH runs in the background.
+        let rollback_detail = self.page_details.get(&page_key).cloned();
+        if let Some(current) = rollback_detail.as_ref() {
+            if inline_images.is_empty() && !markdown.trim().is_empty() {
+                let merged_md = if current.body_markdown.trim().is_empty() {
+                    markdown.clone()
+                } else {
+                    format!("{}\n\n{}", current.body_markdown.trim_end(), markdown)
+                };
+                let outgoing = OutgoingOnenotePage {
+                    title: current.summary.title.clone(),
+                    markdown_body: merged_md,
+                    inline_images: Vec::new(),
+                    level: None,
+                };
+                let xhtml = crate::parser::onenote::compile_new_page_xhtml(&outgoing);
+                let preview = crate::parser::onenote::parse_onenote_page_xhtml(
+                    current.summary.clone(),
+                    &xhtml,
+                );
+                self.page_details.insert(page_key.clone(), preview);
+            }
+        }
         let task_id = ui.tasks.start("Appending to page");
         let graph = self.graph.clone();
         let storage = self.storage.clone();
@@ -1160,9 +1486,11 @@ impl AppState {
                     });
                 }
                 Err(err) => {
-                    let _ = tx.send(UiMsg::TaskFailed {
+                    let _ = tx.send(UiMsg::MutationFailed {
                         task_id,
+                        page_key,
                         error: format!("Failed to append content: {err}"),
+                        rollback_detail: rollback_detail.map(Box::new),
                     });
                 }
             }
@@ -1248,6 +1576,15 @@ impl AppState {
         };
         let base_content = parser::block_baseline_content(block);
         let page_key = detail.summary.page_key.clone();
+        // Optimistic 0ms checkbox flip so toggling feels instantaneous; reverts on conflict/error.
+        let rollback_detail = Some(detail.clone());
+        if let Some(cached) = self.page_details.get_mut(&page_key) {
+            if let Some(blk) = cached.blocks.get_mut(block_index) {
+                if let Some(crate::models::OnenoteTagKind::Todo { completed }) = blk.tag.as_mut() {
+                    *completed = !*completed;
+                }
+            }
+        }
         let task_id = ui.tasks.start("Toggling to-do");
         let graph = self.graph.clone();
         let storage = self.storage.clone();
@@ -1287,9 +1624,11 @@ impl AppState {
                     });
                 }
                 Err(err) => {
-                    let _ = tx.send(UiMsg::TaskFailed {
+                    let _ = tx.send(UiMsg::MutationFailed {
                         task_id,
+                        page_key,
                         error: format!("Failed to toggle to-do: {err}"),
+                        rollback_detail: rollback_detail.map(Box::new),
                     });
                 }
             }
@@ -2021,6 +2360,81 @@ impl AppState {
             UiMsg::TaskFailed { task_id, error } => {
                 ui.tasks.finish(task_id);
                 ui.error(error);
+            }
+            UiMsg::MutationFailed {
+                task_id,
+                page_key,
+                error,
+                rollback_detail,
+            } => {
+                ui.tasks.finish(task_id);
+                if let Some(prev) = rollback_detail {
+                    self.page_details.insert(page_key.clone(), *prev);
+                }
+                if let Some(ref mut ed) = ui.inline_editor {
+                    if ed.page_key == page_key {
+                        ed.mark_error(error.clone());
+                    }
+                }
+                ui.error(error);
+            }
+            UiMsg::InlineSaved {
+                task_id,
+                detail,
+                cleared_draft_key,
+            } => {
+                ui.tasks.finish(task_id);
+                let pk = detail.summary.page_key.clone();
+                let new_md = detail.body_markdown.clone();
+                let epoch = self.storage.record_page_mutated(&pk);
+                self.locally_mutated_pages.insert(pk.clone(), epoch);
+                self.locally_deleted_pages.remove(&pk);
+                if let Some(key) = cleared_draft_key {
+                    self.clear_draft(&key);
+                }
+                if let Some(ref mut ed) = ui.inline_editor {
+                    if ed.page_key == pk {
+                        let new_base = match &ed.target {
+                            crate::ui::inline_editor::InlineEditTarget::PageBody { .. } => {
+                                Some(new_md)
+                            }
+                            crate::ui::inline_editor::InlineEditTarget::Block {
+                                element_id, ..
+                            } => parser::find_block_by_element_id(&detail, element_id)
+                                .map(parser::block_baseline_content),
+                            crate::ui::inline_editor::InlineEditTarget::Append => {
+                                ed.composer.clear();
+                                None
+                            }
+                        };
+                        ed.mark_saved(new_base);
+                    }
+                }
+                self.evict_image_cache_for_page(&pk);
+                self.sync_detail_summary_into_pages(&detail.summary);
+                self.cache_page_detail(*detail);
+                self.refresh_active_search(ui);
+            }
+            UiMsg::InlineConflict {
+                task_id,
+                detail,
+                draft_to_preserve,
+                message,
+            } => {
+                ui.tasks.finish(task_id);
+                if let Some((draft_key, entry)) = draft_to_preserve {
+                    self.save_draft_entry(draft_key, entry);
+                }
+                let pk = detail.summary.page_key.clone();
+                if let Some(ref mut ed) = ui.inline_editor {
+                    if ed.page_key == pk {
+                        ed.mark_conflict(message.clone());
+                    }
+                }
+                self.evict_image_cache_for_page(&pk);
+                self.sync_detail_summary_into_pages(&detail.summary);
+                self.cache_page_detail(*detail);
+                ui.warn(message);
             }
             UiMsg::Info(msg) => ui.info(msg),
             UiMsg::Error(msg) => ui.error(msg),

@@ -540,6 +540,7 @@ struct UiLayoutSnapshot {
     overlays_len: usize,
     top_overlay_kind: Option<ui::overlays::OverlayKind>,
     focus: ui::app::Focus,
+    inline_editing: bool,
     show_nav_rail: bool,
     density: crate::config::DensityMode,
     onenote_scroll: usize,
@@ -558,6 +559,7 @@ impl UiLayoutSnapshot {
             overlays_len: ui.overlays.len(),
             top_overlay_kind: ui.overlays.last().map(ui::overlays::Overlay::kind),
             focus: ui.focus,
+            inline_editing: ui.inline_editor.is_some(),
             show_nav_rail: ui.show_nav_rail,
             density: ui.density,
             onenote_scroll: ui.onenote_scroll,
@@ -639,8 +641,10 @@ async fn process_terminal_event_with_burst(
         let next_ev = match stream.next().now_or_never() {
             Some(item) => item,
             None => {
-                let buffered = crossterm::event::poll(Duration::ZERO).unwrap_or(false);
-                if !has_enter && !buffered {
+                // `EventStream::poll_next` already polled with `Duration::ZERO` and woke its
+                // background reader thread. Never call `crossterm::event::poll(Duration::ZERO)`
+                // here — on Windows that contends on `INTERNAL_EVENT_READER` until the next key!
+                if !has_enter {
                     break;
                 }
                 match tokio::time::timeout(PASTE_BURST_POLL, stream.next()).await {
@@ -1223,7 +1227,11 @@ pub async fn run_with_persona(
             guard.restore();
             let initial_body = match ui.overlays.last() {
                 Some(ui::overlays::Overlay::OnenoteForm(form)) => form.body.clone(),
-                _ => String::new(),
+                _ => ui
+                    .inline_editor
+                    .as_ref()
+                    .map(|ed| ed.composer.text().to_string())
+                    .unwrap_or_default(),
             };
             let result = composer::external_edit(&initial_body);
             let mut stdout = io::stdout();
@@ -1270,6 +1278,10 @@ pub async fn run_with_persona(
                         ui.overlays.last_mut()
                     {
                         form.body = edited;
+                    } else if let Some(ref mut ed) = ui.inline_editor {
+                        ed.composer.load_text(&edited);
+                        ed.mark_dirty();
+                        app.flush_inline_editor(&mut ui, false);
                     }
                     ui.info("Updated OneNote Markdown from external editor");
                 }
@@ -1288,9 +1300,14 @@ pub async fn run_with_persona(
         let mut redraw_immediately = false;
         tokio::select! {
             _ = tick.tick() => {
+                let now = std::time::Instant::now();
                 let before = ui.toasts.len();
-                ui.toasts.tick(std::time::Instant::now());
+                ui.toasts.tick(now);
                 if ui.toasts.len() != before {
+                    dirty = true;
+                }
+                if ui.inline_editor.as_ref().is_some_and(|ed| ed.should_autosave(now)) {
+                    app.flush_inline_editor(&mut ui, false);
                     dirty = true;
                 }
                 if ui.poll_retrying || app.syncing || ui.tasks.first_running().is_some() {
@@ -1419,6 +1436,14 @@ pub async fn run_with_persona(
     if let Some(ui::overlays::Overlay::OnenoteForm(form)) = ui.overlays.last() {
         if let Some((key, entry)) = form.draft_entry_snapshot() {
             app.save_draft_entry(key, entry);
+        }
+    } else if let Some(ed) = ui.inline_editor.as_ref() {
+        if ed.dirty {
+            app.save_draft(
+                format!("inline:{}", ed.page_key),
+                ed.page_title.clone(),
+                ed.composer.text().to_string(),
+            );
         }
     }
     app.html_server.shutdown();

@@ -78,6 +78,20 @@ impl ComposerState {
         self.cursor
     }
 
+    pub fn set_cursor_byte(&mut self, pos: usize) {
+        let mut clamped = pos.min(self.text.len());
+        while clamped > 0 && !self.text.is_char_boundary(clamped) {
+            clamped -= 1;
+        }
+        self.cursor = clamped;
+        self.anchor = None;
+    }
+
+    pub fn cursor_line_col_1based(&self) -> (usize, usize) {
+        let (line, col) = line_col(&self.text, self.cursor);
+        (line + 1, col + 1)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty() && self.pending_images.is_empty()
     }

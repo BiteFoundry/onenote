@@ -44,7 +44,7 @@ pub fn key_to_action(
             KeyCommand::NewSection => Action::OpenOnenoteCreateSection,
             KeyCommand::NewPage => Action::OpenOnenoteCreatePage { level: 0 },
             KeyCommand::AppendMarkdown => Action::OpenOnenoteAppend,
-            KeyCommand::EditBlock => Action::OpenOnenoteEditBlock,
+            KeyCommand::EditBlock => Action::StartInlineEdit,
             KeyCommand::ToggleTodo => Action::OnenoteToggleTodo(None),
             KeyCommand::DeletePage => Action::ConfirmDeleteOnenotePage,
             KeyCommand::OpenWeb => Action::OnenoteOpenWeb,
@@ -59,6 +59,36 @@ pub fn key_to_action(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    if focus == Focus::Canvas && text_input {
+        if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+            return Some(Action::InlineSave);
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z')) {
+            return Some(Action::Undo);
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            return Some(Action::Redo);
+        }
+        return match key.code {
+            KeyCode::Esc => Some(Action::InlineClose),
+            KeyCode::Enter => Some(Action::InsertNewline),
+            KeyCode::Tab => Some(Action::Tab),
+            KeyCode::BackTab => Some(Action::InlineClose),
+            KeyCode::Backspace => Some(Action::Backspace),
+            KeyCode::Delete => Some(Action::Delete),
+            KeyCode::Up => Some(Action::CursorUp),
+            KeyCode::Down => Some(Action::CursorDown),
+            KeyCode::Left => Some(Action::CursorLeft),
+            KeyCode::Right => Some(Action::CursorRight),
+            KeyCode::Home => Some(Action::CursorHome),
+            KeyCode::End => Some(Action::CursorEnd),
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Char(ch) if !ctrl && !alt => Some(Action::Input(ch)),
+            _ => None,
+        };
+    }
 
     if focus == Focus::Overlay {
         if ctrl && key.code == KeyCode::Enter || alt && key.code == KeyCode::Enter {

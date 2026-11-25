@@ -90,7 +90,7 @@ impl KeyMap {
             KeyCode::Char('S') => Some(KeyCommand::NewSection),
             KeyCode::Char('n') => Some(KeyCommand::NewPage),
             KeyCode::Char('a') => Some(KeyCommand::AppendMarkdown),
-            KeyCode::Char('e') => Some(KeyCommand::EditBlock),
+            KeyCode::Char('e') | KeyCode::Char('i') => Some(KeyCommand::EditBlock),
             KeyCode::Char(' ') | KeyCode::Char('x') => Some(KeyCommand::ToggleTodo),
             KeyCode::Char('D') | KeyCode::Delete => Some(KeyCommand::DeletePage),
             KeyCode::Char('o') => Some(KeyCommand::OpenWeb),

@@ -38,6 +38,9 @@ pub enum ButtonId {
     ConfirmCancel,
     FormSubmit,
     FormCancel,
+    // Inline canvas editor buttons
+    InlineSave,
+    InlineDone,
 }
 
 /// Clickable targets on the screen.
@@ -67,6 +70,8 @@ pub enum HitTarget {
     OverlayBody,
     /// Item inside the top overlay.
     OverlayItem { index: usize },
+    /// Direct inline canvas text editor area.
+    InlineEditorBody,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -5,6 +5,7 @@ pub mod app;
 pub mod composer;
 pub mod event;
 pub mod hitmap;
+pub mod inline_editor;
 pub mod keymap;
 pub mod nav_pane;
 pub mod notification;
@@ -83,6 +84,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     let body = rows[0];
     let status = rows[1];
 
+    let mut cursor_pos = None;
     if area.width < 80 {
         // Narrow mode: compact top switcher + active pane
         let split = Layout::default()
@@ -93,7 +95,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
         match ui.narrow_pane {
             NarrowPane::Notebooks => nav_pane::draw(frame, split[1], app, ui, &mut hitmap),
             NarrowPane::Pages | NarrowPane::Canvas => {
-                onenote_view::draw(frame, split[1], app, ui, &mut hitmap)
+                cursor_pos = onenote_view::draw(frame, split[1], app, ui, &mut hitmap);
             }
         }
     } else if ui.show_nav_rail {
@@ -108,9 +110,9 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
             .split(body);
         nav_pane::draw(frame, cols[0], app, ui, &mut hitmap);
         draw_vertical_divider(frame, cols[1], &theme);
-        onenote_view::draw(frame, cols[2], app, ui, &mut hitmap);
+        cursor_pos = onenote_view::draw(frame, cols[2], app, ui, &mut hitmap);
     } else {
-        onenote_view::draw(frame, body, app, ui, &mut hitmap);
+        cursor_pos = onenote_view::draw(frame, body, app, ui, &mut hitmap);
     }
 
     draw_status_bar(frame, status, app, ui, &mut hitmap);
@@ -119,6 +121,9 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     // Register a full-screen backdrop before each overlay so only the top-most modal
     // can receive mouse clicks (preventing click-through to lower modals or main UI).
     let mut overlays = std::mem::take(&mut ui.overlays);
+    if !overlays.is_empty() {
+        cursor_pos = None;
+    }
     for ov in &mut overlays {
         hitmap.add(area, HitTarget::OverlayBackdrop);
         ov.draw(frame, area, app, ui, &mut hitmap);
@@ -126,7 +131,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     ui.overlays = overlays;
 
     ui.hitmap = hitmap;
-    None
+    cursor_pos
 }
 
 fn draw_vertical_divider(frame: &mut Frame, area: Rect, theme: &theme::Theme) {

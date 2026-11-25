@@ -113,7 +113,7 @@ pub fn draw(
     app: &mut AppState,
     ui: &mut UiState,
     hitmap: &mut HitMap,
-) {
+) -> Option<(u16, u16)> {
     let theme = ui.theme.clone();
     let focused = matches!(ui.focus, Focus::Canvas | Focus::Pages);
 
@@ -151,7 +151,7 @@ pub fn draw(
     frame.render_widget(block, area);
 
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return None;
     }
 
     // Row 0: Colored Horizontal Section Ribbon Bar
@@ -166,14 +166,14 @@ pub fn draw(
         hitmap,
     );
     if inner.height == 1 {
-        return;
+        return None;
     }
 
     // Row 1: Clickable Action Toolbar
     let toolbar_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
     draw_action_toolbar(frame, toolbar_area, &theme, hitmap);
     if inner.height <= 2 {
-        return;
+        return None;
     }
 
     // Split Body (Row 2..)
@@ -192,7 +192,7 @@ pub fn draw(
             .split(body_area);
 
         draw_page_list_column(frame, cols[0], app, ui, &theme, hitmap);
-        draw_note_canvas(frame, cols[1], app, ui, &theme, hitmap);
+        draw_note_canvas(frame, cols[1], app, ui, &theme, hitmap)
     } else {
         // Narrow mode (< 76 cols): compact active-page selector bar + full-width Note Canvas
         if body_area.height >= 3 {
@@ -204,9 +204,9 @@ pub fn draw(
                 body_area.height - 1,
             );
             draw_compact_page_bar(frame, selector_rect, app, &theme, hitmap);
-            draw_note_canvas(frame, canvas_rect, app, ui, &theme, hitmap);
+            draw_note_canvas(frame, canvas_rect, app, ui, &theme, hitmap)
         } else {
-            draw_note_canvas(frame, body_area, app, ui, &theme, hitmap);
+            draw_note_canvas(frame, body_area, app, ui, &theme, hitmap)
         }
     }
 }
@@ -608,7 +608,7 @@ fn draw_note_canvas(
     ui: &mut UiState,
     theme: &Theme,
     hitmap: &mut HitMap,
-) {
+) -> Option<(u16, u16)> {
     hitmap.add(area, HitTarget::PaneCanvas);
     let inner = Rect::new(
         area.x.saturating_add(1),
@@ -617,7 +617,13 @@ fn draw_note_canvas(
         area.height,
     );
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return None;
+    }
+
+    if let Some(ref mut editor) = ui.inline_editor {
+        if app.active_page_key.as_deref() == Some(editor.page_key.as_str()) {
+            return editor.draw(frame, inner, theme, hitmap);
+        }
     }
 
     let Some(detail) = app.active_page_detail().cloned() else {
@@ -640,7 +646,7 @@ fn draw_note_canvas(
             WrapPrefix::empty(),
         );
         frame.render_widget(Paragraph::new(wrapped), inner);
-        return;
+        return None;
     };
 
     if !detail.blocks.is_empty() && ui.onenote_selected_block >= detail.blocks.len() {
@@ -719,6 +725,7 @@ fn draw_note_canvas(
     ui.onenote_scroll = offset;
 
     render_scrolled_lines(frame, inner, &lines, offset, height, hitmap);
+    None
 }
 
 /// Helper wrapping terminal image lookup from `app.image_cache`.

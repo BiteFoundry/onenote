@@ -52,11 +52,16 @@ pub enum Action {
     InsertNewline,
     Backspace,
     Delete,
+    Undo,
+    Redo,
     Paste(String),
     PasteClipboard,
     ClearPendingImages,
     OverlaySubmit,
     CloseOverlay,
+    StartInlineEdit,
+    InlineSave,
+    InlineClose,
     OpenOverlay(OverlayKind),
     OpenSearch,
     OpenSearchWithQuery(String),
@@ -206,6 +211,77 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 return dispatch_inner(next, app, ui);
             }
             OverlayOutcome::NotHandled => {}
+        }
+    }
+
+    // Route actions to the active in-place inline canvas editor when no modal overlay is open.
+    if ui.overlays.is_empty() && ui.inline_editor.is_some() {
+        match &action {
+            Action::InlineSave => {
+                app.flush_inline_editor(ui, false);
+                return false;
+            }
+            Action::InlineClose => {
+                app.flush_inline_editor(ui, true);
+                return false;
+            }
+            Action::RequestExternalEditor => {
+                ui.editor_requested = true;
+                return false;
+            }
+            Action::MouseClick {
+                target: HitTarget::InlineEditorBody,
+                col,
+                row,
+            } => {
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.handle_click(*col, *row);
+                }
+                return false;
+            }
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::InlineSave),
+                ..
+            } => {
+                app.flush_inline_editor(ui, false);
+                return false;
+            }
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::InlineDone),
+                ..
+            } => {
+                app.flush_inline_editor(ui, true);
+                return false;
+            }
+            Action::Input(_)
+            | Action::Paste(_)
+            | Action::PasteClipboard
+            | Action::InsertNewline
+            | Action::Newline
+            | Action::Activate
+            | Action::Tab
+            | Action::Backspace
+            | Action::Delete
+            | Action::Undo
+            | Action::Redo
+            | Action::CursorLeft
+            | Action::CursorRight
+            | Action::CursorUp
+            | Action::CursorDown
+            | Action::MoveUp
+            | Action::MoveDown
+            | Action::CursorHome
+            | Action::CursorEnd
+            | Action::PageUp
+            | Action::PageDown
+            | Action::ScrollTop
+            | Action::ScrollBottom => {
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.handle_action(&action);
+                }
+                return false;
+            }
+            _ => {}
         }
     }
 
@@ -396,9 +472,12 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                     if let Some(pk) = app.active_page_key.clone() {
                         app.request_page_detail(pk);
                     }
+                    if app.active_page_detail().is_some() {
+                        app.open_inline_editor(ui, None);
+                    }
                 }
                 Focus::Canvas => {
-                    // Activate on a todo block toggles it; on an image block opens image preview; otherwise edits block
+                    // Activate on a todo block toggles it; on an image block opens image preview; otherwise edits inline
                     if let Some(detail) = app.active_page_detail() {
                         if let Some(blk) = detail.blocks.get(ui.onenote_selected_block) {
                             if blk.tag.as_ref().is_some_and(|t| t.is_todo()) {
@@ -429,7 +508,8 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                             }
                         }
                     }
-                    return dispatch(Action::OpenOnenoteEditBlock, app, ui);
+                    app.open_inline_editor(ui, Some(ui.onenote_selected_block));
+                    return false;
                 }
                 Focus::Overlay => {}
             }
@@ -1115,12 +1195,26 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
             ui.info("Press Ctrl+E inside a OneNote editor modal to open $EDITOR");
             false
         }
+        Action::StartInlineEdit => {
+            app.open_inline_editor(ui, Some(ui.onenote_selected_block));
+            false
+        }
+        Action::InlineSave => {
+            app.flush_inline_editor(ui, false);
+            false
+        }
+        Action::InlineClose => {
+            app.flush_inline_editor(ui, true);
+            false
+        }
         Action::Tab
         | Action::Input(_)
         | Action::Newline
         | Action::InsertNewline
         | Action::Backspace
         | Action::Delete
+        | Action::Undo
+        | Action::Redo
         | Action::Paste(_)
         | Action::PasteClipboard
         | Action::ClearPendingImages
@@ -1246,6 +1340,17 @@ fn handle_mouse_click(
             ui.overlays.clear();
             ui.focus = Focus::Canvas;
             sync_narrow_from_focus(ui);
+            if app.active_page_detail().is_some() {
+                app.open_inline_editor(ui, None);
+            }
+            false
+        }
+        HitTarget::InlineEditorBody => {
+            ui.focus = Focus::Canvas;
+            sync_narrow_from_focus(ui);
+            if let Some(ref mut ed) = ui.inline_editor {
+                ed.handle_click(col, row);
+            }
             false
         }
         HitTarget::NavRow(idx) => {
@@ -1285,6 +1390,7 @@ fn handle_mouse_click(
             ui.focus = Focus::Canvas;
             sync_narrow_from_focus(ui);
             ui.onenote_selected_block = idx;
+            app.open_inline_editor(ui, Some(idx));
             false
         }
         HitTarget::OnenoteTodoToggle(idx) => {
@@ -1348,6 +1454,14 @@ fn handle_mouse_click(
                         form.focus_cancel_button();
                     }
                     dispatch(Action::CloseOverlay, app, ui)
+                }
+                ButtonId::InlineSave => {
+                    app.flush_inline_editor(ui, false);
+                    false
+                }
+                ButtonId::InlineDone => {
+                    app.flush_inline_editor(ui, true);
+                    false
                 }
                 ButtonId::HtmlPreview => dispatch(Action::OpenHtmlPreview, app, ui),
                 ButtonId::HtmlToggleRaw => {
