@@ -266,6 +266,17 @@ impl ComposerState {
         self.anchor = None;
     }
 
+    pub(crate) fn delete_byte_range(&mut self, range: Range<usize>) {
+        if range.start >= range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        self.delete_range(range);
+    }
+
     fn delete_range(&mut self, range: Range<usize>) {
         if range.start >= range.end {
             return;

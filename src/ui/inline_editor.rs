@@ -4,11 +4,12 @@
 //! for real 2D cursor navigation, UTF-8 / Korean IME hardware cursor placement,
 //! Undo/Redo, clipboard paste, and debounced background Graph syncing.
 //!
-//! Defaults to **Line Live Preview** (`EditorMode::LivePreview`): inactive logical lines
-//! render as clean rich Markdown (headings, checkboxes, bullets, blockquotes, horizontal
-//! rules, fenced code blocks, bold/italic/code/strike/links), while the active cursor line
-//! expands its raw Markdown source with syntax highlighting and exact hardware cursor `(cx, cy)`.
-//! Press `Ctrl+M` or click `[Live]`/`[Src]` to toggle full raw Markdown source mode.
+//! Defaults to **Full WYSIWYG Rendered** editing (`EditorMode::Rendered`): all lines —
+//! including the active cursor line — render rich Markdown (headings, checkboxes, bullets,
+//! blockquotes, horizontal rules, fenced code blocks, bold/italic/code/strike/links) with
+//! exact hardware cursor projection `(cx, cy)` and ergonomic WYSIWYG navigation.
+//! Press `Ctrl+M` or click `[Render]`/`[Live]`/`[Src]` to cycle through `Rendered`,
+//! Obsidian-style `LivePreview`, and raw `Source` modes.
 
 use std::time::{Duration, Instant};
 
@@ -39,8 +40,10 @@ pub const INLINE_AUTOSAVE_DEBOUNCE_MS: u64 = 1_500;
 /// Rendering mode for the in-place OneNote canvas editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorMode {
-    /// Obsidian-style Line Live Preview: inactive lines render rich Markdown; active line exposes raw Markdown.
+    /// Full WYSIWYG rendered Markdown editing across all lines, including the active line.
     #[default]
+    Rendered,
+    /// Obsidian-style Line Live Preview: inactive lines render rich Markdown; active line exposes raw Markdown.
     LivePreview,
     /// Full raw Markdown source mode with syntax highlighting across all lines.
     Source,
@@ -142,7 +145,7 @@ impl OnenoteInlineEditor {
             page_key: detail.summary.page_key.clone(),
             page_title: detail.summary.title.clone(),
             target,
-            mode: EditorMode::LivePreview,
+            mode: EditorMode::Rendered,
             composer,
             dirty: false,
             dirty_since: None,
@@ -152,11 +155,12 @@ impl OnenoteInlineEditor {
         }
     }
 
-    /// Toggles between `EditorMode::LivePreview` and `EditorMode::Source`.
+    /// Cycles editor mode: `Rendered` -> `LivePreview` -> `Source` -> `Rendered`.
     pub fn toggle_mode(&mut self) {
         self.mode = match self.mode {
+            EditorMode::Rendered => EditorMode::LivePreview,
             EditorMode::LivePreview => EditorMode::Source,
-            EditorMode::Source => EditorMode::LivePreview,
+            EditorMode::Source => EditorMode::Rendered,
         };
     }
 
@@ -222,11 +226,17 @@ impl OnenoteInlineEditor {
                 InlineEditEvent::ModeChanged
             }
             Action::Input(ch) => {
+                if self.mode == EditorMode::Rendered && !self.composer.has_selection() {
+                    self.snap_cursor_out_of_rendered_prefix();
+                }
                 self.composer.insert_char(*ch);
                 self.mark_dirty();
                 InlineEditEvent::TextChanged
             }
             Action::Paste(text) => {
+                if self.mode == EditorMode::Rendered && !self.composer.has_selection() {
+                    self.snap_cursor_out_of_rendered_prefix();
+                }
                 self.composer.insert_str(text);
                 self.mark_dirty();
                 InlineEditEvent::TextChanged
@@ -235,6 +245,9 @@ impl OnenoteInlineEditor {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     if let Ok(text) = cb.get_text() {
                         if !text.is_empty() {
+                            if self.mode == EditorMode::Rendered && !self.composer.has_selection() {
+                                self.snap_cursor_out_of_rendered_prefix();
+                            }
                             self.composer.insert_str(&composer::normalize(&text));
                             self.mark_dirty();
                             return InlineEditEvent::TextChanged;
@@ -244,22 +257,36 @@ impl OnenoteInlineEditor {
                 InlineEditEvent::Ignored
             }
             Action::InsertNewline | Action::Newline | Action::Activate => {
+                if self.mode == EditorMode::Rendered && !self.composer.has_selection() {
+                    self.snap_cursor_out_of_rendered_prefix();
+                }
                 self.composer.newline();
                 self.mark_dirty();
                 InlineEditEvent::TextChanged
             }
             Action::Tab => {
+                if self.mode == EditorMode::Rendered && !self.composer.has_selection() {
+                    self.snap_cursor_out_of_rendered_prefix();
+                }
                 self.composer.insert_str("  ");
                 self.mark_dirty();
                 InlineEditEvent::TextChanged
             }
             Action::Backspace => {
-                self.composer.backspace();
+                if self.mode == EditorMode::Rendered {
+                    self.rendered_backspace();
+                } else {
+                    self.composer.backspace();
+                }
                 self.mark_dirty();
                 InlineEditEvent::TextChanged
             }
             Action::Delete => {
-                self.composer.delete_forward();
+                if self.mode == EditorMode::Rendered {
+                    self.rendered_delete_forward();
+                } else {
+                    self.composer.delete_forward();
+                }
                 self.mark_dirty();
                 InlineEditEvent::TextChanged
             }
@@ -280,23 +307,41 @@ impl OnenoteInlineEditor {
                 }
             }
             Action::CursorLeft => {
-                self.composer.move_left(false);
+                if self.mode == EditorMode::Rendered {
+                    self.rendered_move_left();
+                } else {
+                    self.composer.move_left(false);
+                }
                 InlineEditEvent::CursorChanged
             }
             Action::CursorRight => {
-                self.composer.move_right(false);
+                if self.mode == EditorMode::Rendered {
+                    self.rendered_move_right();
+                } else {
+                    self.composer.move_right(false);
+                }
                 InlineEditEvent::CursorChanged
             }
             Action::CursorUp | Action::MoveUp => {
                 self.composer.move_up(false);
+                if self.mode == EditorMode::Rendered {
+                    self.snap_cursor_out_of_rendered_prefix();
+                }
                 InlineEditEvent::CursorChanged
             }
             Action::CursorDown | Action::MoveDown => {
                 self.composer.move_down(false);
+                if self.mode == EditorMode::Rendered {
+                    self.snap_cursor_out_of_rendered_prefix();
+                }
                 InlineEditEvent::CursorChanged
             }
             Action::CursorHome => {
-                self.composer.move_home(false);
+                if self.mode == EditorMode::Rendered {
+                    self.rendered_move_home();
+                } else {
+                    self.composer.move_home(false);
+                }
                 InlineEditEvent::CursorChanged
             }
             Action::CursorEnd => {
@@ -307,16 +352,25 @@ impl OnenoteInlineEditor {
                 for _ in 0..8 {
                     self.composer.move_up(false);
                 }
+                if self.mode == EditorMode::Rendered {
+                    self.snap_cursor_out_of_rendered_prefix();
+                }
                 InlineEditEvent::CursorChanged
             }
             Action::PageDown => {
                 for _ in 0..8 {
                     self.composer.move_down(false);
                 }
+                if self.mode == EditorMode::Rendered {
+                    self.snap_cursor_out_of_rendered_prefix();
+                }
                 InlineEditEvent::CursorChanged
             }
             Action::ScrollTop => {
                 self.composer.move_doc_start(false);
+                if self.mode == EditorMode::Rendered {
+                    self.snap_cursor_out_of_rendered_prefix();
+                }
                 InlineEditEvent::CursorChanged
             }
             Action::ScrollBottom => {
@@ -327,8 +381,214 @@ impl OnenoteInlineEditor {
         }
     }
 
+    fn snap_cursor_out_of_rendered_prefix(&mut self) {
+        let cursor = self.composer.cursor();
+        let contexts = all_line_contexts(self.composer.text());
+        let ctx = line_context_for_cursor(&contexts, cursor);
+        if let Some((_, content_rel)) = rendered_block_prefix(ctx.raw, ctx.fence_kind) {
+            let content_start = ctx.line_start + content_rel;
+            if cursor < content_start {
+                self.composer.set_cursor_byte(content_start);
+            }
+        }
+    }
+
+    fn rendered_move_home(&mut self) {
+        let cursor = self.composer.cursor();
+        let contexts = all_line_contexts(self.composer.text());
+        let ctx = line_context_for_cursor(&contexts, cursor);
+        if let Some((_, content_rel)) = rendered_block_prefix(ctx.raw, ctx.fence_kind) {
+            self.composer.set_cursor_byte(ctx.line_start + content_rel);
+        } else {
+            self.composer.move_home(false);
+        }
+    }
+
+    fn rendered_move_left(&mut self) {
+        if self.composer.has_selection() {
+            self.composer.move_left(false);
+            self.snap_cursor_out_of_rendered_prefix();
+            return;
+        }
+        let cursor = self.composer.cursor();
+        let contexts = all_line_contexts(self.composer.text());
+        let ctx = line_context_for_cursor(&contexts, cursor);
+        let stops = rendered_line_stops(ctx);
+        let idx = stops.partition_point(|&b| b < cursor);
+        if idx > 0 {
+            self.composer.set_cursor_byte(stops[idx - 1]);
+        } else if ctx.line_idx > 0 {
+            let prev_end = contexts[ctx.line_idx - 1].line_end;
+            self.composer.set_cursor_byte(prev_end);
+        } else if let Some(&first_stop) = stops.first() {
+            self.composer.set_cursor_byte(first_stop);
+        }
+    }
+
+    fn rendered_move_right(&mut self) {
+        if self.composer.has_selection() {
+            self.composer.move_right(false);
+            self.snap_cursor_out_of_rendered_prefix();
+            return;
+        }
+        let cursor = self.composer.cursor();
+        let contexts = all_line_contexts(self.composer.text());
+        let ctx = line_context_for_cursor(&contexts, cursor);
+        let stops = rendered_line_stops(ctx);
+        let idx = stops.partition_point(|&b| b < cursor);
+        if idx + 1 < stops.len() {
+            self.composer.set_cursor_byte(stops[idx + 1]);
+        } else if ctx.line_idx + 1 < contexts.len() {
+            let next_stops = rendered_line_stops(&contexts[ctx.line_idx + 1]);
+            let target = next_stops
+                .first()
+                .copied()
+                .unwrap_or(contexts[ctx.line_idx + 1].line_start);
+            self.composer.set_cursor_byte(target);
+        } else {
+            self.composer.set_cursor_byte(ctx.line_end);
+        }
+    }
+
+    fn rendered_backspace(&mut self) {
+        if self.composer.delete_selection() {
+            self.cleanup_orphan_inline_delimiters();
+            return;
+        }
+        let cursor = self.composer.cursor();
+        if cursor == 0 {
+            return;
+        }
+        let (action_range, fallback_raw) = {
+            let text = self.composer.text();
+            let contexts = all_line_contexts(text);
+            let ctx = line_context_for_cursor(&contexts, cursor);
+            if !matches!(ctx.fence_kind, FenceLineKind::None) || is_horizontal_rule(ctx.raw) {
+                (None, true)
+            } else {
+                let prefix = rendered_block_prefix(ctx.raw, ctx.fence_kind);
+                let content_glyphs = rendered_line_content_glyphs(ctx);
+                let prev_glyph = content_glyphs.iter().rev().find(|g| g.src_byte < cursor);
+
+                if prev_glyph.is_none() {
+                    if let Some((del_start_rel, content_rel)) = prefix {
+                        (
+                            Some((ctx.line_start + del_start_rel)..(ctx.line_start + content_rel)),
+                            false,
+                        )
+                    } else if ctx.line_start > 0 {
+                        (Some((ctx.line_start - 1)..ctx.line_start), false)
+                    } else {
+                        (None, false)
+                    }
+                } else {
+                    let prev_byte = prev_glyph.unwrap().src_byte;
+                    let ch_len = text[prev_byte..].chars().next().map_or(1, char::len_utf8);
+                    let mut del_start = prev_byte;
+                    let mut del_end = prev_byte + ch_len;
+                    // If deleting an escaped punctuation char whose leading `\` is hidden, remove `\` too.
+                    if del_start > ctx.line_start
+                        && text.as_bytes()[del_start - 1] == b'\\'
+                        && is_escapable_punctuation(text.as_bytes()[del_start])
+                        && !content_glyphs.iter().any(|g| g.src_byte == del_start - 1)
+                    {
+                        del_start -= 1;
+                    }
+                    let (exp_start, exp_end) = expand_orphan_inline_delimiters(
+                        text,
+                        ctx.line_start,
+                        ctx.line_end,
+                        del_start,
+                        del_end,
+                    );
+                    del_start = exp_start;
+                    del_end = exp_end;
+                    (Some(del_start..del_end), false)
+                }
+            }
+        };
+
+        if fallback_raw {
+            self.composer.backspace();
+        } else if let Some(range) = action_range {
+            self.composer.delete_byte_range(range);
+        }
+    }
+
+    fn rendered_delete_forward(&mut self) {
+        if self.composer.delete_selection() {
+            self.cleanup_orphan_inline_delimiters();
+            return;
+        }
+        let cursor = self.composer.cursor();
+        if cursor >= self.composer.text().len() {
+            return;
+        }
+        let (action_range, fallback_raw) = {
+            let text = self.composer.text();
+            let contexts = all_line_contexts(text);
+            let ctx = line_context_for_cursor(&contexts, cursor);
+            if !matches!(ctx.fence_kind, FenceLineKind::None) || is_horizontal_rule(ctx.raw) {
+                (None, true)
+            } else {
+                let content_glyphs = rendered_line_content_glyphs(ctx);
+                let next_glyph = content_glyphs.iter().find(|g| g.src_byte >= cursor);
+                if let Some(ng) = next_glyph {
+                    let del_start = ng.src_byte;
+                    let ch_len = text[del_start..].chars().next().map_or(1, char::len_utf8);
+                    let del_end = del_start + ch_len;
+                    let mut adj_start = del_start;
+                    if adj_start > ctx.line_start
+                        && text.as_bytes()[adj_start - 1] == b'\\'
+                        && is_escapable_punctuation(text.as_bytes()[adj_start])
+                        && !content_glyphs.iter().any(|g| g.src_byte == adj_start - 1)
+                    {
+                        adj_start -= 1;
+                    }
+                    let (exp_start, exp_end) = expand_orphan_inline_delimiters(
+                        text,
+                        ctx.line_start,
+                        ctx.line_end,
+                        adj_start,
+                        del_end,
+                    );
+                    (Some(exp_start..exp_end), false)
+                } else if ctx.line_end < text.len() {
+                    (Some(ctx.line_end..(ctx.line_end + 1)), false)
+                } else {
+                    (None, false)
+                }
+            }
+        };
+
+        if fallback_raw {
+            self.composer.delete_forward();
+        } else if let Some(range) = action_range {
+            self.composer.delete_byte_range(range);
+        }
+    }
+
+    fn cleanup_orphan_inline_delimiters(&mut self) {
+        let cursor = self.composer.cursor();
+        let range = {
+            let text = self.composer.text();
+            let contexts = all_line_contexts(text);
+            let ctx = line_context_for_cursor(&contexts, cursor);
+            if !matches!(ctx.fence_kind, FenceLineKind::None) {
+                None
+            } else {
+                let (s, e) =
+                    expand_orphan_inline_delimiters(text, ctx.line_start, ctx.line_end, cursor, cursor);
+                (s < e).then_some(s..e)
+            }
+        };
+        if let Some(r) = range {
+            self.composer.delete_byte_range(r);
+        }
+    }
+
     /// Places the composer cursor accurately at the logical line & byte offset matching a
-    /// mouse click inside `last_editor_area` (works identically in both `LivePreview` and `Source`).
+    /// mouse click inside `last_editor_area` (works across `Rendered`, `LivePreview`, and `Source`).
     pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
         let area = self.last_editor_area;
         if area.width == 0
@@ -362,6 +622,9 @@ impl OnenoteInlineEditor {
         if let Some(vrow) = layout.rows.get(target_vis_row) {
             let pos = vrow.byte_offset_for_col(target_col);
             self.composer.set_cursor_byte(pos);
+            if self.mode == EditorMode::Rendered {
+                self.snap_cursor_out_of_rendered_prefix();
+            }
             return true;
         }
         self.composer.move_doc_end(false);
@@ -397,6 +660,7 @@ impl OnenoteInlineEditor {
         let bg = theme.bg_header;
 
         let (mode_pill, mode_pill_color) = match self.mode {
+            EditorMode::Rendered => (" [Render] ", theme.accent),
             EditorMode::LivePreview => (" [Live] ", theme.accent_soft),
             EditorMode::Source => (" [Src] ", theme.warning),
         };
@@ -618,6 +882,7 @@ struct Glyph {
     width: usize,
     style: Style,
     src_byte: usize,
+    synthetic: bool,
 }
 
 impl Glyph {
@@ -628,6 +893,7 @@ impl Glyph {
                 width: 4,
                 style,
                 src_byte,
+                synthetic: false,
             }
         } else {
             Self {
@@ -635,6 +901,7 @@ impl Glyph {
                 width: UnicodeWidthChar::width(ch).unwrap_or(0),
                 style,
                 src_byte,
+                synthetic: false,
             }
         }
     }
@@ -645,6 +912,7 @@ impl Glyph {
             width: UnicodeWidthChar::width(ch).unwrap_or(0),
             style,
             src_byte,
+            synthetic: true,
         }
     }
 
@@ -700,7 +968,13 @@ fn build_editor_layout(
     for (line_start, line_end) in ranges {
         let raw = &text[line_start..line_end];
         let is_active = cursor >= line_start && cursor <= line_end;
-        let hide_delimiters = mode == EditorMode::LivePreview && !is_active;
+        let has_overlapping_selection =
+            selection.is_some_and(|(s, e)| s < e && s < line_end && e > line_start);
+        let hide_delimiters = match mode {
+            EditorMode::Rendered => !has_overlapping_selection,
+            EditorMode::LivePreview => !is_active,
+            EditorMode::Source => false,
+        };
 
         // Track fenced code block state across logical lines regardless of active status.
         let fence_kind = if let Some((fch, flen)) = fence_state {
@@ -741,6 +1015,19 @@ fn build_editor_layout(
             }
         }
 
+        // In Rendered mode (hide_delimiters == true on the active line), if cursor falls
+        // before/inside a leading block prefix (`# `, `- [ ] `, `- `, `> `), project it right
+        // after the rendered prefix (`☐ `, `• `, `┃ `, or col 0 for headings).
+        let effective_cursor = if is_active && hide_delimiters {
+            if let Some((_, content_rel)) = rendered_block_prefix(raw, fence_kind) {
+                cursor.max(line_start + content_rel)
+            } else {
+                cursor
+            }
+        } else {
+            cursor
+        };
+
         // Soft-wrap glyphs into VisualRows while computing exact cursor (row, col) on the active line.
         let cont_w: usize = cont_prefix.iter().map(|g| g.width).sum();
         let use_cont = hide_delimiters && !cont_prefix.is_empty() && cont_w < width;
@@ -779,8 +1066,15 @@ fn build_editor_layout(
                 }
             }
 
-            if is_active && g.src_byte == cursor && cursor_pos.is_none() {
-                cursor_pos = Some((rows.len(), col));
+            if is_active && cursor_pos.is_none() && !g.synthetic {
+                let matched = if hide_delimiters {
+                    g.src_byte >= effective_cursor
+                } else {
+                    g.src_byte == effective_cursor
+                };
+                if matched {
+                    cursor_pos = Some((rows.len(), col));
+                }
             }
             row_cells.push(CellMap {
                 col_start: col,
@@ -1655,6 +1949,187 @@ fn parse_inline_markdown(
     }
 }
 
+// ---------------------------------------------------------------------------
+// WYSIWYG Rendered Mode Navigation & Editing Helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct LineContext<'a> {
+    line_idx: usize,
+    line_start: usize,
+    line_end: usize,
+    raw: &'a str,
+    fence_kind: FenceLineKind<'a>,
+}
+
+fn all_line_contexts(text: &str) -> Vec<LineContext<'_>> {
+    let ranges = logical_line_ranges(text);
+    let mut out = Vec::with_capacity(ranges.len());
+    let mut fence_state: Option<(char, usize)> = None;
+    for (line_idx, (line_start, line_end)) in ranges.into_iter().enumerate() {
+        let raw = &text[line_start..line_end];
+        let fence_kind = if let Some((fch, flen)) = fence_state {
+            if is_closing_fence(raw, fch, flen) {
+                fence_state = None;
+                FenceLineKind::Close
+            } else {
+                FenceLineKind::Body
+            }
+        } else if let Some((fch, flen, lang)) = parse_opening_fence(raw) {
+            fence_state = Some((fch, flen));
+            FenceLineKind::Open(lang)
+        } else {
+            FenceLineKind::None
+        };
+        out.push(LineContext {
+            line_idx,
+            line_start,
+            line_end,
+            raw,
+            fence_kind,
+        });
+    }
+    out
+}
+
+fn line_context_for_cursor<'a>(
+    contexts: &'a [LineContext<'a>],
+    cursor: usize,
+) -> &'a LineContext<'a> {
+    for ctx in contexts {
+        if cursor >= ctx.line_start && cursor <= ctx.line_end {
+            return ctx;
+        }
+    }
+    contexts.last().expect("logical_line_ranges is never empty")
+}
+
+/// Returns `(delete_start_rel, content_start_rel)` for a logical line whose leading Markdown
+/// block prefix (`# `..`###### `, `- [ ] `, `- [x] `, `- `, `* `, `+ `, `> `) is hidden/replaced
+/// in `Rendered` mode. Matches the exact priority of `build_logical_line_glyphs`.
+fn rendered_block_prefix(raw: &str, fence_kind: FenceLineKind<'_>) -> Option<(usize, usize)> {
+    if !matches!(fence_kind, FenceLineKind::None) || is_horizontal_rule(raw) {
+        return None;
+    }
+    if let Some((_, content_rel)) = parse_heading(raw) {
+        return Some((0, content_rel));
+    }
+    if let Some((indent, _, content_rel)) = parse_task_item(raw) {
+        return Some((indent, content_rel));
+    }
+    if let Some((indent, content_rel)) = parse_bullet_item(raw) {
+        return Some((indent, content_rel));
+    }
+    if parse_ordered_item(raw).is_some() {
+        return None;
+    }
+    if let Some((_, content_rel)) = parse_blockquote(raw) {
+        return Some((0, content_rel));
+    }
+    None
+}
+
+fn rendered_line_content_glyphs(ctx: &LineContext<'_>) -> Vec<Glyph> {
+    let theme = Theme::default();
+    let mut glyphs = Vec::with_capacity(ctx.raw.len());
+    let mut cont_prefix = Vec::new();
+    build_logical_line_glyphs(
+        ctx.raw,
+        ctx.line_start,
+        80,
+        ctx.fence_kind,
+        true,
+        &theme,
+        &mut glyphs,
+        &mut cont_prefix,
+    );
+    let min_byte = rendered_block_prefix(ctx.raw, ctx.fence_kind)
+        .map(|(_, content_rel)| ctx.line_start + content_rel)
+        .unwrap_or(ctx.line_start);
+    glyphs
+        .into_iter()
+        .filter(|g| !g.synthetic && g.src_byte >= min_byte)
+        .collect()
+}
+
+/// Ordered byte offsets for every visible cursor stop on a rendered line (each non-synthetic
+/// content glyph plus `ctx.line_end`).
+fn rendered_line_stops(ctx: &LineContext<'_>) -> Vec<usize> {
+    let mut stops: Vec<usize> = rendered_line_content_glyphs(ctx)
+        .into_iter()
+        .map(|g| g.src_byte)
+        .collect();
+    stops.push(ctx.line_end);
+    stops
+}
+
+/// Expands `[del_start..del_end]` on a logical line (`line_start..line_end`) to also remove any
+/// empty orphan inline delimiter pair (`***...***`, `**...**`, `__...__`, `~~...~~`, `` `...` ``,
+/// `*...*`, `_..._`) that would be left directly surrounding the cursor after deleting the range.
+fn expand_orphan_inline_delimiters(
+    text: &str,
+    line_start: usize,
+    line_end: usize,
+    mut del_start: usize,
+    mut del_end: usize,
+) -> (usize, usize) {
+    let line = &text[line_start..line_end];
+    let bytes = line.as_bytes();
+    let delims: &[(&str, bool)] = &[
+        ("***", false),
+        ("**", false),
+        ("__", true),
+        ("~~", false),
+        ("`", false),
+        ("*", false),
+        ("_", true),
+    ];
+
+    loop {
+        let rel_start = del_start - line_start;
+        let rel_end = del_end - line_start;
+        let before = &line[..rel_start];
+        let after = &line[rel_end..];
+        let mut expanded = false;
+
+        for &(delim, word_boundary) in delims {
+            let dlen = delim.len();
+            if !before.ends_with(delim) || !after.starts_with(delim) {
+                continue;
+            }
+            // Skip escaped opening delimiter (`\*`, `\~`, etc.).
+            if rel_start > dlen && bytes[rel_start - dlen - 1] == b'\\' {
+                continue;
+            }
+            // For single `*` or `_`, avoid partially stripping a `**` or `__` run.
+            if dlen == 1 {
+                let b = delim.as_bytes()[0];
+                let prev_same = rel_start > 1 && bytes[rel_start - 2] == b;
+                let next_same = rel_end + 1 < bytes.len() && bytes[rel_end + 1] == b;
+                if prev_same || next_same {
+                    continue;
+                }
+            }
+            if word_boundary
+                && (prev_char_is_word(line, rel_start - dlen)
+                    || next_char_is_word(line, rel_end + dlen))
+            {
+                continue;
+            }
+            del_start -= dlen;
+            del_end += dlen;
+            expanded = true;
+            break;
+        }
+
+        if !expanded {
+            break;
+        }
+    }
+
+    (del_start, del_end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1704,7 +2179,7 @@ mod tests {
         );
         let mut editor = OnenoteInlineEditor::open_for_page(&detail, Some(0));
         assert!(matches!(editor.target, InlineEditTarget::PageBody { .. }));
-        assert_eq!(editor.mode, EditorMode::LivePreview);
+        assert_eq!(editor.mode, EditorMode::Rendered);
         assert!(!editor.dirty);
 
         // Type Korean + ASCII directly with full cursor movement & undo
@@ -1760,6 +2235,7 @@ mod tests {
             r#"<!DOCTYPE html><html><head><title>Live Preview</title></head><body><div id="div:{1}"><p id="p:{1}">Init</p></div></body></html>"#,
         );
         let mut editor = OnenoteInlineEditor::open_for_page(&detail, None);
+        editor.mode = EditorMode::LivePreview;
         assert_eq!(editor.mode, EditorMode::LivePreview);
 
         let md = [
@@ -1857,6 +2333,7 @@ mod tests {
             r#"<!DOCTYPE html><html><head><title>Click Test</title></head><body><div id="div:{1}"><p id="p:{1}">Init</p></div></body></html>"#,
         );
         let mut editor = OnenoteInlineEditor::open_for_page(&detail, None);
+        editor.mode = EditorMode::LivePreview;
         editor
             .composer
             .load_text("# Title **Bold**\n- [ ] Task 한글\nLast **active** line");
@@ -1907,7 +2384,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_m_and_mode_pill_toggle_between_live_preview_and_source() {
+    fn ctrl_m_and_mode_pill_cycle_rendered_live_preview_and_source() {
         let keymap = crate::ui::keymap::KeyMap;
         let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
         let action = crate::ui::event::key_to_action(
@@ -1922,8 +2399,8 @@ mod tests {
             r#"<!DOCTYPE html><html><head><title>Mode Test</title></head><body><div id="div:{1}"><p id="p:{1}">Init</p></div></body></html>"#,
         );
         let mut editor = OnenoteInlineEditor::open_for_page(&detail, None);
-        editor.composer.load_text("# Heading\nSecond line");
-        assert_eq!(editor.mode, EditorMode::LivePreview);
+        editor.composer.load_text("# Heading\nSecond **line**");
+        assert_eq!(editor.mode, EditorMode::Rendered);
 
         let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
         let theme = Theme::default();
@@ -1934,21 +2411,38 @@ mod tests {
         .unwrap();
 
         let y0 = editor.last_editor_area.y;
-        // Header shows clickable `[Live]` pill and registers `ButtonId::InlineToggleMode`
-        let header = buffer_row_text(&term, 0, 80);
-        assert!(header.contains("[Live]"), "header={header:?}");
+        // 1) Rendered (default): `[Render]` pill registered, BOTH inactive & active lines rendered
+        let header_render = buffer_row_text(&term, 0, 80);
+        assert!(header_render.contains("[Render]"), "header={header_render:?}");
         assert!(
             hitmap
                 .region_of(HitTarget::Button(ButtonId::InlineToggleMode))
                 .is_some(),
-            "[Live] pill must register ButtonId::InlineToggleMode in HitMap"
+            "[Render] pill must register ButtonId::InlineToggleMode in HitMap"
         );
-        // Inactive line 0 is rendered without `# `
         assert_eq!(buffer_row_text(&term, y0, 80), "Heading");
+        assert_eq!(buffer_row_text(&term, y0 + 1, 80), "Second line");
 
-        // Toggle via Ctrl+M action -> Source mode exposes raw `# Heading` on inactive lines too
+        // 2) Toggle via Ctrl+M -> LivePreview: `[Live]` pill, inactive rendered, active raw
         assert_eq!(
             editor.handle_action(&action.unwrap()),
+            InlineEditEvent::ModeChanged
+        );
+        assert_eq!(editor.mode, EditorMode::LivePreview);
+
+        hitmap.clear();
+        term.draw(|f| {
+            editor.draw(f, f.area(), &theme, &mut hitmap);
+        })
+        .unwrap();
+        let header_live = buffer_row_text(&term, 0, 80);
+        assert!(header_live.contains("[Live]"), "header_live={header_live:?}");
+        assert_eq!(buffer_row_text(&term, y0, 80), "Heading");
+        assert_eq!(buffer_row_text(&term, y0 + 1, 80), "Second **line**");
+
+        // 3) Toggle via Ctrl+M -> Source: `[Src]` pill, all lines raw
+        assert_eq!(
+            editor.handle_action(&Action::InlineToggleMode),
             InlineEditEvent::ModeChanged
         );
         assert_eq!(editor.mode, EditorMode::Source);
@@ -1961,10 +2455,11 @@ mod tests {
         let header_src = buffer_row_text(&term, 0, 80);
         assert!(header_src.contains("[Src]"), "header_src={header_src:?}");
         assert_eq!(buffer_row_text(&term, y0, 80), "# Heading");
+        assert_eq!(buffer_row_text(&term, y0 + 1, 80), "Second **line**");
 
-        // Toggle back -> LivePreview
+        // 4) Toggle back -> Rendered
         editor.handle_action(&Action::InlineToggleMode);
-        assert_eq!(editor.mode, EditorMode::LivePreview);
+        assert_eq!(editor.mode, EditorMode::Rendered);
     }
 
     #[test]
@@ -1973,6 +2468,7 @@ mod tests {
             r#"<!DOCTYPE html><html><head><title>Wrap Test</title></head><body><div id="div:{1}"><p id="p:{1}">Init</p></div></body></html>"#,
         );
         let mut editor = OnenoteInlineEditor::open_for_page(&detail, None);
+        editor.mode = EditorMode::LivePreview;
         // Width = 20 cols:
         // Line 0 (inactive): "# 가나다라마바사아자차카타" -> rendered "가나다라마바사아자차카타" (24 cols) -> wraps to 2 rows (10 chars = 20 cols on row 0, 2 chars = 4 cols on row 1)
         // Line 1 (active):   "**한글** soft wrap 테스트" -> 25 cols -> wraps onto row 2 (20 cols) and row 3 (5 cols)
@@ -2013,5 +2509,247 @@ mod tests {
             "cursor should land on '타', got {:?}",
             &editor.composer.text()[editor.composer.cursor()..]
         );
+    }
+
+    #[test]
+    fn rendered_mode_keeps_active_line_rendered_with_exact_ascii_and_cjk_cursor_projection() {
+        let detail = sample_detail(
+            r#"<!DOCTYPE html><html><head><title>Rendered Cursor</title></head><body><div id="div:{1}"><p id="p:{1}">Init</p></div></body></html>"#,
+        );
+        let mut editor = OnenoteInlineEditor::open_for_page(&detail, None);
+        assert_eq!(editor.mode, EditorMode::Rendered);
+
+        let md = [
+            "## 한글 active **라인**",
+            "- [ ] Task **한글**",
+            "- Bullet item",
+            "> Quoted text",
+        ]
+        .join("\n");
+        editor.composer.load_text(&md);
+
+        let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let theme = Theme::default();
+        let mut hitmap = HitMap::default();
+        let draw_cursor = |term: &mut Terminal<TestBackend>,
+                           ed: &mut OnenoteInlineEditor,
+                           hitmap: &mut HitMap|
+         -> (u16, u16) {
+            let mut cursor = None;
+            term.draw(|f| {
+                cursor = ed.draw(f, f.area(), &theme, hitmap);
+            })
+            .unwrap();
+            cursor.expect("rendered editor must return hardware cursor")
+        };
+
+        // Move cursor to end of line 0 ("## 한글 active **라인**")
+        let line0_end = "## 한글 active **라인**".len();
+        editor.composer.set_cursor_byte(line0_end);
+        let (cx, cy) = draw_cursor(&mut term, &mut editor, &mut hitmap);
+        let y0 = editor.last_editor_area.y;
+        let x0 = editor.last_editor_area.x;
+
+        // Active line 0 stays fully rendered (no `## ` or `**`)
+        let row0 = buffer_row_text(&term, y0, 80);
+        assert_eq!(row0, "한글 active 라인");
+        assert!(!row0.contains('#') && !row0.contains('*'));
+        assert_eq!(cy, y0);
+        assert_eq!(cx, x0 + UnicodeWidthStr::width("한글 active 라인") as u16);
+
+        // Cursor positioned on `인` inside `**라인**` projects cleanly past hidden `## ` and `**`
+        let in_byte = md.find('인').unwrap();
+        editor.composer.set_cursor_byte(in_byte);
+        let (cx_in, cy_in) = draw_cursor(&mut term, &mut editor, &mut hitmap);
+        assert_eq!(cy_in, y0);
+        assert_eq!(cx_in, x0 + UnicodeWidthStr::width("한글 active 라") as u16);
+
+        // Cursor placed before/inside leading `# ` prefix projects to col 0 (heading start)
+        editor.composer.set_cursor_byte(0);
+        let (cx_h0, cy_h0) = draw_cursor(&mut term, &mut editor, &mut hitmap);
+        assert_eq!((cx_h0, cy_h0), (x0, y0));
+        editor.composer.set_cursor_byte(1);
+        let (cx_h1, cy_h1) = draw_cursor(&mut term, &mut editor, &mut hitmap);
+        assert_eq!((cx_h1, cy_h1), (x0, y0));
+
+        // Cursor inside leading `- [ ] ` prefix on line 1 projects right after `☐ ` (col 2)
+        let line1_start = line0_end + 1;
+        editor.composer.set_cursor_byte(line1_start);
+        let (cx_t0, cy_t0) = draw_cursor(&mut term, &mut editor, &mut hitmap);
+        assert_eq!(buffer_row_text(&term, y0 + 1, 80), "☐ Task 한글");
+        assert_eq!(cy_t0, y0 + 1);
+        assert_eq!(cx_t0, x0 + UnicodeWidthStr::width("☐ ") as u16);
+
+        // Typing when cursor was on leading prefix inserts into task content, preserving `- [ ] `
+        editor.handle_action(&Action::Input('!'));
+        assert!(
+            editor.composer.text().contains("\n- [ ] !Task **한글**\n"),
+            "text={:?}",
+            editor.composer.text()
+        );
+
+        // Click on `한` in rendered `☐ !Task 한글` (col = width("☐ !Task ") = 8)
+        let _ = draw_cursor(&mut term, &mut editor, &mut hitmap);
+        assert!(editor.handle_click(x0 + 8, y0 + 1));
+        assert!(editor.composer.text()[editor.composer.cursor()..].starts_with("한글"));
+        let (cx_click, cy_click) = draw_cursor(&mut term, &mut editor, &mut hitmap);
+        assert_eq!((cx_click, cy_click), (x0 + 8, y0 + 1));
+
+        // Soft-wrap with CJK + hidden delimiters on active line
+        editor
+            .composer
+            .load_text("# **가나다라마바사아자차카타**");
+        let mut narrow = Terminal::new(TestBackend::new(20, 10)).unwrap();
+        let mut narrow_cursor = None;
+        narrow
+            .draw(|f| {
+                narrow_cursor = editor.draw(f, f.area(), &theme, &mut hitmap);
+            })
+            .unwrap();
+        let ny0 = editor.last_editor_area.y;
+        let nx0 = editor.last_editor_area.x;
+        assert_eq!(buffer_row_text(&narrow, ny0, 20), "가나다라마바사아자차");
+        assert_eq!(buffer_row_text(&narrow, ny0 + 1, 20), "카타");
+        let (ncx, ncy) = narrow_cursor.unwrap();
+        assert_eq!(ncy, ny0 + 1);
+        assert_eq!(ncx, nx0 + UnicodeWidthStr::width("카타") as u16);
+    }
+
+    #[test]
+    fn rendered_mode_cursor_left_and_right_skip_hidden_delimiters_and_prefixes() {
+        let detail = sample_detail(
+            r#"<!DOCTYPE html><html><head><title>Nav Test</title></head><body><div id="div:{1}"><p id="p:{1}">Init</p></div></body></html>"#,
+        );
+        let mut editor = OnenoteInlineEditor::open_for_page(&detail, None);
+        assert_eq!(editor.mode, EditorMode::Rendered);
+
+        editor
+            .composer
+            .load_text("Hi **bold** ~~no~~ `x`\n## Heading");
+
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let theme = Theme::default();
+        let mut hitmap = HitMap::default();
+        let mut vis_cursor = |ed: &mut OnenoteInlineEditor| -> (u16, u16) {
+            let mut cur = None;
+            term.draw(|f| {
+                cur = ed.draw(f, f.area(), &theme, &mut hitmap);
+            })
+            .unwrap();
+            cur.unwrap()
+        };
+
+        // CursorHome on `## Heading` lands on `H` (right after `## `)
+        editor.handle_action(&Action::CursorHome);
+        assert!(editor.composer.text()[editor.composer.cursor()..].starts_with("Heading"));
+        let (hx, hy) = vis_cursor(&mut editor);
+        assert_eq!(hx, editor.last_editor_area.x);
+        assert_eq!(hy, editor.last_editor_area.y + 1);
+
+        // CursorLeft from content start of `## Heading` steps directly to end of previous line
+        editor.handle_action(&Action::CursorLeft);
+        let line0_end = "Hi **bold** ~~no~~ `x`".len();
+        assert_eq!(editor.composer.cursor(), line0_end);
+
+        // CursorRight from end of line 0 steps directly onto `H` of `## Heading`
+        editor.handle_action(&Action::CursorRight);
+        assert!(editor.composer.text()[editor.composer.cursor()..].starts_with("Heading"));
+
+        // Walk right across line 0 (`Hi bold no x`): every single CursorRight MUST advance cx
+        editor.composer.set_cursor_byte(0);
+        let expected_rendered = "Hi bold no x";
+        let mut prev_cx = vis_cursor(&mut editor).0;
+        assert_eq!(prev_cx, editor.last_editor_area.x);
+        for step in 1..=expected_rendered.chars().count() {
+            editor.handle_action(&Action::CursorRight);
+            let (cx, cy) = vis_cursor(&mut editor);
+            assert_eq!(cy, editor.last_editor_area.y);
+            assert!(
+                cx > prev_cx,
+                "step {step}: CursorRight must visibly advance cursor past hidden delimiters (prev={prev_cx}, now={cx}, byte={})",
+                editor.composer.cursor()
+            );
+            prev_cx = cx;
+        }
+        assert_eq!(
+            prev_cx,
+            editor.last_editor_area.x + expected_rendered.len() as u16
+        );
+
+        // Walk left back across line 0: every single CursorLeft MUST decrease cx
+        for step in 1..=expected_rendered.chars().count() {
+            editor.handle_action(&Action::CursorLeft);
+            let (cx, cy) = vis_cursor(&mut editor);
+            assert_eq!(cy, editor.last_editor_area.y);
+            assert!(
+                cx < prev_cx,
+                "step {step}: CursorLeft must visibly move cursor left past hidden delimiters (prev={prev_cx}, now={cx}, byte={})",
+                editor.composer.cursor()
+            );
+            prev_cx = cx;
+        }
+        assert_eq!(prev_cx, editor.last_editor_area.x);
+        assert_eq!(editor.composer.cursor(), 0);
+    }
+
+    #[test]
+    fn rendered_mode_backspace_unwraps_prefixes_and_cleans_up_orphan_delimiters() {
+        let detail = sample_detail(
+            r#"<!DOCTYPE html><html><head><title>Edit Test</title></head><body><div id="div:{1}"><p id="p:{1}">Init</p></div></body></html>"#,
+        );
+        let mut editor = OnenoteInlineEditor::open_for_page(&detail, None);
+        assert_eq!(editor.mode, EditorMode::Rendered);
+
+        // 1) Backspace unwraps `## ` heading prefix in 1 keypress
+        editor.composer.load_text("## Title");
+        editor.handle_action(&Action::CursorHome);
+        editor.handle_action(&Action::Backspace);
+        assert_eq!(editor.composer.text(), "Title");
+        assert_eq!(editor.composer.cursor(), 0);
+        // Undo restores the prefix cleanly
+        editor.handle_action(&Action::Undo);
+        assert_eq!(editor.composer.text(), "## Title");
+
+        // 2) Backspace unwraps `- [ ] ` task prefix in 1 keypress
+        editor.composer.load_text("- [ ] Task");
+        editor.handle_action(&Action::CursorHome);
+        editor.handle_action(&Action::Backspace);
+        assert_eq!(editor.composer.text(), "Task");
+        assert_eq!(editor.composer.cursor(), 0);
+
+        // 3) Backspace unwraps `- ` bullet prefix and `> ` quote prefix in 1 keypress
+        editor.composer.load_text("- Item");
+        editor.handle_action(&Action::CursorHome);
+        editor.handle_action(&Action::Backspace);
+        assert_eq!(editor.composer.text(), "Item");
+
+        editor.composer.load_text("> Quote");
+        editor.handle_action(&Action::CursorHome);
+        editor.handle_action(&Action::Backspace);
+        assert_eq!(editor.composer.text(), "Quote");
+
+        // 4) Deleting bold text cleans up empty `****` (both from end and from inside)
+        editor.composer.load_text("Say **hi**!");
+        // Place cursor right after `i` inside `**hi**`
+        let after_i = "Say **hi".len();
+        editor.composer.set_cursor_byte(after_i);
+        editor.handle_action(&Action::Backspace); // removes `i` -> `Say **h**!`
+        assert_eq!(editor.composer.text(), "Say **h**!");
+        editor.handle_action(&Action::Backspace); // removes `h` + empty `****` -> `Say !`
+        assert_eq!(editor.composer.text(), "Say !");
+
+        // Also works when cursor is at end of `**a**` (after closing `**`)
+        editor.composer.load_text("Keep **a**");
+        editor.handle_action(&Action::Backspace);
+        assert_eq!(editor.composer.text(), "Keep ");
+
+        // Also works with Delete key and cleans up `~~` and `` ` ``
+        editor.composer.load_text("~~x~~ `y`");
+        editor.composer.set_cursor_byte(2); // on `x`
+        editor.handle_action(&Action::Delete);
+        assert_eq!(editor.composer.text(), " `y`");
+        editor.composer.set_cursor_byte(2); // on `y`
+        editor.handle_action(&Action::Delete);
+        assert_eq!(editor.composer.text(), " ");
     }
 }
