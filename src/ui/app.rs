@@ -852,6 +852,8 @@ impl AppState {
             return;
         }
 
+        let cursor_line_1based = ed.composer.cursor_line_col_1based().0;
+        let total_editor_lines = ed.composer.text().lines().count().max(1);
         ed.mark_syncing();
         if close_after {
             ui.inline_editor = None;
@@ -860,30 +862,82 @@ impl AppState {
         // Apply 0ms optimistic local preview immediately so exiting or saving feels instant.
         let rollback_detail = self.page_details.get(&page_key).cloned();
         if let Some(current) = rollback_detail.as_ref() {
-            let optimistic_md = match &target {
+            match &target {
                 crate::ui::inline_editor::InlineEditTarget::PageBody { .. } => {
-                    Some(edited_md.clone())
+                    let outgoing = OutgoingOnenotePage {
+                        title: current.summary.title.clone(),
+                        markdown_body: edited_md.clone(),
+                        inline_images: Vec::new(),
+                        level: None,
+                    };
+                    let xhtml = crate::parser::onenote::compile_new_page_xhtml(&outgoing);
+                    let preview = crate::parser::onenote::parse_onenote_page_xhtml(
+                        current.summary.clone(),
+                        &xhtml,
+                    );
+                    self.page_details.insert(page_key.clone(), preview);
                 }
                 crate::ui::inline_editor::InlineEditTarget::Append => {
-                    if current.body_markdown.trim().is_empty() {
-                        Some(edited_md.clone())
+                    let md = if current.body_markdown.trim().is_empty() {
+                        edited_md.clone()
                     } else {
-                        Some(format!("{}\n\n{}", current.body_markdown.trim_end(), edited_md))
-                    }
+                        format!("{}\n\n{}", current.body_markdown.trim_end(), edited_md)
+                    };
+                    let outgoing = OutgoingOnenotePage {
+                        title: current.summary.title.clone(),
+                        markdown_body: md,
+                        inline_images: Vec::new(),
+                        level: None,
+                    };
+                    let xhtml = crate::parser::onenote::compile_new_page_xhtml(&outgoing);
+                    let preview = crate::parser::onenote::parse_onenote_page_xhtml(
+                        current.summary.clone(),
+                        &xhtml,
+                    );
+                    self.page_details.insert(page_key.clone(), preview);
                 }
-                crate::ui::inline_editor::InlineEditTarget::Block { .. } => None,
-            };
-            if let Some(md) = optimistic_md {
-                let outgoing = OutgoingOnenotePage {
-                    title: current.summary.title.clone(),
-                    markdown_body: md,
-                    inline_images: Vec::new(),
-                    level: None,
-                };
-                let xhtml = crate::parser::onenote::compile_new_page_xhtml(&outgoing);
-                let preview =
-                    crate::parser::onenote::parse_onenote_page_xhtml(current.summary.clone(), &xhtml);
-                self.page_details.insert(page_key.clone(), preview);
+                crate::ui::inline_editor::InlineEditTarget::Block { block_index, .. } => {
+                    let mut preview = current.clone();
+                    if let Some(blk) = preview.blocks.get_mut(*block_index) {
+                        let new_spans = vec![crate::models::RichSpan::plain(edited_md.clone())];
+                        match &mut blk.kind {
+                            crate::models::OnenoteBlockKind::Heading { spans, .. }
+                            | crate::models::OnenoteBlockKind::Paragraph { spans }
+                            | crate::models::OnenoteBlockKind::ListItem { spans, .. }
+                            | crate::models::OnenoteBlockKind::Quote { spans } => {
+                                *spans = new_spans;
+                            }
+                            crate::models::OnenoteBlockKind::CodeBlock { code, .. } => {
+                                *code = edited_md.clone();
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.page_details.insert(page_key.clone(), preview);
+                }
+            }
+        }
+        if close_after {
+            if let Some(detail) = self.page_details.get(&page_key) {
+                if !detail.blocks.is_empty() {
+                    let target_blk = match &target {
+                        crate::ui::inline_editor::InlineEditTarget::Block { block_index, .. } => {
+                            (*block_index).min(detail.blocks.len() - 1)
+                        }
+                        crate::ui::inline_editor::InlineEditTarget::Append => {
+                            detail.blocks.len() - 1
+                        }
+                        crate::ui::inline_editor::InlineEditTarget::PageBody { .. } => {
+                            let ratio_idx = cursor_line_1based
+                                .saturating_sub(1)
+                                .saturating_mul(detail.blocks.len())
+                                / total_editor_lines;
+                            ratio_idx.min(detail.blocks.len() - 1)
+                        }
+                    };
+                    ui.onenote_selected_block = target_blk;
+                    ui.onenote_follow_selection = true;
+                }
             }
         }
 

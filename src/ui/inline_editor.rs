@@ -909,7 +909,7 @@ fn parse_heading(raw: &str) -> Option<(usize, usize)> {
         return None;
     }
     let after = &trimmed[hashes..];
-    if after.starts_with(' ') {
+    if after.starts_with(' ') && !after[1..].trim().is_empty() {
         Some((hashes, indent + hashes + 1))
     } else {
         None
