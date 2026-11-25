@@ -126,6 +126,7 @@ pub enum UiMsg {
         task_id: u64,
         section_key: String,
         page: OnenotePageSummary,
+        preview_detail: Box<OnenotePageDetail>,
     },
     PageMutated {
         task_id: u64,
@@ -1105,10 +1106,16 @@ impl AppState {
                 Ok(page) => {
                     let _ = storage.upsert_onenote_pages(std::slice::from_ref(&page));
                     storage.record_page_created(&page.page_key);
+                    let preview_xhtml = crate::parser::onenote::compile_new_page_xhtml(&outgoing);
+                    let preview_detail = crate::parser::onenote::parse_onenote_page_xhtml(
+                        page.clone(),
+                        &preview_xhtml,
+                    );
                     let _ = tx.send(UiMsg::PageCreated {
                         task_id,
                         section_key,
                         page,
+                        preview_detail: Box::new(preview_detail),
                     });
                 }
                 Err(err) => {
@@ -1798,6 +1805,7 @@ impl AppState {
                 task_id,
                 section_key,
                 page,
+                preview_detail,
             } => {
                 ui.tasks.finish(task_id);
                 let title = page.title.clone();
@@ -1811,6 +1819,9 @@ impl AppState {
                 if self.active_section_key.as_deref() == Some(section_key.as_str()) {
                     self.pages.retain(|p| p.page_key != pk);
                     self.pages.insert(0, page);
+                    // Display the locally rendered preview immediately while background
+                    // `HydratePage` (triggered by `select_page`) upgrades with Graph `data-id`s.
+                    self.page_details.insert(pk.clone(), *preview_detail);
                     self.select_page(pk, ui);
                 }
                 self.refresh_active_search(ui);
@@ -2989,5 +3000,91 @@ mod tests {
         assert_eq!(app.image_raw_bytes, 0);
 
         srv.abort();
+    }
+
+    #[test]
+    fn page_created_renders_preview_immediately_without_loading_blank() {
+        let storage = Storage::open_in_memory().unwrap();
+        let cfg = AppConfig::default();
+        let auth = crate::auth::AuthManager::from_tokens(
+            cfg.clone(),
+            crate::auth::StoredTokens {
+                access_token: "tok".to_string(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".to_string(),
+                tenant_id: "tid".to_string(),
+                user_id: Some("u1".to_string()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "access_token".to_string(),
+            },
+        );
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, mut nudge_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg, auth, graph, storage, sync_ctrl, ui_tx);
+        app.active_section_key = Some("me|sec-1".to_string());
+        let mut ui = UiState::new();
+
+        let page = OnenotePageSummary {
+            page_key: "me|p-new".to_string(),
+            id: "p-new".to_string(),
+            scope: crate::models::OnenoteScope::Me,
+            section_id: "sec-1".to_string(),
+            section_name: Some("Notes".to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Personal".to_string()),
+            title: "Instant Page".to_string(),
+            level: 0,
+            order: 0,
+            created_at: None,
+            last_modified_at: None,
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        };
+        let outgoing = OutgoingOnenotePage {
+            title: "Instant Page".to_string(),
+            markdown_body: "Hello instant preview".to_string(),
+            inline_images: Vec::new(),
+            level: None,
+        };
+        let preview_xhtml = crate::parser::onenote::compile_new_page_xhtml(&outgoing);
+        let preview_detail =
+            crate::parser::onenote::parse_onenote_page_xhtml(page.clone(), &preview_xhtml);
+
+        let task_id = ui.tasks.start("Creating page");
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::PageCreated {
+                task_id,
+                section_key: "me|sec-1".to_string(),
+                page,
+                preview_detail: Box::new(preview_detail),
+            },
+        );
+
+        assert_eq!(app.active_page_key.as_deref(), Some("me|p-new"));
+        assert!(
+            !app.loading_onenote_detail,
+            "newly created page must display immediately instead of showing loading blank"
+        );
+        let detail = app
+            .active_page_detail()
+            .expect("preview detail must be present immediately");
+        assert!(detail.body_plain.contains("Hello instant preview"));
+
+        // Background HydratePage must still be queued to fetch authoritative Graph element IDs.
+        let mut saw_hydrate = false;
+        while let Ok(cmd) = nudge_rx.try_recv() {
+            if matches!(cmd, SyncCommand::HydratePage { ref page_key } if page_key == "me|p-new") {
+                saw_hydrate = true;
+            }
+        }
+        assert!(saw_hydrate, "background HydratePage must still be requested");
     }
 }

@@ -8,7 +8,7 @@ pub mod onenote;
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
@@ -83,6 +83,7 @@ pub struct GraphClient {
     http_requests_total: Arc<AtomicU64>,
     in_flight_requests: Arc<AtomicUsize>,
     max_in_flight_requests: Arc<AtomicUsize>,
+    pagelevel_unsupported: Arc<AtomicBool>,
     request_allowance: Option<RequestAllowance>,
 }
 
@@ -114,8 +115,17 @@ impl GraphClient {
             http_requests_total: Arc::new(AtomicU64::new(0)),
             in_flight_requests: Arc::new(AtomicUsize::new(0)),
             max_in_flight_requests: Arc::new(AtomicUsize::new(0)),
+            pagelevel_unsupported: Arc::new(AtomicBool::new(false)),
             request_allowance: None,
         })
+    }
+
+    pub(crate) fn is_pagelevel_unsupported(&self) -> bool {
+        self.pagelevel_unsupported.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_pagelevel_unsupported(&self) {
+        self.pagelevel_unsupported.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn with_automatic_budget(

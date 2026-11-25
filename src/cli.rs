@@ -2084,8 +2084,27 @@ pub async fn append_onenote_page_helper(
     markdown: &str,
     inline_images: &[InlineImageUpload],
 ) -> Result<OnenotePageDetail> {
-    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
-    graph
+    let q = page_query.trim();
+    if q.is_empty() {
+        bail!("Page ID or title is empty.");
+    }
+    let cached_detail = if let Some(detail) = storage.get_onenote_page_detail(q)? {
+        Some(detail)
+    } else if let Some(summary) = resolver::resolve_page_cached(storage, q, None)?.into_option()? {
+        storage.get_onenote_page_detail(&summary.page_key)?
+    } else {
+        None
+    };
+
+    let (mut detail, used_cache) = match cached_detail {
+        Some(detail) => (detail, true),
+        None => (
+            load_onenote_page_detail(storage, graph, q, false).await?,
+            false,
+        ),
+    };
+
+    if let Err(err) = graph
         .append_onenote_page_markdown(
             &detail.summary.scope,
             &detail.summary.id,
@@ -2093,7 +2112,29 @@ pub async fn append_onenote_page_helper(
             markdown,
             inline_images,
         )
-        .await?;
+        .await
+    {
+        let can_retry_stale_target = used_cache
+            && matches!(
+                crate::graph::client::graph_http_status(&err),
+                Some(400 | 404 | 410)
+            );
+        if can_retry_stale_target {
+            detail = load_onenote_page_detail(storage, graph, q, false).await?;
+            graph
+                .append_onenote_page_markdown(
+                    &detail.summary.scope,
+                    &detail.summary.id,
+                    detail.primary_div_id.as_deref(),
+                    markdown,
+                    inline_images,
+                )
+                .await?;
+        } else {
+            return Err(err);
+        }
+    }
+
     let updated = graph
         .get_onenote_page_detail(
             &detail.summary.scope,

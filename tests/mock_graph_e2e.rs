@@ -5233,3 +5233,127 @@ async fn e2e_create_page_is_not_replayed_after_gateway_timeout() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn append_uses_cached_primary_div_and_retries_once_on_stale_target() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let content_get_hits = Arc::new(AtomicUsize::new(0));
+    let patch_hits = Arc::new(AtomicUsize::new(0));
+    let current_div = Arc::new(Mutex::new("div:{div-v1}".to_string()));
+    let body_text = Arc::new(Mutex::new("Initial".to_string()));
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me/onenote/pages/p-1",
+            get(|| async {
+                Json(serde_json::json!({
+                    "id": "p-1",
+                    "title": "Fast Append",
+                    "level": 0,
+                    "order": 0,
+                    "parentSection": { "id": "sec-1", "displayName": "Notes" }
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/onenote/pages/p-1/content",
+            get({
+                let gets = content_get_hits.clone();
+                let div = current_div.clone();
+                let body = body_text.clone();
+                move || async move {
+                    gets.fetch_add(1, Ordering::SeqCst);
+                    let d = div.lock().unwrap().clone();
+                    let b = body.lock().unwrap().clone();
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/html")],
+                        format!(
+                            "<!DOCTYPE html><html><head><title>Fast Append</title></head><body><div id=\"{d}\"><p id=\"p:{{1}}\">{b}</p></div></body></html>"
+                        ),
+                    )
+                }
+            })
+            .patch({
+                let patches = patch_hits.clone();
+                let div = current_div.clone();
+                let body = body_text.clone();
+                move |raw_body: axum::body::Bytes| async move {
+                    patches.fetch_add(1, Ordering::SeqCst);
+                    let req_str = String::from_utf8_lossy(&raw_body);
+                    let expected_div = div.lock().unwrap().clone();
+                    if !req_str.contains(&expected_div) {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": { "code": "20132", "message": "target div does not exist" }
+                            })),
+                        );
+                    }
+                    body.lock().unwrap().push_str(" + appended");
+                    (StatusCode::NO_CONTENT, Json(serde_json::json!({})))
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let cfg = AppConfig {
+        graph_base_url: format!("http://{addr}/v1.0"),
+        ..AppConfig::default()
+    };
+    let auth = AuthManager::from_tokens(
+        cfg.clone(),
+        StoredTokens {
+            access_token: "test-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("u1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        },
+    );
+    let graph = GraphClient::new(cfg, auth).unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+
+    // Seed SQLite cache with initial detail (div:{div-v1}).
+    let seeded = cli::load_onenote_page_detail(&storage, &graph, "me|p-1", false)
+        .await
+        .unwrap();
+    assert_eq!(seeded.primary_div_id.as_deref(), Some("div:{div-v1}"));
+    content_get_hits.store(0, Ordering::SeqCst);
+    patch_hits.store(0, Ordering::SeqCst);
+
+    // 1. Cached append: skips pre-fetch GET (only 1 PATCH + 1 post-write GET).
+    let updated = cli::append_onenote_page_helper(&storage, &graph, "me|p-1", "Line 1", &[])
+        .await
+        .unwrap();
+    assert!(updated.body_plain.contains("appended"));
+    assert_eq!(patch_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        content_get_hits.load(Ordering::SeqCst),
+        1,
+        "cached append must skip redundant pre-fetch GET"
+    );
+
+    // 2. Stale cached primary_div_id: PATCH 400 triggers 1 remote refresh + retry.
+    *current_div.lock().unwrap() = "div:{div-v2}".to_string();
+    content_get_hits.store(0, Ordering::SeqCst);
+    patch_hits.store(0, Ordering::SeqCst);
+    let retried = cli::append_onenote_page_helper(&storage, &graph, "me|p-1", "Line 2", &[])
+        .await
+        .unwrap();
+    assert_eq!(retried.primary_div_id.as_deref(), Some("div:{div-v2}"));
+    assert_eq!(patch_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(content_get_hits.load(Ordering::SeqCst), 2);
+
+    srv.abort();
+}

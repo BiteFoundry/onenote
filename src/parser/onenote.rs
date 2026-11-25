@@ -2869,17 +2869,22 @@ fn escape_xml_attr(input: &str) -> String {
 // 3. New Page XHTML / Multipart Payload Compiler (`POST .../sections/{id}/pages`)
 // ---------------------------------------------------------------------------
 
-/// Compiles an `OutgoingOnenotePage` into `(body_bytes, content_type_header)` ready for
-/// `POST /{scope}/onenote/sections/{id}/pages`.
-pub fn compile_new_page_payload(outgoing: &OutgoingOnenotePage) -> (Vec<u8>, String) {
+/// Compiles an `OutgoingOnenotePage` into its XHTML document string.
+pub fn compile_new_page_xhtml(outgoing: &OutgoingOnenotePage) -> String {
     let escaped_title = escape_xml(outgoing.title.trim());
     let created_iso = Utc::now().to_rfc3339();
     let body_fragment =
         markdown_to_onenote_html_fragment(&outgoing.markdown_body, &outgoing.inline_images);
 
-    let xhtml = format!(
+    format!(
         "<!DOCTYPE html>\n<html>\n  <head>\n    <title>{escaped_title}</title>\n    <meta name=\"created\" content=\"{created_iso}\" />\n  </head>\n  <body>\n    {body_fragment}\n  </body>\n</html>"
-    );
+    )
+}
+
+/// Compiles an `OutgoingOnenotePage` into `(body_bytes, content_type_header)` ready for
+/// `POST /{scope}/onenote/sections/{id}/pages`.
+pub fn compile_new_page_payload(outgoing: &OutgoingOnenotePage) -> (Vec<u8>, String) {
+    let xhtml = compile_new_page_xhtml(outgoing);
 
     if outgoing.inline_images.is_empty() {
         (

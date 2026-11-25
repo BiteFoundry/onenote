@@ -53,6 +53,8 @@ const MIN_BUDGETED_HIERARCHY_SECS: u64 = 270;
 const MAX_BUDGETED_HIERARCHY_SECS: u64 = 3_600;
 const OVERLAP_COALESCE_MS: u64 = 450;
 const SECTION_COALESCE_MS: u64 = 1_500;
+const SECTION_PAGE_PREFETCH_LIMIT: usize = 4;
+const SECTION_PAGE_PREFETCH_CONCURRENCY: usize = 2;
 
 fn section_pages_cursor_key(section_key: &str) -> String {
     format!("onenote:pages:{section_key}")
@@ -329,10 +331,7 @@ async fn sync_hierarchy_and_sections_inner(
     skip_recent_section_key: Option<&str>,
 ) -> Result<HierarchySyncOutcome> {
     let start_epoch = storage.current_mutation_epoch();
-    let mut nb_res = graph.list_all_accessible_notebooks_scoped(true).await?;
-    let mut sec_res = graph
-        .list_all_accessible_sections_scoped(&nb_res.notebooks, Some(&nb_res.complete_scopes))
-        .await?;
+    let (mut nb_res, mut sec_res) = graph.list_all_accessible_hierarchy_scoped(true).await?;
 
     // Guard against in-flight local notebook/section creations that completed after `start_epoch`.
     if storage.hierarchy_mutated_since(start_epoch) {
@@ -1087,12 +1086,22 @@ async fn apply_focus_change(
     if let Some(sec_key) = focus.section_key.as_deref().filter(|_| section_changed) {
         if !schedule.should_coalesce_section_fetch(sec_key, now) {
             let before = graph.http_request_count();
-            let _ = run_section_pages_refresh(
+            let ok = run_section_pages_refresh(
                 graph, storage, event_tx, sec_key, focus.page_key.as_deref(),
                 false, backoff, shared, now,
             ).await;
             let cost = graph.http_request_count().saturating_sub(before);
             schedule.mark_section_fetched(sec_key, Instant::now(), true, Duration::ZERO, cost);
+            if ok && !shared.is_auth_paused(Instant::now()) {
+                spawn_prefetch_section_pages(
+                    graph,
+                    storage,
+                    &schedule.automatic_budget,
+                    AUTO_HOURLY_BUDGET,
+                    sec_key,
+                    focus.page_key.as_deref(),
+                );
+            }
         } else {
             let persisted = storage.list_onenote_pages(sec_key).unwrap_or_default();
             let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
@@ -1178,7 +1187,7 @@ async fn handle_sync_command(
             let focus = focus_rx.borrow().clone();
             if !schedule.should_coalesce_section_fetch(&section_key, now) {
                 let before = graph.http_request_count();
-                let _ = run_section_pages_refresh(
+                let ok = run_section_pages_refresh(
                     graph,
                     storage,
                     event_tx,
@@ -1199,6 +1208,16 @@ async fn handle_sync_command(
                     Duration::ZERO,
                     cost,
                 );
+                if ok && is_focused && !shared.is_auth_paused(Instant::now()) {
+                    spawn_prefetch_section_pages(
+                        graph,
+                        storage,
+                        &schedule.automatic_budget,
+                        AUTO_HOURLY_BUDGET,
+                        &section_key,
+                        focus.page_key.as_deref(),
+                    );
+                }
             } else {
                 let persisted = storage.list_onenote_pages(&section_key).unwrap_or_default();
                 let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
@@ -1243,50 +1262,65 @@ async fn run_full_refresh(
         busy: true,
         summary: "Syncing OneNote...".to_string(),
     });
-    if let Ok(me) = focused_graph.get_me().await {
-        let _ = event_tx.send(CoreEvent::ProfileLoaded(me));
-    }
 
-    // Prioritize focused section & open page BEFORE bulk hierarchy so large accounts
-    // cannot exhaust `STARTUP_HTTP_BUDGET` before the user's active view loads.
-    let mut focused_pages_ok = true;
-    let mut synced_focused_sec: Option<String> = None;
-    if let Some(sec_key) = focus.section_key.as_deref() {
-        if !shared.is_auth_paused(Instant::now()) {
-            let before_s = focused_graph.http_request_count();
-            focused_pages_ok = run_section_pages_refresh(
-                focused_graph,
-                storage,
-                event_tx,
-                sec_key,
-                focus.page_key.as_deref(),
-                false,
-                backoff,
-                shared,
-                Instant::now(),
-            )
-            .await;
-            let cost_s = focused_graph.http_request_count().saturating_sub(before_s);
-            schedule.mark_section_fetched(sec_key, Instant::now(), true, Duration::ZERO, cost_s);
-            synced_focused_sec = Some(sec_key.to_string());
-        } else {
-            focused_pages_ok = false;
+    // Prioritize profile, focused section & open page concurrently BEFORE bulk hierarchy
+    // so large accounts cannot exhaust `STARTUP_HTTP_BUDGET` before the user's active view loads.
+    let auth_paused = shared.is_auth_paused(Instant::now());
+    let me_fut = async {
+        if let Ok(me) = focused_graph.get_me().await {
+            let _ = event_tx.send(CoreEvent::ProfileLoaded(me));
         }
-    }
-
-    let hydrate_ok = if let Some(page_key) = focus.page_key.as_deref() {
-        if shared.is_auth_paused(Instant::now()) {
-            false
-        } else {
-            let ok = run_hydrate_page(focused_graph, storage, event_tx, page_key).await;
-            if ok {
-                schedule.mark_page_hydrated(page_key, Instant::now(), true);
-            }
-            ok
-        }
-    } else {
-        true
     };
+    let focused_sec_fut = async {
+        if let Some(sec_key) = focus.section_key.as_deref() {
+            if !auth_paused {
+                let before_s = focused_graph.http_request_count();
+                let ok = run_section_pages_refresh(
+                    focused_graph,
+                    storage,
+                    event_tx,
+                    sec_key,
+                    focus.page_key.as_deref(),
+                    false,
+                    backoff,
+                    shared,
+                    Instant::now(),
+                )
+                .await;
+                let cost_s = focused_graph.http_request_count().saturating_sub(before_s);
+                (ok, Some((sec_key.to_string(), cost_s)))
+            } else {
+                (false, None)
+            }
+        } else {
+            (true, None)
+        }
+    };
+    let focused_page_fut = async {
+        if let Some(page_key) = focus.page_key.as_deref() {
+            if auth_paused {
+                (false, None)
+            } else {
+                let ok = run_hydrate_page(focused_graph, storage, event_tx, page_key).await;
+                (ok, ok.then(|| page_key.to_string()))
+            }
+        } else {
+            (true, None)
+        }
+    };
+
+    let ((), (focused_pages_ok, synced_sec_info), (hydrate_ok, hydrated_page_key)) =
+        tokio::join!(me_fut, focused_sec_fut, focused_page_fut);
+
+    let synced_focused_sec = if let Some((sec_key, cost_s)) = synced_sec_info {
+        schedule.mark_section_fetched(&sec_key, Instant::now(), true, Duration::ZERO, cost_s);
+        Some(sec_key)
+    } else {
+        None
+    };
+    if let Some(page_key) = hydrated_page_key {
+        schedule.mark_page_hydrated(&page_key, Instant::now(), true);
+    }
 
     let (hierarchy_ok, synced_secs) = if shared.is_auth_paused(Instant::now()) {
         (false, HashSet::new())
@@ -1355,6 +1389,24 @@ async fn run_full_refresh(
             true
         }
     };
+
+    if pages_ok && !shared.is_auth_paused(Instant::now()) {
+        if let Some(sec_key) = synced_focused_sec.as_deref().or(focus.section_key.as_deref()) {
+            let budget_limit = if bulk_graph.has_automatic_budget() {
+                STARTUP_HTTP_BUDGET
+            } else {
+                AUTO_HOURLY_BUDGET
+            };
+            spawn_prefetch_section_pages(
+                focused_graph,
+                storage,
+                &schedule.automatic_budget,
+                budget_limit,
+                sec_key,
+                focus.page_key.as_deref(),
+            );
+        }
+    }
 
     if hierarchy_ok && pages_ok && hydrate_ok {
         let _ = event_tx.send(CoreEvent::SyncStateChanged {
@@ -1751,6 +1803,63 @@ async fn run_hydrate_page(
             false
         }
     }
+}
+
+/// Quietly warms SQLite with up to `SECTION_PAGE_PREFETCH_LIMIT` uncached pages in the
+/// active section so switching pages with `j`/`k` renders immediately from cache.
+fn spawn_prefetch_section_pages(
+    graph: &GraphClient,
+    storage: &Storage,
+    budget: &AutomaticRequestBudget,
+    budget_limit: usize,
+    section_key: &str,
+    skip_page_key: Option<&str>,
+) {
+    let Ok(pages) = storage.list_onenote_pages(section_key) else {
+        return;
+    };
+    let candidates: Vec<OnenotePageSummary> = pages
+        .into_iter()
+        .filter(|p| Some(p.page_key.as_str()) != skip_page_key)
+        .filter(|p| !p.section_id.trim().is_empty())
+        .filter(|p| {
+            storage
+                .get_onenote_page_detail(&p.page_key)
+                .ok()
+                .flatten()
+                .is_none()
+        })
+        .take(SECTION_PAGE_PREFETCH_LIMIT)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+
+    let budgeted_graph = graph.with_automatic_budget(budget, Instant::now(), budget_limit);
+    let storage = storage.clone();
+    tokio::spawn(async move {
+        stream::iter(candidates)
+            .for_each_concurrent(SECTION_PAGE_PREFETCH_CONCURRENCY, |summary| {
+                let graph = budgeted_graph.clone();
+                let storage = storage.clone();
+                async move {
+                    let pk = summary.page_key.clone();
+                    let start_epoch = storage.current_mutation_epoch();
+                    let (scope, raw_id) = resolve_effective_scope(&pk, Some(&summary));
+                    if let Ok(detail) = graph
+                        .get_onenote_page_detail_content_only(&scope, &raw_id, summary)
+                        .await
+                    {
+                        if !storage.page_mutated_since(&pk, start_epoch)
+                            && !storage.page_deleted_since(&pk, start_epoch)
+                        {
+                            let _ = storage.upsert_onenote_page_detail(&detail);
+                        }
+                    }
+                }
+            })
+            .await;
+    });
 }
 
 fn find_new_page_notification(
@@ -4066,5 +4175,165 @@ mod tests {
             .get_onenote_page_detail("me|p-sec-50")
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn run_full_refresh_overlaps_active_requests_and_prefetches_siblings() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use crate::auth::{AuthManager, StoredTokens};
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let app = Router::new()
+            .route(
+                "/v1.0/me",
+                get({
+                    let b = barrier.clone();
+                    move || async move {
+                        b.wait().await;
+                        Json(serde_json::json!({
+                            "id": "user-1",
+                            "displayName": "Tester",
+                            "mail": "tester@example.com"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/notebooks",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{ "id": "nb-1", "displayName": "NB" }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sections",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "sec-1",
+                            "displayName": "Sec",
+                            "parentNotebook": { "id": "nb-1", "displayName": "NB" }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sectionGroups",
+                get(|| async { Json(serde_json::json!({ "value": [] })) }),
+            )
+            .route(
+                "/v1.0/me/onenote/sections/sec-1/pages",
+                get({
+                    let b = barrier.clone();
+                    move || async move {
+                        b.wait().await;
+                        Json(serde_json::json!({
+                            "value": [
+                                { "id": "p-1", "title": "Active Page", "level": 0, "order": 0, "parentSection": { "id": "sec-1", "displayName": "Sec" } },
+                                { "id": "p-2", "title": "Sibling Page", "level": 0, "order": 1, "parentSection": { "id": "sec-1", "displayName": "Sec" } }
+                            ]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/pages/p-1",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "id": "p-1",
+                        "title": "Active Page",
+                        "level": 0,
+                        "order": 0,
+                        "parentSection": { "id": "sec-1", "displayName": "Sec" }
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/pages/p-1/content",
+                get({
+                    let b = barrier.clone();
+                    move || async move {
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/html")],
+                            "<!DOCTYPE html><html><head><title>Active Page</title></head><body><div id=\"div:{1}\"><p id=\"p:{1}\">Active body</p></div></body></html>",
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/pages/p-2/content",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/html")],
+                        "<!DOCTYPE html><html><head><title>Sibling Page</title></head><body><div id=\"div:{2}\"><p id=\"p:{2}\">Prefetched sibling body</p></div></body></html>",
+                    )
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tokens = StoredTokens {
+            access_token: "sync-test-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "consumers".to_string(),
+            user_id: Some("user-1".to_string()),
+            user_display_name: Some("Tester".to_string()),
+            user_email: Some("tester@example.com".to_string()),
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let epoch = Instant::now();
+        let shared = SyncSharedState::with_epoch(epoch);
+        let mut schedule = SyncScheduleState::new(&cfg, epoch);
+        let mut backoff = ErrorBackoffState::new(cfg.active_poll_ms);
+        let focus = FocusTarget {
+            notebook_key: Some("me|nb-1".to_string()),
+            section_key: Some("me|sec-1".to_string()),
+            page_key: Some("me|p-1".to_string()),
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            run_full_refresh(
+                &graph,
+                &graph,
+                &storage,
+                &tx,
+                &focus,
+                &mut backoff,
+                &shared,
+                &mut schedule,
+            ),
+        )
+        .await
+        .expect("get_me, focused section pages, and focused page hydrate must overlap concurrently");
+
+        // Wait briefly for the spawned sibling prefetch to warm SQLite.
+        let mut prefetched = None;
+        for _ in 0..40 {
+            if let Some(d) = storage.get_onenote_page_detail("me|p-2").unwrap() {
+                prefetched = Some(d);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let prefetched = prefetched.expect("active section sibling p-2 must be prefetched into SQLite");
+        assert!(prefetched.body_plain.contains("Prefetched sibling body"));
+        srv.abort();
     }
 }

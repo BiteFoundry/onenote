@@ -784,9 +784,8 @@ impl GraphClient {
         include_teams: bool,
         max_teams: usize,
     ) -> Result<ScopedNotebooksResult> {
-        let me_res = self.list_onenote_notebooks(&OnenoteScope::Me).await;
         if !include_teams {
-            let notebooks = me_res?;
+            let notebooks = self.list_onenote_notebooks(&OnenoteScope::Me).await?;
             let mut complete_scopes = HashSet::new();
             complete_scopes.insert(OnenoteScope::Me.scope_key());
             return Ok(ScopedNotebooksResult {
@@ -796,6 +795,25 @@ impl GraphClient {
             });
         }
         let mut warnings: Vec<String> = Vec::new();
+
+        let tokens = self.auth.current_tokens().await;
+        let teams_decision = joined_teams_decision(tokens.as_ref());
+        let (me_res, teams_list_res) = match teams_decision {
+            JoinedTeamsDecision::Query => {
+                let (me_res, joined) = tokio::join!(
+                    self.list_onenote_notebooks(&OnenoteScope::Me),
+                    self.list_joined_teams_lite(max_teams)
+                );
+                (me_res, Some(joined))
+            }
+            JoinedTeamsDecision::SkipMissingOrgScopes => {
+                warnings.push(TEAMS_SKIPPED_MISSING_ORG_SCOPES_WARNING.to_string());
+                (self.list_onenote_notebooks(&OnenoteScope::Me).await, None)
+            }
+            JoinedTeamsDecision::SkipConsumer => {
+                (self.list_onenote_notebooks(&OnenoteScope::Me).await, None)
+            }
+        };
 
         let mut merged: Vec<OnenoteNotebook> = Vec::new();
         let mut index_by_id: HashMap<String, usize> = HashMap::new();
@@ -821,30 +839,23 @@ impl GraphClient {
             }
         }
 
-        let tokens = self.auth.current_tokens().await;
-        let teams = match joined_teams_decision(tokens.as_ref()) {
-            JoinedTeamsDecision::Query => match self.list_joined_teams_lite(max_teams).await {
-                Ok((teams, truncated)) => {
-                    if truncated {
-                        warnings.push(format!(
-                            "Showing notebooks for the first {} of your joined Teams; set ONENOTE_MAX_TEAMS to raise the limit.",
-                            teams.len()
-                        ));
-                    }
-                    Some(teams)
-                }
-                Err(err) => {
+        let teams = match teams_list_res {
+            Some(Ok((teams, truncated))) => {
+                if truncated {
                     warnings.push(format!(
-                        "Teams notebooks were skipped: listing your joined Teams failed ({err})."
+                        "Showing notebooks for the first {} of your joined Teams; set ONENOTE_MAX_TEAMS to raise the limit.",
+                        teams.len()
                     ));
-                    None
                 }
-            },
-            JoinedTeamsDecision::SkipMissingOrgScopes => {
-                warnings.push(TEAMS_SKIPPED_MISSING_ORG_SCOPES_WARNING.to_string());
+                Some(teams)
+            }
+            Some(Err(err)) => {
+                warnings.push(format!(
+                    "Teams notebooks were skipped: listing your joined Teams failed ({err})."
+                ));
                 None
             }
-            JoinedTeamsDecision::SkipConsumer => None,
+            None => None,
         };
         if let Some(teams) = teams {
             let scopes: Vec<OnenoteScope> = teams
@@ -1212,10 +1223,46 @@ impl GraphClient {
         Ok((res.section_groups, res.sections))
     }
 
+    /// Fetches accessible notebooks, section groups, and sections together,
+    /// overlapping personal (`/me/onenote`) notebooks, sectionGroups, and sections
+    /// into a single parallel round-trip instead of two serial hops.
+    pub async fn list_all_accessible_hierarchy_scoped(
+        &self,
+        include_teams: bool,
+    ) -> Result<(ScopedNotebooksResult, ScopedSectionsResult)> {
+        let (nb_res, me_groups_res, me_secs_res) = tokio::join!(
+            self.list_all_accessible_notebooks_scoped(include_teams),
+            self.list_onenote_section_groups(&OnenoteScope::Me, None),
+            self.list_onenote_sections_direct(&OnenoteScope::Me, None),
+        );
+        let nb_res = nb_res?;
+        let sec_res = self
+            .list_all_accessible_sections_scoped_inner(
+                &nb_res.notebooks,
+                Some(&nb_res.complete_scopes),
+                Some((me_groups_res, me_secs_res)),
+            )
+            .await?;
+        Ok((nb_res, sec_res))
+    }
+
     pub async fn list_all_accessible_sections_scoped(
         &self,
         notebooks: &[OnenoteNotebook],
         extra_complete_scopes: Option<&HashSet<String>>,
+    ) -> Result<ScopedSectionsResult> {
+        self.list_all_accessible_sections_scoped_inner(notebooks, extra_complete_scopes, None)
+            .await
+    }
+
+    async fn list_all_accessible_sections_scoped_inner(
+        &self,
+        notebooks: &[OnenoteNotebook],
+        extra_complete_scopes: Option<&HashSet<String>>,
+        mut prefetched_me: Option<(
+            Result<Vec<OnenoteSectionGroup>>,
+            Result<Vec<OnenoteSection>>,
+        )>,
     ) -> Result<ScopedSectionsResult> {
         let mut unique_scopes: Vec<OnenoteScope> = Vec::new();
         let mut scope_pos_by_key: HashMap<String, usize> = HashMap::new();
@@ -1284,19 +1331,30 @@ impl GraphClient {
         let mut first_err: Option<anyhow::Error> = None;
 
         for chunk in unique_scopes.chunks(ONENOTE_SCOPE_CONCURRENCY) {
-            let futs = chunk.iter().map(|scope| {
-                let scope_nbs = notebooks_by_scope
-                    .get(&scope.scope_key())
-                    .cloned()
-                    .unwrap_or_default();
-                async move {
-                    let (groups_res, secs_res) = tokio::join!(
-                        self.list_onenote_section_groups(scope, None),
-                        self.list_onenote_sections_direct(scope, None)
-                    );
-                    (scope.clone(), scope_nbs, groups_res, secs_res)
-                }
-            });
+            let futs: Vec<_> = chunk
+                .iter()
+                .map(|scope| {
+                    let scope_nbs = notebooks_by_scope
+                        .get(&scope.scope_key())
+                        .cloned()
+                        .unwrap_or_default();
+                    let pre = if scope.is_personal() {
+                        prefetched_me.take()
+                    } else {
+                        None
+                    };
+                    async move {
+                        let (groups_res, secs_res) = match pre {
+                            Some(res) => res,
+                            None => tokio::join!(
+                                self.list_onenote_section_groups(scope, None),
+                                self.list_onenote_sections_direct(scope, None)
+                            ),
+                        };
+                        (scope.clone(), scope_nbs, groups_res, secs_res)
+                    }
+                })
+                .collect();
             let results = join_all(futs).await;
             for (scope, scope_nbs, groups_res, secs_res) in results {
                 let mut scope_groups: Vec<OnenoteSectionGroup> = Vec::new();
@@ -1636,15 +1694,19 @@ impl GraphClient {
         let base = scope.graph_base_path();
         let sec_enc = urlencoding::encode(&sec_id);
 
-        let url_with_level = format!("{base}/sections/{sec_enc}/pages?$top={top}&pagelevel=true");
-        let first_page: GraphListPage<GraphOnenotePage> = match self.get_json(&url_with_level).await
-        {
-            Ok(page) => page,
-            Err(err) if is_pagelevel_bad_request(&err) => {
-                let fallback_url = format!("{base}/sections/{sec_enc}/pages?$top={top}");
-                self.get_json(&fallback_url).await?
+        let fallback_url = format!("{base}/sections/{sec_enc}/pages?$top={top}");
+        let first_page: GraphListPage<GraphOnenotePage> = if self.is_pagelevel_unsupported() {
+            self.get_json(&fallback_url).await?
+        } else {
+            let url_with_level = format!("{fallback_url}&pagelevel=true");
+            match self.get_json(&url_with_level).await {
+                Ok(page) => page,
+                Err(err) if is_pagelevel_bad_request(&err) => {
+                    self.mark_pagelevel_unsupported();
+                    self.get_json(&fallback_url).await?
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
         };
 
         let mut pages = Vec::new();
@@ -1700,16 +1762,36 @@ impl GraphClient {
         }
         let base = scope.graph_base_path();
         let pid_enc = urlencoding::encode(&pid);
-        let meta_with_level = format!("{base}/pages/{pid_enc}?pagelevel=true");
-        let raw_meta = match self.get_json::<GraphOnenotePage>(&meta_with_level).await {
-            Ok(meta) => meta,
-            Err(err) if is_pagelevel_bad_request(&err) => {
-                let fallback_meta = format!("{base}/pages/{pid_enc}");
-                self.get_json::<GraphOnenotePage>(&fallback_meta).await?
+        let fallback_meta = format!("{base}/pages/{pid_enc}");
+        let raw_meta = if self.is_pagelevel_unsupported() {
+            self.get_json::<GraphOnenotePage>(&fallback_meta).await?
+        } else {
+            let meta_with_level = format!("{fallback_meta}?pagelevel=true");
+            match self.get_json::<GraphOnenotePage>(&meta_with_level).await {
+                Ok(meta) => meta,
+                Err(err) if is_pagelevel_bad_request(&err) => {
+                    self.mark_pagelevel_unsupported();
+                    self.get_json::<GraphOnenotePage>(&fallback_meta).await?
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
         };
         Ok(merge_fetched_page_summary(raw_meta, scope, cached_summary))
+    }
+
+    /// Fetches only page XHTML content (`GET /{scope}/pages/{id}/content?includeIDs=true`)
+    /// and parses it with a known summary (1 HTTP request instead of 2).
+    pub async fn get_onenote_page_detail_content_only(
+        &self,
+        scope: &OnenoteScope,
+        page_id: &str,
+        mut cached_summary: OnenotePageSummary,
+    ) -> Result<OnenotePageDetail> {
+        let raw_xhtml = self.get_onenote_page_content_xhtml(scope, page_id).await?;
+        cached_summary.preview_text = None;
+        let mut detail = crate::parser::onenote::parse_onenote_page_xhtml(cached_summary, &raw_xhtml);
+        detail.synced_at = Some(chrono::Utc::now().to_rfc3339());
+        Ok(detail)
     }
 
     pub async fn get_onenote_page_detail(
@@ -1726,11 +1808,15 @@ impl GraphClient {
         let pid_enc = urlencoding::encode(&pid);
 
         let meta_fut = async {
-            let meta_with_level = format!("{base}/pages/{pid_enc}?pagelevel=true");
+            let fallback_meta = format!("{base}/pages/{pid_enc}");
+            if self.is_pagelevel_unsupported() {
+                return self.get_json::<GraphOnenotePage>(&fallback_meta).await;
+            }
+            let meta_with_level = format!("{fallback_meta}?pagelevel=true");
             match self.get_json::<GraphOnenotePage>(&meta_with_level).await {
                 Ok(meta) => Ok(meta),
                 Err(err) if is_pagelevel_bad_request(&err) => {
-                    let fallback_meta = format!("{base}/pages/{pid_enc}");
+                    self.mark_pagelevel_unsupported();
                     self.get_json::<GraphOnenotePage>(&fallback_meta).await
                 }
                 Err(err) => Err(err),
@@ -3051,7 +3137,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(capped.notebooks.len(), 3);
-        assert_eq!(*group_hits.lock().unwrap(), ["team-01", "team-02"]);
+        let mut capped_hits = group_hits.lock().unwrap().clone();
+        capped_hits.sort();
+        assert_eq!(capped_hits, ["team-01", "team-02"]);
         assert_eq!(capped.warnings.len(), 1);
         assert!(capped.warnings[0].contains("first 2 of your joined Teams"));
         assert!(capped.warnings[0].contains("ONENOTE_MAX_TEAMS"));
@@ -3216,5 +3304,174 @@ mod tests {
             .list_onenote_sections_scoped(&OnenoteScope::Me, Some("nb-1"))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn pagelevel_unsupported_is_remembered_after_first_400() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pagelevel_hits = Arc::new(AtomicUsize::new(0));
+        let plain_hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/sections/sec-1/pages",
+                get({
+                    let pl = pagelevel_hits.clone();
+                    let ok = plain_hits.clone();
+                    move |Query(params): Query<HashMap<String, String>>| async move {
+                        if params.contains_key("pagelevel") {
+                            pl.fetch_add(1, Ordering::SeqCst);
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": { "code": "20102", "message": "pagelevel query option is invalid" }
+                                })),
+                            );
+                        }
+                        ok.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "value": [{ "id": "p-1", "title": "Note 1" }]
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/pages/p-1",
+                get({
+                    let pl = pagelevel_hits.clone();
+                    let ok = plain_hits.clone();
+                    move |Query(params): Query<HashMap<String, String>>| async move {
+                        if params.contains_key("pagelevel") {
+                            pl.fetch_add(1, Ordering::SeqCst);
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": { "code": "20102", "message": "pagelevel query option is invalid" }
+                                })),
+                            );
+                        }
+                        ok.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "id": "p-1",
+                                "title": "Note 1",
+                                "parentSection": { "id": "sec-1", "displayName": "Section 1" }
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/pages/p-1/content",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/html")],
+                        "<!DOCTYPE html><html><head><title>Note 1</title></head><body><div id=\"div:{1}\"><p id=\"p:{1}\">Hello</p></div></body></html>",
+                    )
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(format!("http://{addr}/v1.0"));
+        let (pages, has_more) = client
+            .list_onenote_pages_with_more(&OnenoteScope::Me, "sec-1", 50)
+            .await
+            .unwrap();
+        assert_eq!(pages.len(), 1);
+        assert!(!has_more);
+        assert_eq!(pagelevel_hits.load(Ordering::SeqCst), 1);
+
+        // Subsequent summary + detail calls must skip `?pagelevel=true` completely.
+        let summary = client
+            .get_onenote_page_summary(&OnenoteScope::Me, "p-1", None)
+            .await
+            .unwrap();
+        assert_eq!(summary.id, "p-1");
+        let detail = client
+            .get_onenote_page_detail(&OnenoteScope::Me, "p-1", Some(summary))
+            .await
+            .unwrap();
+        assert!(detail.body_plain.contains("Hello"));
+        assert_eq!(
+            pagelevel_hits.load(Ordering::SeqCst),
+            1,
+            "pagelevel=true 400 fallback must be remembered across calls"
+        );
+        assert_eq!(plain_hits.load(Ordering::SeqCst), 3);
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn list_all_accessible_hierarchy_scoped_overlaps_personal_requests() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/notebooks",
+                get({
+                    let b = barrier.clone();
+                    move || async move {
+                        b.wait().await;
+                        Json(serde_json::json!({
+                            "value": [{ "id": "nb-1", "displayName": "Personal" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sections",
+                get({
+                    let b = barrier.clone();
+                    move || async move {
+                        b.wait().await;
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "sec-1",
+                                "displayName": "Notes",
+                                "parentNotebook": { "id": "nb-1", "displayName": "Personal" }
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sectionGroups",
+                get({
+                    let b = barrier.clone();
+                    move || async move {
+                        b.wait().await;
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(format!("http://{addr}/v1.0"));
+        let (nb_res, sec_res) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.list_all_accessible_hierarchy_scoped(false),
+        )
+        .await
+        .expect("notebooks, sections, and sectionGroups must execute concurrently")
+        .unwrap();
+        assert_eq!(nb_res.notebooks.len(), 1);
+        assert_eq!(sec_res.sections.len(), 1);
+        assert!(nb_res.complete_scopes.contains("me"));
+        assert!(sec_res.complete_scopes.contains("me"));
+        srv.abort();
     }
 }
