@@ -5,6 +5,7 @@
 //! - `a`: Append Markdown block (`AppendMarkdown`, supports `- [ ]` tasks + `Ctrl+V` clipboard image paste + `Ctrl+F` File Picker)
 //! - `e`: Surgically edit selected block (`EditBlock`, pre-filled with selected block's Markdown)
 
+use bitefoundry_html::layout::{windowed_single_line_input, wrap_styled_spans, WrapPrefix};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -692,19 +693,14 @@ impl OnenoteFormOverlay {
                 } else {
                     "Section name:  "
                 };
-                let cursor = if self.field == 0 { "▏" } else { "" };
-                let line = Line::from(vec![
-                    Span::styled(
-                        prompt,
-                        if self.field == 0 {
-                            active_label_style
-                        } else {
-                            theme.muted_style()
-                        },
-                    ),
-                    Span::raw(self.title.clone()),
-                    Span::styled(cursor, active_label_style),
-                ]);
+                let line = build_single_line_input(
+                    prompt,
+                    &self.title,
+                    self.field == 0,
+                    inner.width as usize,
+                    active_label_style,
+                    theme.muted_style(),
+                );
                 frame.render_widget(
                     Paragraph::new(line),
                     Rect::new(inner.x, y, inner.width, 1),
@@ -718,19 +714,14 @@ impl OnenoteFormOverlay {
                 } else {
                     "Page title: "
                 };
-                let cursor = if self.field == 0 { "▏" } else { "" };
-                let line = Line::from(vec![
-                    Span::styled(
-                        badge,
-                        if self.field == 0 {
-                            active_label_style
-                        } else {
-                            theme.muted_style()
-                        },
-                    ),
-                    Span::raw(self.title.clone()),
-                    Span::styled(cursor, active_label_style),
-                ]);
+                let line = build_single_line_input(
+                    badge,
+                    &self.title,
+                    self.field == 0,
+                    inner.width as usize,
+                    active_label_style,
+                    theme.muted_style(),
+                );
                 frame.render_widget(
                     Paragraph::new(line),
                     Rect::new(inner.x, y, inner.width, 1),
@@ -879,13 +870,29 @@ impl OnenoteFormOverlay {
         }
 
         let box_rect = Rect::new(inner.x, *y, inner.width, avail_h);
+        let box_w = box_rect.width as usize;
         let raw_lines: Vec<&str> = if self.body.is_empty() {
             vec![""]
         } else {
             self.body.split('\n').collect()
         };
+        let cursor_style = Style::default().fg(ONENOTE_PURPLE);
+        let mut visual_lines: Vec<Line<'static>> = Vec::with_capacity(raw_lines.len());
+        for (i, line_str) in raw_lines.iter().enumerate() {
+            let is_last = i + 1 == raw_lines.len();
+            let clean = line_str.trim_end_matches('\r');
+            let mut line_spans = Vec::new();
+            if !clean.is_empty() {
+                line_spans.push(Span::raw(clean.to_string()));
+            }
+            if focused && is_last {
+                line_spans.push(Span::styled("▏", cursor_style));
+            }
+            visual_lines.extend(wrap_styled_spans(&line_spans, box_w, WrapPrefix::empty()));
+        }
+
         let visible = avail_h as usize;
-        let max_scroll = raw_lines.len().saturating_sub(visible);
+        let max_scroll = visual_lines.len().saturating_sub(visible);
         if self.follow_body_bottom {
             self.body_scroll = max_scroll;
         } else {
@@ -895,18 +902,11 @@ impl OnenoteFormOverlay {
             }
         }
         let start = self.body_scroll;
-        let mut rendered_lines = Vec::with_capacity(visible);
-        for (i, line_str) in raw_lines.iter().enumerate().skip(start).take(visible) {
-            let is_last = i + 1 == raw_lines.len();
-            if focused && is_last {
-                rendered_lines.push(Line::from(vec![
-                    Span::raw((*line_str).to_string()),
-                    Span::styled("▏", Style::default().fg(ONENOTE_PURPLE)),
-                ]));
-            } else {
-                rendered_lines.push(Line::from(Span::raw((*line_str).to_string())));
-            }
-        }
+        let rendered_lines: Vec<Line<'static>> = visual_lines
+            .into_iter()
+            .skip(start)
+            .take(visible)
+            .collect();
         frame.render_widget(Paragraph::new(rendered_lines), box_rect);
         for row_off in 0..avail_h {
             hitmap.add_line(
@@ -929,6 +929,46 @@ impl OnenoteFormOverlay {
             }
         }
     }
+}
+
+fn build_single_line_input(
+    label: &str,
+    text: &str,
+    focused: bool,
+    total_width: usize,
+    active_label_style: Style,
+    muted_style: Style,
+) -> Line<'static> {
+    let label_style = if focused {
+        active_label_style
+    } else {
+        muted_style
+    };
+    let label_w = UnicodeWidthStr::width(label);
+    let vp_w = total_width.saturating_sub(label_w);
+    let mut spans = vec![Span::styled(label.to_string(), label_style)];
+    if vp_w == 0 {
+        return Line::from(spans);
+    }
+
+    let window_vp = if focused { vp_w } else { vp_w.saturating_add(1) };
+    let win = windowed_single_line_input(text, text.len(), window_vp);
+    if win.clipped_left {
+        spans.push(Span::styled("‹", muted_style));
+    }
+    if !win.before_cursor.is_empty() {
+        spans.push(Span::raw(win.before_cursor));
+    }
+    if focused {
+        spans.push(Span::styled("▏", active_label_style));
+    }
+    if !win.after_cursor.is_empty() {
+        spans.push(Span::raw(win.after_cursor));
+    }
+    if win.clipped_right {
+        spans.push(Span::styled("›", muted_style));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -1009,6 +1049,81 @@ mod tests {
                 markdown: "- [ ] Updated task".to_string(),
                 base_content: "- [ ] Previous task".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn onenote_form_long_title_and_body_show_tail_chars_and_cursor() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let render_to_string = |form: &mut OnenoteFormOverlay| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+            let ui = UiState::new();
+            let mut hitmap = HitMap::default();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    form.draw(f, area, &ui, &mut hitmap);
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let mut out = String::new();
+            for y in 0..buf.area.height {
+                let mut x = 0u16;
+                while x < buf.area.width {
+                    let sym = buf[(x, y)].symbol();
+                    out.push_str(sym);
+                    let step = UnicodeWidthStr::width(sym).max(1) as u16;
+                    x = x.saturating_add(step);
+                }
+                out.push('\n');
+            }
+            out
+        };
+
+        let title_120 = format!("{}{}", "A".repeat(110), "TITLE_TAIL");
+        assert_eq!(title_120.chars().count(), 120);
+        let body_150 = format!("{}{}", "B".repeat(140), "BODY_END99");
+        assert_eq!(body_150.chars().count(), 150);
+
+        // 1. CreatePage with title focused (field == 0): 120-char title shows tail + cursor `▏`,
+        //    and wrapped 150-char body also shows its tail chars.
+        let mut form =
+            OnenoteFormOverlay::create_page("me|sec-1".to_string(), "Notes".to_string(), 0);
+        form.title = title_120.clone();
+        form.body = body_150.clone();
+        form.field = 0;
+
+        let screen_title = render_to_string(&mut form);
+        assert!(
+            screen_title.contains("TITLE_TAIL▏"),
+            "120-char title must show tail and cursor `▏`:\n{screen_title}"
+        );
+        assert!(
+            screen_title.contains("BODY_END99"),
+            "150-char wrapped body must show tail chars:\n{screen_title}"
+        );
+
+        // 2. CreatePage with body focused (field == 1): 150-char body wraps and shows tail + cursor `▏`,
+        //    and unfocused 120-char title still keeps tail visible.
+        form.field = 1;
+        let screen_body = render_to_string(&mut form);
+        assert!(
+            screen_body.contains("BODY_END99▏"),
+            "150-char body must wrap and show tail + cursor `▏`:\n{screen_body}"
+        );
+        assert!(
+            screen_body.contains("TITLE_TAIL"),
+            "unfocused 120-char title must keep tail visible:\n{screen_body}"
+        );
+
+        // 3. CreateNotebook single-line input with 120-char Korean + ASCII name shows tail + cursor `▏`.
+        let mut nb_form = OnenoteFormOverlay::create_notebook();
+        nb_form.title = format!("{}노트끝Z", "한글노트북이름테스트".repeat(12));
+        let screen_nb = render_to_string(&mut nb_form);
+        assert!(
+            screen_nb.contains("노트끝Z▏"),
+            "CreateNotebook single-line input must show tail + cursor `▏`:\n{screen_nb}"
         );
     }
 }

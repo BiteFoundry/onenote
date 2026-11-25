@@ -15,6 +15,9 @@
 
 use std::collections::HashMap;
 
+use bitefoundry_html::layout::{
+    render_wrapped_table, wrap_styled_spans, TableBorder, TableSpec, WrapPrefix,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -22,7 +25,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     img_preview::RenderedTerminalImage,
@@ -463,11 +466,12 @@ fn draw_page_list_column(
         } else {
             "No pages (press n)"
         };
-        frame.render_widget(
-            Paragraph::new(crate::ui::truncate_width(msg, inner.width as usize))
-                .style(theme.muted_style()),
-            inner,
+        let wrapped = wrap_styled_spans(
+            &[Span::styled(msg, theme.muted_style())],
+            inner.width as usize,
+            WrapPrefix::empty(),
         );
+        frame.render_widget(Paragraph::new(wrapped), inner);
         return;
     }
 
@@ -630,7 +634,12 @@ fn draw_note_canvas(
         } else {
             "Select a page (j/k or click) or press r to refresh."
         };
-        frame.render_widget(Paragraph::new(msg).style(theme.muted_style()), inner);
+        let wrapped = wrap_styled_spans(
+            &[Span::styled(msg, theme.muted_style())],
+            inner.width as usize,
+            WrapPrefix::empty(),
+        );
+        frame.render_widget(Paragraph::new(wrapped), inner);
         return;
     };
 
@@ -865,10 +874,20 @@ pub fn build_page_canvas_lines_with_opts(
                 lines.push(RenderedLine::plain(line));
             }
         } else {
-            lines.push(RenderedLine::plain(Line::from(Span::styled(
-                "  Empty page. Press `a` to append Markdown or `n` to create a new page.",
-                theme.muted_style(),
-            ))));
+            let indent = [Span::raw("  ")];
+            for line in wrap_styled_spans(
+                &[Span::styled(
+                    "Empty page. Press `a` to append Markdown or `n` to create a new page.",
+                    theme.muted_style(),
+                )],
+                width,
+                WrapPrefix {
+                    first: &indent,
+                    cont: &indent,
+                },
+            ) {
+                lines.push(RenderedLine::plain(line));
+            }
         }
         return (lines, ranges);
     }
@@ -1052,35 +1071,33 @@ fn render_block_into(
                 base_style = base_style.add_modifier(Modifier::DIM | Modifier::CROSSED_OUT);
             }
 
-            let mut line_spans = vec![Span::styled(sel_marker, sel_marker_style)];
-            let mut inline_hits = Vec::new();
-            let mut col_off = UnicodeWidthStr::width(sel_marker) as u16;
-
-            if let Some((b_txt, mut b_st, is_todo)) = badge_info {
-                if let Some(bg) = row_bg {
-                    b_st = b_st.bg(bg);
-                }
-                let bw = UnicodeWidthStr::width(b_txt) as u16;
-                if is_todo {
-                    inline_hits.push((col_off, bw.max(2), HitTarget::OnenoteTodoToggle(block_idx)));
-                }
-                line_spans.push(Span::styled(b_txt, b_st));
-                col_off = col_off.saturating_add(bw);
-            }
-
-            line_spans.push(Span::styled(prefix_hashes, base_style));
-            let _ = col_off;
-            append_rich_spans(&mut line_spans, spans, base_style, theme);
-            out.push(RenderedLine::with_inline(
-                Line::from(line_spans),
-                Some(block_hit),
-                inline_hits,
-            ));
+            render_rich_text_lines(
+                out,
+                block_idx,
+                sel_marker,
+                sel_marker_style,
+                &prefix_hashes,
+                base_style,
+                None,
+                badge_info,
+                spans,
+                base_style,
+                row_bg,
+                theme,
+                width,
+            );
 
             if *level <= 2 {
-                let text_w = spans_plain_text(spans).width() + (*level as usize) + 1;
+                let max_seg_w = spans_plain_text(spans)
+                    .split('\n')
+                    .map(|s| UnicodeWidthStr::width(s.trim_end_matches('\r')))
+                    .max()
+                    .unwrap_or(0);
+                let text_w = max_seg_w + (*level as usize) + 1;
                 let rule_char = if *level == 1 { "═" } else { "─" };
-                let rule = rule_char.repeat(text_w.clamp(6, width.saturating_sub(4)));
+                let max_rule_w = width.saturating_sub(4);
+                let rule_len = text_w.min(max_rule_w).max(6.min(max_rule_w));
+                let rule = rule_char.repeat(rule_len);
                 out.push(RenderedLine::clickable(
                     Line::from(vec![
                         Span::raw("  "),
@@ -1091,6 +1108,7 @@ fn render_block_into(
             }
         }
         OnenoteBlockKind::Paragraph { spans } => {
+            let base_style = default_rich_base_style(todo_completed, row_bg, theme);
             render_rich_text_lines(
                 out,
                 block_idx,
@@ -1098,9 +1116,10 @@ fn render_block_into(
                 sel_marker_style,
                 "",
                 Style::default(),
+                None,
                 badge_info,
                 spans,
-                todo_completed,
+                base_style,
                 row_bg,
                 theme,
                 width,
@@ -1112,7 +1131,9 @@ fn render_block_into(
             depth,
             spans,
         } => {
-            let indent = "  ".repeat((*depth).min(6) as usize);
+            let max_indent = width.saturating_sub(14);
+            let indent_w = ((*depth).min(6) as usize * 2).min(max_indent);
+            let indent = " ".repeat(indent_w);
             let bullet = if *ordered {
                 format!("{indent}{}. ", index.unwrap_or(1))
             } else {
@@ -1124,6 +1145,7 @@ fn render_block_into(
             if let Some(bg) = row_bg {
                 bullet_style = bullet_style.bg(bg);
             }
+            let base_style = default_rich_base_style(todo_completed, row_bg, theme);
             render_rich_text_lines(
                 out,
                 block_idx,
@@ -1131,9 +1153,10 @@ fn render_block_into(
                 sel_marker_style,
                 &bullet,
                 bullet_style,
+                None,
                 badge_info,
                 spans,
-                todo_completed,
+                base_style,
                 row_bg,
                 theme,
                 width,
@@ -1146,6 +1169,7 @@ fn render_block_into(
             if let Some(bg) = row_bg {
                 bar_style = bar_style.bg(bg);
             }
+            let base_style = default_rich_base_style(todo_completed, row_bg, theme);
             render_rich_text_lines(
                 out,
                 block_idx,
@@ -1153,16 +1177,19 @@ fn render_block_into(
                 sel_marker_style,
                 "│ ",
                 bar_style,
+                Some(("│ ", bar_style)),
                 badge_info,
                 spans,
-                todo_completed,
+                base_style,
                 row_bg,
                 theme,
                 width,
             );
         }
         OnenoteBlockKind::Table { headers, rows } => {
-            for line in render_unicode_table(headers, rows, selected, theme, width.saturating_sub(2))
+            let sel_w = UnicodeWidthStr::width(sel_marker);
+            for line in
+                render_unicode_table(headers, rows, selected, theme, width.saturating_sub(sel_w))
             {
                 let mut prefixed = vec![Span::styled(sel_marker, sel_marker_style)];
                 prefixed.extend(line.spans);
@@ -1170,12 +1197,14 @@ fn render_block_into(
             }
         }
         OnenoteBlockKind::CodeBlock { lang, code } => {
-            let box_w = width.saturating_sub(4).max(16);
-            let lang_label = lang
+            let sel_w = UnicodeWidthStr::width(sel_marker);
+            let box_w = width.saturating_sub(sel_w + 2).min(width.saturating_sub(sel_w)).max(6);
+            let lang_raw = lang
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("code");
+            let lang_label = truncate_clean(lang_raw, box_w.saturating_sub(5).max(1));
             let top_label = format!("─ {lang_label} ");
             let top_rem = box_w.saturating_sub(UnicodeWidthStr::width(top_label.as_str()) + 2);
             let border_st = if selected {
@@ -1194,27 +1223,24 @@ fn render_block_into(
                 block_hit,
             ));
 
-            let inner_code_w = box_w.saturating_sub(4).max(8);
-            let code_lines: Vec<&str> = if code.is_empty() {
-                vec![""]
-            } else {
-                code.lines().collect()
-            };
-            for raw in code_lines {
-                let expanded = raw.replace('\t', "    ");
-                let wrapped = wrap_text_to_width(&expanded, inner_code_w);
-                for seg in wrapped {
-                    let pad = inner_code_w.saturating_sub(UnicodeWidthStr::width(seg.as_str()));
-                    out.push(RenderedLine::clickable(
-                        Line::from(vec![
-                            Span::styled(sel_marker, sel_marker_style),
-                            Span::styled("│ ", border_st.bg(code_bg)),
-                            Span::styled(format!("{seg}{}", " ".repeat(pad)), code_st),
-                            Span::styled(" │", border_st.bg(code_bg)),
-                        ]),
-                        block_hit,
-                    ));
+            let inner_code_w = box_w.saturating_sub(4).max(2);
+            let wrapped = wrap_styled_spans(
+                &[Span::styled(code.clone(), code_st)],
+                inner_code_w,
+                WrapPrefix::empty(),
+            );
+            for line in wrapped {
+                let pad = inner_code_w.saturating_sub(line.width());
+                let mut row_spans = vec![
+                    Span::styled(sel_marker, sel_marker_style),
+                    Span::styled("│ ", border_st.bg(code_bg)),
+                ];
+                row_spans.extend(line.spans);
+                if pad > 0 {
+                    row_spans.push(Span::styled(" ".repeat(pad), code_st));
                 }
+                row_spans.push(Span::styled(" │", border_st.bg(code_bg)));
+                out.push(RenderedLine::clickable(Line::from(row_spans), block_hit));
             }
 
             out.push(RenderedLine::clickable(
@@ -1249,26 +1275,32 @@ fn render_block_into(
                 "[IMG #{}{dim_tag}{alt_tag} — v preview]",
                 resource_index + 1
             );
-            let chip_w = UnicodeWidthStr::width(chip.as_str()) as u16;
             let mut chip_style = Style::default()
                 .fg(ONENOTE_PURPLE)
                 .add_modifier(Modifier::BOLD);
             if let Some(bg) = row_bg {
                 chip_style = chip_style.bg(bg);
             }
-            let off = UnicodeWidthStr::width(sel_marker) as u16;
-            out.push(RenderedLine::with_inline(
-                Line::from(vec![
-                    Span::styled(sel_marker, sel_marker_style),
-                    Span::styled(chip, chip_style),
-                ]),
-                Some(block_hit),
-                vec![(
-                    off,
-                    chip_w,
-                    HitTarget::OnenoteResource(*resource_index),
-                )],
-            ));
+            let sel_w = UnicodeWidthStr::width(sel_marker);
+            let first_p = [Span::styled(sel_marker, sel_marker_style)];
+            let cont_p = [Span::styled(" ".repeat(sel_w), sel_marker_style)];
+            let off = sel_w as u16;
+            for line in wrap_styled_spans(
+                &[Span::styled(chip, chip_style)],
+                width,
+                WrapPrefix {
+                    first: &first_p,
+                    cont: &cont_p,
+                },
+            ) {
+                let hit_w = (line.width() as u16).saturating_sub(off);
+                let inline_hits = if hit_w > 0 {
+                    vec![(off, hit_w, HitTarget::OnenoteResource(*resource_index))]
+                } else {
+                    Vec::new()
+                };
+                out.push(RenderedLine::with_inline(line, Some(block_hit), inline_hits));
+            }
 
             if let Some(thumb) = cached_thumbs.get(resource_index) {
                 for img_line in &thumb.lines {
@@ -1301,24 +1333,30 @@ fn render_block_into(
             } else {
                 format!("[FILE {name} ({mime_type}) — A download]")
             };
-            let chip_w = UnicodeWidthStr::width(chip.as_str()) as u16;
             let mut chip_style = theme.accent_style().add_modifier(Modifier::BOLD);
             if let Some(bg) = row_bg {
                 chip_style = chip_style.bg(bg);
             }
-            let off = UnicodeWidthStr::width(sel_marker) as u16;
-            out.push(RenderedLine::with_inline(
-                Line::from(vec![
-                    Span::styled(sel_marker, sel_marker_style),
-                    Span::styled(chip, chip_style),
-                ]),
-                Some(block_hit),
-                vec![(
-                    off,
-                    chip_w,
-                    HitTarget::OnenoteResource(*resource_index),
-                )],
-            ));
+            let sel_w = UnicodeWidthStr::width(sel_marker);
+            let first_p = [Span::styled(sel_marker, sel_marker_style)];
+            let cont_p = [Span::styled(" ".repeat(sel_w), sel_marker_style)];
+            let off = sel_w as u16;
+            for line in wrap_styled_spans(
+                &[Span::styled(chip, chip_style)],
+                width,
+                WrapPrefix {
+                    first: &first_p,
+                    cont: &cont_p,
+                },
+            ) {
+                let hit_w = (line.width() as u16).saturating_sub(off);
+                let inline_hits = if hit_w > 0 {
+                    vec![(off, hit_w, HitTarget::OnenoteResource(*resource_index))]
+                } else {
+                    Vec::new()
+                };
+                out.push(RenderedLine::with_inline(line, Some(block_hit), inline_hits));
+            }
         }
         OnenoteBlockKind::Divider => {
             out.push(RenderedLine::clickable(
@@ -1335,6 +1373,20 @@ fn render_block_into(
     }
 }
 
+fn default_rich_base_style(todo_completed: bool, row_bg: Option<Color>, theme: &Theme) -> Style {
+    let mut base_style = if todo_completed {
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::DIM | Modifier::CROSSED_OUT)
+    } else {
+        Style::default().fg(theme.fg)
+    };
+    if let Some(bg) = row_bg {
+        base_style = base_style.bg(bg);
+    }
+    base_style
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_rich_text_lines(
     out: &mut Vec<RenderedLine>,
@@ -1343,74 +1395,72 @@ fn render_rich_text_lines(
     sel_marker_style: Style,
     lead_prefix: &str,
     lead_style: Style,
+    cont_lead: Option<(&str, Style)>,
     badge_info: Option<(&'static str, Style, bool)>,
     spans: &[RichSpan],
-    todo_completed: bool,
+    base_style: Style,
     row_bg: Option<Color>,
     theme: &Theme,
     width: usize,
 ) {
     let block_hit = HitTarget::OnenoteBlock(block_idx);
-    let mut base_style = Style::default().fg(theme.fg);
-    if let Some(bg) = row_bg {
-        base_style = base_style.bg(bg);
-    }
-    if todo_completed {
-        base_style = Style::default()
-            .fg(theme.muted)
-            .add_modifier(Modifier::DIM | Modifier::CROSSED_OUT);
-        if let Some(bg) = row_bg {
-            base_style = base_style.bg(bg);
-        }
-    }
-
     let badge_w = badge_info
         .as_ref()
         .map(|(txt, _, _)| UnicodeWidthStr::width(*txt))
         .unwrap_or(0);
-    let first_prefix_w = UnicodeWidthStr::width(sel_marker)
-        + UnicodeWidthStr::width(lead_prefix)
-        + badge_w;
-    let body_budget = width.saturating_sub(first_prefix_w).max(10);
+    let lead_w = UnicodeWidthStr::width(lead_prefix);
 
-    let wrapped_span_lines = wrap_rich_spans(spans, body_budget, base_style, theme);
-    let cont_pad = " ".repeat(UnicodeWidthStr::width(lead_prefix) + badge_w);
+    let mut first_prefix = vec![Span::styled(sel_marker, sel_marker_style)];
+    let mut first_inline_hits = Vec::new();
+    let mut col_off = UnicodeWidthStr::width(sel_marker) as u16;
 
-    for (line_idx, seg_spans) in wrapped_span_lines.into_iter().enumerate() {
-        let mut row_spans = vec![Span::styled(sel_marker, sel_marker_style)];
-        let mut inline_hits = Vec::new();
-        let mut col_off = UnicodeWidthStr::width(sel_marker) as u16;
-
-        if line_idx == 0 {
-            if !lead_prefix.is_empty() {
-                let lw = UnicodeWidthStr::width(lead_prefix) as u16;
-                row_spans.push(Span::styled(lead_prefix.to_string(), lead_style));
-                col_off = col_off.saturating_add(lw);
-            }
-            if let Some((b_txt, mut b_st, is_todo)) = badge_info {
-                if let Some(bg) = row_bg {
-                    b_st = b_st.bg(bg);
-                }
-                let bw = UnicodeWidthStr::width(b_txt) as u16;
-                if is_todo {
-                    inline_hits.push((col_off, bw.max(2), HitTarget::OnenoteTodoToggle(block_idx)));
-                }
-                row_spans.push(Span::styled(b_txt, b_st));
-            }
-        } else if !cont_pad.is_empty() {
-            let mut pad_st = Style::default();
-            if let Some(bg) = row_bg {
-                pad_st = pad_st.bg(bg);
-            }
-            row_spans.push(Span::styled(cont_pad.clone(), pad_st));
+    if !lead_prefix.is_empty() {
+        first_prefix.push(Span::styled(lead_prefix.to_string(), lead_style));
+        col_off = col_off.saturating_add(lead_w as u16);
+    }
+    if let Some((b_txt, mut b_st, is_todo)) = badge_info {
+        if let Some(bg) = row_bg {
+            b_st = b_st.bg(bg);
         }
+        let bw = UnicodeWidthStr::width(b_txt) as u16;
+        if is_todo {
+            first_inline_hits.push((col_off, bw.max(2), HitTarget::OnenoteTodoToggle(block_idx)));
+        }
+        first_prefix.push(Span::styled(b_txt, b_st));
+    }
 
-        row_spans.extend(seg_spans);
-        out.push(RenderedLine::with_inline(
-            Line::from(row_spans),
-            Some(block_hit),
-            inline_hits,
-        ));
+    let mut cont_prefix = vec![Span::styled(sel_marker, sel_marker_style)];
+    let mut pad_st = Style::default();
+    if let Some(bg) = row_bg {
+        pad_st = pad_st.bg(bg);
+    }
+    if let Some((c_txt, c_st)) = cont_lead {
+        cont_prefix.push(Span::styled(c_txt.to_string(), c_st));
+        if badge_w > 0 {
+            cont_prefix.push(Span::styled(" ".repeat(badge_w), pad_st));
+        }
+    } else if lead_w + badge_w > 0 {
+        cont_prefix.push(Span::styled(" ".repeat(lead_w + badge_w), pad_st));
+    }
+
+    let wrapped = wrap_rich_spans(
+        spans,
+        width,
+        WrapPrefix {
+            first: &first_prefix,
+            cont: &cont_prefix,
+        },
+        base_style,
+        theme,
+    );
+
+    for (line_idx, line) in wrapped.into_iter().enumerate() {
+        let inline_hits = if line_idx == 0 {
+            std::mem::take(&mut first_inline_hits)
+        } else {
+            Vec::new()
+        };
+        out.push(RenderedLine::with_inline(line, Some(block_hit), inline_hits));
     }
 }
 
@@ -1437,6 +1487,17 @@ fn style_for_rich_span(span: &RichSpan, base_style: Style, theme: &Theme) -> Sty
     st
 }
 
+fn rich_spans_to_ratatui(
+    spans: &[RichSpan],
+    base_style: Style,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    spans
+        .iter()
+        .map(|sp| Span::styled(sp.text.clone(), style_for_rich_span(sp, base_style, theme)))
+        .collect()
+}
+
 fn expand_inline_href_spans(spans: &[RichSpan], show_inline_hrefs: bool) -> Vec<RichSpan> {
     if !show_inline_hrefs {
         return spans.to_vec();
@@ -1457,78 +1518,20 @@ fn expand_inline_href_spans(spans: &[RichSpan], show_inline_hrefs: bool) -> Vec<
     out
 }
 
-fn append_rich_spans(
-    out: &mut Vec<Span<'static>>,
-    spans: &[RichSpan],
-    base_style: Style,
-    theme: &Theme,
-) {
-    for sp in spans {
-        let st = style_for_rich_span(sp, base_style, theme);
-        out.push(Span::styled(sp.text.replace('\n', " "), st));
-    }
-}
-
 fn wrap_rich_spans(
     spans: &[RichSpan],
     max_width: usize,
+    prefix: WrapPrefix<'_>,
     base_style: Style,
     theme: &Theme,
-) -> Vec<Vec<Span<'static>>> {
-    if spans.is_empty() {
-        return vec![vec![Span::styled(String::new(), base_style)]];
-    }
-
-    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut cur_w = 0usize;
-
-    for sp in spans {
-        let st = style_for_rich_span(sp, base_style, theme);
-        let mut chunk = String::new();
-
-        for ch in sp.text.chars() {
-            if ch == '\r' {
-                continue;
-            }
-            if ch == '\n' {
-                if !chunk.is_empty() {
-                    lines
-                        .last_mut()
-                        .unwrap()
-                        .push(Span::styled(std::mem::take(&mut chunk), st));
-                }
-                lines.push(Vec::new());
-                cur_w = 0;
-                continue;
-            }
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if cur_w + cw > max_width && cur_w > 0 {
-                if !chunk.is_empty() {
-                    lines
-                        .last_mut()
-                        .unwrap()
-                        .push(Span::styled(std::mem::take(&mut chunk), st));
-                }
-                lines.push(Vec::new());
-                cur_w = 0;
-            }
-            chunk.push(ch);
-            cur_w += cw;
-        }
-
-        if !chunk.is_empty() {
-            lines.last_mut().unwrap().push(Span::styled(chunk, st));
-        }
-    }
-
-    if lines.is_empty() {
-        vec![vec![Span::styled(String::new(), base_style)]]
-    } else {
-        lines
-    }
+) -> Vec<Line<'static>> {
+    let styled = rich_spans_to_ratatui(spans, base_style, theme);
+    wrap_styled_spans(&styled, max_width, prefix)
 }
 
-/// Renders a crisp Unicode box-drawn table (`┌──┬──┐` / `│  │  │` / `├──┼──┤` / `└──┴──┘`) fit to `max_width`.
+/// Renders a crisp Unicode box-drawn table (`┌──┬──┐` / `│  │  │` / `├──┼──┤` / `└──┴──┘`) fit to `max_width`
+/// via the shared `bitefoundry_html::layout::render_wrapped_table` primitive (lossless multi-line cells,
+/// strict `line.width() <= max_width`, stacked fallback on ultra-narrow viewports).
 pub fn render_unicode_table(
     headers: &[Vec<RichSpan>],
     rows: &[Vec<Vec<RichSpan>>],
@@ -1543,24 +1546,6 @@ pub fn render_unicode_table(
         return Vec::new();
     }
 
-    let header_texts: Vec<String> = (0..col_count)
-        .map(|c| {
-            headers
-                .get(c)
-                .map(|s| spans_plain_text(s))
-                .unwrap_or_default()
-        })
-        .collect();
-    let body_texts: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| {
-            (0..col_count)
-                .map(|c| r.get(c).map(|s| spans_plain_text(s)).unwrap_or_default())
-                .collect()
-        })
-        .collect();
-
-    let col_widths = compute_table_col_widths(&header_texts, &body_texts, col_count, max_width);
     let border_style = if selected {
         Style::default().fg(ONENOTE_PURPLE)
     } else {
@@ -1571,143 +1556,46 @@ pub fn render_unicode_table(
         .add_modifier(Modifier::BOLD);
     let cell_style = Style::default().fg(theme.fg);
 
-    let mut out = Vec::new();
-    out.push(Line::from(Span::styled(
-        build_table_rule(&col_widths, '┌', '┬', '┐'),
-        border_style,
-    )));
-
-    let has_non_empty_header = header_texts.iter().any(|h| !h.trim().is_empty());
-    if has_non_empty_header {
-        render_table_row(
-            &mut out,
-            &header_texts,
-            &col_widths,
-            border_style,
-            header_style,
-        );
-        if !body_texts.is_empty() {
-            out.push(Line::from(Span::styled(
-                build_table_rule(&col_widths, '├', '┼', '┤'),
-                border_style,
-            )));
-        }
-    }
-
-    for (r_idx, row_cells) in body_texts.iter().enumerate() {
-        render_table_row(&mut out, row_cells, &col_widths, border_style, cell_style);
-        if r_idx + 1 < body_texts.len() {
-            out.push(Line::from(Span::styled(
-                build_table_rule(&col_widths, '├', '┼', '┤'),
-                border_style,
-            )));
-        }
-    }
-
-    out.push(Line::from(Span::styled(
-        build_table_rule(&col_widths, '└', '┴', '┘'),
-        border_style,
-    )));
-    out
-}
-
-fn compute_table_col_widths(
-    headers: &[String],
-    rows: &[Vec<String>],
-    col_count: usize,
-    max_width: usize,
-) -> Vec<usize> {
-    // Each column consumes `col_w + 3` chars (`│ cell `), plus final `│` = `3 * col_count + 1` overhead
-    let overhead = 3 * col_count + 1;
-    let min_col = 4usize;
-    let available = max_width.saturating_sub(overhead).max(col_count * min_col);
-
-    let mut natural = vec![min_col; col_count];
-    for (c, h) in headers.iter().enumerate() {
-        natural[c] = natural[c].max(UnicodeWidthStr::width(h.trim()).min(36));
-    }
-    for r in rows {
-        for (c, cell) in r.iter().enumerate() {
-            let max_line = cell
-                .lines()
-                .map(|l| UnicodeWidthStr::width(l.trim()))
-                .max()
-                .unwrap_or(0);
-            natural[c] = natural[c].max(max_line.min(40));
-        }
-    }
-
-    let sum_nat: usize = natural.iter().sum();
-    if sum_nat <= available {
-        return natural;
-    }
-
-    let mut scaled: Vec<usize> = natural
+    let has_non_empty_header = headers
         .iter()
-        .map(|&w| ((w * available) / sum_nat.max(1)).max(min_col))
-        .collect();
-    let mut cur_sum: usize = scaled.iter().sum();
-    while cur_sum > available {
-        if let Some((idx, _)) = scaled
-            .iter()
-            .enumerate()
-            .filter(|(_, &w)| w > min_col)
-            .max_by_key(|(_, &w)| w)
-        {
-            scaled[idx] -= 1;
-            cur_sum -= 1;
-        } else {
-            break;
-        }
-    }
-    scaled
-}
+        .any(|cell| cell.iter().any(|sp| !sp.text.trim().is_empty()));
+    let styled_headers: Vec<Vec<Span<'static>>> = if has_non_empty_header {
+        (0..col_count)
+            .map(|c| {
+                headers
+                    .get(c)
+                    .map(|cell| rich_spans_to_ratatui(cell, header_style, theme))
+                    .unwrap_or_default()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-fn build_table_rule(col_widths: &[usize], left: char, mid: char, right: char) -> String {
-    let mut s = String::new();
-    s.push(left);
-    for (i, &w) in col_widths.iter().enumerate() {
-        s.push_str(&"─".repeat(w + 2));
-        if i + 1 < col_widths.len() {
-            s.push(mid);
-        }
-    }
-    s.push(right);
-    s
-}
-
-fn render_table_row(
-    out: &mut Vec<Line<'static>>,
-    cells: &[String],
-    col_widths: &[usize],
-    border_style: Style,
-    text_style: Style,
-) {
-    let wrapped_cols: Vec<Vec<String>> = col_widths
+    let styled_rows: Vec<Vec<Vec<Span<'static>>>> = rows
         .iter()
-        .enumerate()
-        .map(|(c, &w)| {
-            let raw = cells.get(c).map(String::as_str).unwrap_or("");
-            wrap_text_to_width(raw.trim(), w).into_iter().take(4).collect()
+        .map(|row| {
+            (0..col_count)
+                .map(|c| {
+                    row.get(c)
+                        .map(|cell| rich_spans_to_ratatui(cell, cell_style, theme))
+                        .unwrap_or_default()
+                })
+                .collect()
         })
         .collect();
-    let row_height = wrapped_cols.iter().map(Vec::len).max().unwrap_or(1).max(1);
 
-    for sub in 0..row_height {
-        let mut spans = vec![Span::styled("│", border_style)];
-        for (c, &w) in col_widths.iter().enumerate() {
-            let seg = wrapped_cols
-                .get(c)
-                .and_then(|lines| lines.get(sub))
-                .map(String::as_str)
-                .unwrap_or("");
-            let used = UnicodeWidthStr::width(seg);
-            let pad = w.saturating_sub(used);
-            spans.push(Span::styled(format!(" {seg}{} ", " ".repeat(pad)), text_style));
-            spans.push(Span::styled("│", border_style));
-        }
-        out.push(Line::from(spans));
-    }
+    let spec = TableSpec {
+        headers: &styled_headers,
+        rows: &styled_rows,
+        alignments: &[],
+        border: TableBorder::Box,
+        prefix: &[],
+        border_style,
+        header_style,
+        cell_style,
+    };
+    render_wrapped_table(&spec, max_width)
 }
 
 /// Converts a single `OnenoteBlock` back into clean Markdown for surgical block editing (`e`).
@@ -1811,36 +1699,6 @@ fn spans_to_markdown(spans: &[RichSpan]) -> String {
             formatted = format!("[{formatted}]({url})");
         }
         out.push_str(&formatted);
-    }
-    out
-}
-
-fn wrap_text_to_width(text: &str, max_width: usize) -> Vec<String> {
-    let max_width = max_width.max(2);
-    let mut out = Vec::new();
-    for raw_line in text.split('\n') {
-        let clean = raw_line.trim_end_matches('\r');
-        if clean.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut cur = String::new();
-        let mut used = 0usize;
-        for ch in clean.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + cw > max_width && used > 0 {
-                out.push(std::mem::take(&mut cur));
-                used = 0;
-            }
-            cur.push(ch);
-            used += cw;
-        }
-        if !cur.is_empty() {
-            out.push(cur);
-        }
-    }
-    if out.is_empty() {
-        out.push(String::new());
     }
     out
 }
@@ -2122,5 +1980,347 @@ mod tests {
                 && xhtml.contains("Inline warning"),
             "expected styled GFM warning callout, got: {xhtml}"
         );
+    }
+
+    #[test]
+    fn heading_90_char_korean_and_embedded_newline_wraps_losslessly_at_width_50() {
+        let part1 = "가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사";
+        let part2 = "둘째줄한글제목내용가나다라마바사아자차카타파하끝토큰마무리테스트긴제목표시확인완료추가검증문구";
+        let full_heading = format!("{part1}\n{part2}");
+        assert!(
+            full_heading.chars().count() >= 90,
+            "heading must be >= 90 chars, got {}",
+            full_heading.chars().count()
+        );
+
+        let detail = OnenotePageDetail {
+            summary: sample_summary("Heading Wrap Test", 0, false),
+            raw_xhtml: String::new(),
+            body_markdown: String::new(),
+            body_plain: String::new(),
+            blocks: vec![OnenoteBlock {
+                element_id: Some("h1:1".to_string()),
+                tag: None,
+                raw_html: None,
+                kind: OnenoteBlockKind::Heading {
+                    level: 1,
+                    spans: vec![RichSpan::plain(full_heading.clone())],
+                },
+            }],
+            resources: Vec::new(),
+            primary_div_id: None,
+            synced_at: None,
+        };
+
+        let width = 50usize;
+        let (lines, ranges) = build_page_canvas_lines(
+            &detail,
+            None,
+            &HashMap::new(),
+            &Theme::default(),
+            width,
+        );
+        let &(start, end) = ranges.get(&0).expect("heading block range missing");
+        let block_lines = &lines[start..end];
+
+        for (idx, rl) in block_lines.iter().enumerate() {
+            assert!(
+                rl.line.width() <= width,
+                "heading line {idx} exceeded width {width}: {} ({:?})",
+                rl.line.width(),
+                rl.line
+            );
+        }
+
+        // Exclude underline rule (`═`) and trailing blank separator line.
+        let text_lines: Vec<String> = block_lines
+            .iter()
+            .map(|rl| {
+                rl.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .filter(|s| !s.trim().is_empty() && !s.contains('═'))
+            .collect();
+
+        assert!(
+            text_lines.len() >= 4,
+            "expected multi-line wrapped heading at width=50, got {} lines: {:?}",
+            text_lines.len(),
+            text_lines
+        );
+
+        // Embedded `\n` must start `part2` on a distinct line after `part1`.
+        let part2_line_idx = text_lines
+            .iter()
+            .position(|l| l.contains("둘째줄한글"))
+            .expect("second paragraph after embedded newline missing");
+        assert!(
+            part2_line_idx > 0,
+            "embedded newline must place second part on a subsequent line: {:?}",
+            text_lines
+        );
+        assert!(
+            !text_lines[part2_line_idx].contains("카타파하둘째줄"),
+            "embedded newline must not be flattened into a single line: {:?}",
+            text_lines
+        );
+
+        // Lossless character check across all wrapped heading lines.
+        let stripped: String = text_lines
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if i == 0 {
+                    s.strip_prefix("  # ").unwrap_or(s)
+                } else {
+                    s.strip_prefix("    ").unwrap_or(s)
+                }
+            })
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let expected: String = full_heading
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(stripped, expected, "heading text must wrap losslessly");
+    }
+
+    #[test]
+    fn wide_6_col_table_with_8_line_cell_preserves_all_lines_and_width_invariant() {
+        let headers: Vec<Vec<RichSpan>> = (1..=6)
+            .map(|c| vec![RichSpan::plain(format!("C{c}"))])
+            .collect();
+        let eight_line_cell = (1..=8)
+            .map(|n| format!("L{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rows = vec![vec![
+            vec![RichSpan::plain("A1")],
+            vec![RichSpan::plain(eight_line_cell)],
+            vec![RichSpan::plain("A3")],
+            vec![RichSpan::plain("A4")],
+            vec![RichSpan::plain("A5")],
+            vec![RichSpan::plain("END6")],
+        ]];
+
+        let width = 60usize;
+        let rendered = render_unicode_table(&headers, &rows, false, &Theme::default(), width);
+        assert!(!rendered.is_empty());
+
+        for (idx, line) in rendered.iter().enumerate() {
+            assert!(
+                line.width() <= width,
+                "6-col table line {idx} exceeded width {width}: {} ({:?})",
+                line.width(),
+                line
+            );
+        }
+
+        let plain: String = rendered
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // All 6 columns (headers + cells) must be preserved without right-column clipping.
+        for tok in ["C1", "C2", "C3", "C4", "C5", "C6", "A1", "A3", "A4", "A5", "END6"] {
+            assert!(
+                plain.contains(tok),
+                "missing 6-col table token '{tok}' at width={width}:\n{plain}"
+            );
+        }
+
+        // Lines 5-8 of the 8-line cell must ALL survive (old `.take(4)` silently dropped them).
+        for n in 1..=8 {
+            let marker = format!("L{n}");
+            assert!(
+                plain.contains(&marker),
+                "cell line '{marker}' was truncated in 8-line cell:\n{plain}"
+            );
+        }
+
+        // Also check the full canvas integration (with 2-col selection gutter) keeps `line.width() <= 60`.
+        let detail = OnenotePageDetail {
+            summary: sample_summary("Wide Table", 0, false),
+            raw_xhtml: String::new(),
+            body_markdown: String::new(),
+            body_plain: String::new(),
+            blocks: vec![OnenoteBlock {
+                element_id: Some("tbl:1".to_string()),
+                tag: None,
+                raw_html: None,
+                kind: OnenoteBlockKind::Table { headers, rows },
+            }],
+            resources: Vec::new(),
+            primary_div_id: None,
+            synced_at: None,
+        };
+        let (canvas_lines, _) = build_page_canvas_lines(
+            &detail,
+            Some(0),
+            &HashMap::new(),
+            &Theme::default(),
+            width,
+        );
+        for (idx, rl) in canvas_lines.iter().enumerate() {
+            assert!(
+                rl.line.width() <= width,
+                "canvas table line {idx} exceeded width {width}: {} ({:?})",
+                rl.line.width(),
+                rl.line
+            );
+        }
+    }
+
+    #[test]
+    fn deep_list_chips_code_quote_and_empty_state_satisfy_width_invariant() {
+        let detail = OnenotePageDetail {
+            summary: sample_summary("Invariants", 0, false),
+            raw_xhtml: String::new(),
+            body_markdown: String::new(),
+            body_plain: String::new(),
+            blocks: vec![
+                OnenoteBlock {
+                    element_id: Some("li:1".to_string()),
+                    tag: None,
+                    raw_html: None,
+                    kind: OnenoteBlockKind::ListItem {
+                        ordered: true,
+                        index: Some(12),
+                        depth: 6,
+                        spans: vec![RichSpan::plain(
+                            "깊은중첩리스트항목텍스트가좁은폭에서도절대우측경계를넘지않고전량표시된다",
+                        )],
+                    },
+                },
+                OnenoteBlock {
+                    element_id: Some("q:2".to_string()),
+                    tag: None,
+                    raw_html: None,
+                    kind: OnenoteBlockKind::Quote {
+                        spans: vec![RichSpan::plain("인용문첫줄\n인용문둘째줄긴내용확인테스트")],
+                    },
+                },
+                OnenoteBlock {
+                    element_id: Some("pre:3".to_string()),
+                    tag: None,
+                    raw_html: None,
+                    kind: OnenoteBlockKind::CodeBlock {
+                        lang: Some("rust".to_string()),
+                        code: "\tlet very_long_identifier_name = \"한글코드문자열테스트\";".to_string(),
+                    },
+                },
+                OnenoteBlock {
+                    element_id: Some("img:4".to_string()),
+                    tag: None,
+                    raw_html: None,
+                    kind: OnenoteBlockKind::Image {
+                        resource_index: 0,
+                        src: "https://example.com/img.png".to_string(),
+                        alt: Some("아주긴이미지대체텍스트설명문구확인용".to_string()),
+                        width: Some(1920),
+                        height: Some(1080),
+                    },
+                },
+                OnenoteBlock {
+                    element_id: Some("att:5".to_string()),
+                    tag: None,
+                    raw_html: None,
+                    kind: OnenoteBlockKind::Attachment {
+                        resource_index: 1,
+                        src: "https://example.com/report.md".to_string(),
+                        name: "quarterly_architecture_review_2026_final_v3.md".to_string(),
+                        mime_type: "text/markdown".to_string(),
+                    },
+                },
+            ],
+            resources: Vec::new(),
+            primary_div_id: None,
+            synced_at: None,
+        };
+
+        for width in [24usize, 36, 50] {
+            let (lines, ranges) = build_page_canvas_lines(
+                &detail,
+                Some(0),
+                &HashMap::new(),
+                &Theme::default(),
+                width,
+            );
+            for (idx, rl) in lines.iter().enumerate() {
+                assert!(
+                    rl.line.width() <= width,
+                    "width={width} line {idx} overflowed: {} > {width} ({:?})",
+                    rl.line.width(),
+                    rl.line
+                );
+            }
+
+            // Image and Attachment chips must wrap into multiple rows at narrow width
+            // AND preserve `HitTarget::OnenoteResource` on every wrapped row.
+            for &(blk_idx, res_idx) in &[(3usize, 0usize), (4usize, 1usize)] {
+                let &(start, end) = ranges.get(&blk_idx).unwrap();
+                let chip_rows: Vec<&RenderedLine> = lines[start..end]
+                    .iter()
+                    .filter(|rl| {
+                        !rl.line
+                            .spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                            .trim()
+                            .is_empty()
+                    })
+                    .collect();
+                assert!(
+                    chip_rows.len() >= 2 || width >= 50,
+                    "expected wrapped chip rows at width={width} for block {blk_idx}"
+                );
+                for row in chip_rows {
+                    assert!(
+                        row.inline_hits
+                            .iter()
+                            .any(|&(_, _, t)| t == HitTarget::OnenoteResource(res_idx)),
+                        "wrapped chip row missing HitTarget::OnenoteResource({res_idx}) at width={width}"
+                    );
+                }
+            }
+        }
+
+        // Empty-state prompt must wrap cleanly within width.
+        let empty_detail = OnenotePageDetail {
+            summary: sample_summary("Empty", 0, false),
+            raw_xhtml: String::new(),
+            body_markdown: String::new(),
+            body_plain: String::new(),
+            blocks: Vec::new(),
+            resources: Vec::new(),
+            primary_div_id: None,
+            synced_at: None,
+        };
+        let (empty_lines, _) = build_page_canvas_lines(
+            &empty_detail,
+            None,
+            &HashMap::new(),
+            &Theme::default(),
+            28,
+        );
+        for (idx, rl) in empty_lines.iter().enumerate() {
+            assert!(
+                rl.line.width() <= 28,
+                "empty page line {idx} overflowed width 28: {}",
+                rl.line.width()
+            );
+        }
     }
 }
