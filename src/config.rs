@@ -351,6 +351,10 @@ impl AppConfig {
     /// Writes `config.toml` without making environment values permanent: see
     /// `for_saving`.
     pub fn save(&self) -> Result<()> {
+        #[cfg(test)]
+        if std::env::var_os("ONENOTE_CONFIG_DIR").is_none() {
+            return Ok(());
+        }
         let path = config_file_path();
         self.for_saving(&env_overrides(process_env), &path)
             .save_to(&path)
@@ -844,6 +848,10 @@ impl DraftStore {
     }
 
     pub fn save(&self) -> Result<()> {
+        #[cfg(test)]
+        if std::env::var_os("ONENOTE_CONFIG_DIR").is_none() {
+            return Ok(());
+        }
         self.save_to(&drafts_path())
     }
 
