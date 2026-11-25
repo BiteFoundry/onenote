@@ -191,23 +191,23 @@ struct PixelReconcilePlan {
 
 #[derive(Debug, Default)]
 struct PixelLayerTracker {
-    active: Option<ActivePixelGraphic>,
+    active: Vec<ActivePixelGraphic>,
     last_term_size: (u16, u16),
 }
 
 impl PixelLayerTracker {
     fn clear(&mut self) {
-        self.active = None;
+        self.active.clear();
     }
 
     fn plan_transition(
         &self,
-        desired: Option<&ActivePixelGraphic>,
+        desired: &[ActivePixelGraphic],
         term_size: (u16, u16),
         kitty_used: bool,
     ) -> PixelReconcilePlan {
         let term_resized = self.last_term_size != term_size;
-        if self.active.as_ref() == desired && !term_resized {
+        if self.active.as_slice() == desired && !term_resized {
             return PixelReconcilePlan {
                 erase_and_redraw: false,
                 erase_in_place_only: false,
@@ -220,17 +220,15 @@ impl PixelLayerTracker {
         // Fast path for Sixel viewport scroll on the exact same rect & base image:
         // erase only the previous rect in place (no full `terminal.clear()` flicker).
         let sixel_crop_only_update = !term_resized
-            && match (&self.active, desired) {
-                (Some(prev), Some(next))
-                    if prev.protocol == TerminalImageProtocol::Sixel
-                        && next.protocol == TerminalImageProtocol::Sixel
-                        && prev.rect == next.rect =>
-                {
-                    let (prev_base, _) = parse_pixel_key(&prev.cache_key);
-                    let (next_base, _) = parse_pixel_key(&next.cache_key);
-                    prev_base == next_base
-                }
-                _ => false,
+            && self.active.len() == 1
+            && desired.len() == 1
+            && self.active[0].protocol == TerminalImageProtocol::Sixel
+            && desired[0].protocol == TerminalImageProtocol::Sixel
+            && self.active[0].rect == desired[0].rect
+            && {
+                let (prev_base, _) = parse_pixel_key(&self.active[0].cache_key);
+                let (next_base, _) = parse_pixel_key(&desired[0].cache_key);
+                prev_base == next_base
             };
 
         let erase_rects = self
@@ -256,36 +254,38 @@ impl PixelLayerTracker {
             };
         }
 
-        let had_active = self.active.is_some();
+        let had_active = !self.active.is_empty();
         let delete_kitty = had_active
             && (kitty_used
                 || self
                     .active
-                    .as_ref()
-                    .is_some_and(|g| g.protocol == TerminalImageProtocol::Kitty));
+                    .iter()
+                    .any(|g| g.protocol == TerminalImageProtocol::Kitty));
 
         PixelReconcilePlan {
             erase_and_redraw: had_active,
             erase_in_place_only: false,
             delete_kitty,
             erase_rects,
-            emit_desired: desired.is_some(),
+            emit_desired: !desired.is_empty(),
         }
     }
 
-    fn commit(&mut self, desired: Option<ActivePixelGraphic>, term_size: (u16, u16)) {
+    fn commit(&mut self, desired: Vec<ActivePixelGraphic>, term_size: (u16, u16)) {
         self.active = desired;
         self.last_term_size = term_size;
     }
 }
 
-/// Overlay Z-order guard: allows modal pixel graphics only when `ImagePreview` is the top-most overlay,
-/// and blocks all pixel graphics whenever another modal (e.g., `ConfirmDialog`, `CommandPalette`) sits on top.
+/// Overlay Z-order guard: allows modal pixel graphics only when `ImagePreview` or `HtmlPreview`
+/// is the top-most overlay, and blocks all pixel graphics whenever another modal sits on top.
 fn pixel_graphics_allowed_for_overlays(overlays: &[Overlay], cache_key: &str) -> bool {
     if overlays.is_empty() {
-        !cache_key.starts_with("hd:")
+        !cache_key.starts_with("hd:") && !cache_key.starts_with("html:")
     } else if matches!(overlays.last(), Some(Overlay::ImagePreview(_))) {
-        !cache_key.starts_with("inline:")
+        !cache_key.starts_with("inline:") && !cache_key.starts_with("html:")
+    } else if matches!(overlays.last(), Some(Overlay::HtmlPreview(_))) {
+        cache_key.starts_with("html:")
     } else {
         false
     }
@@ -737,10 +737,12 @@ fn draw_frame(
             cursor_pos = ui::draw(frame, app, ui);
         })?;
 
-        // Resolve desired pixel graphic with overlay Z-order and bottom-row safety guards.
-        let desired: Option<ActivePixelGraphic> = ui.pending_pixel_graphic.clone().and_then(|pg| {
+        // Resolve all desired pixel graphics with overlay Z-order and bottom-row safety guards.
+        let mut desired: Vec<ActivePixelGraphic> = Vec::new();
+        let mut desired_payloads: Vec<String> = Vec::new();
+        for pg in &ui.pending_pixel_graphics {
             if !pixel_graphics_allowed_for_overlays(&ui.overlays, &pg.cache_key) {
-                return None;
+                continue;
             }
             // Never allow pixel graphics to touch the bottom-most status row (`term_height - 1`).
             let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
@@ -748,26 +750,54 @@ fn draw_frame(
             let fit_w = pg.rect.width.min(safe_max_w);
             let fit_h = pg.rect.height.min(safe_max_h);
             if fit_w == 0 || fit_h == 0 {
-                return None;
+                continue;
             }
 
-            let (base_key, _crop) = parse_pixel_key(&pg.cache_key);
-            let rendered = app.image_cache.get(base_key)?;
-            let payload_len = rendered.pixel_payload.as_deref()?.len();
-            Some(ActivePixelGraphic {
-                cache_key: pg.cache_key,
+            let resolved_payload: Option<Cow<'_, str>> =
+                if let Some(ref preencoded) = pg.preencoded_payload {
+                    Some(Cow::Borrowed(preencoded.as_str()))
+                } else {
+                    let (base_key, crop) = parse_pixel_key(&pg.cache_key);
+                    app.image_cache.get(base_key).and_then(|rendered| {
+                        if let Some((sx, sy, vw, vh)) = crop {
+                            let eff_vw = vw.min(safe_max_w);
+                            let eff_vh = vh.min(safe_max_h);
+                            rendered
+                                .viewport_pixel_payload(sx, sy, eff_vw, eff_vh)
+                                .map(|(p, _, _)| Cow::Owned(p))
+                                .or_else(|| {
+                                    if rendered.cols <= eff_vw && rendered.rows <= eff_vh {
+                                        rendered.pixel_payload.as_deref().map(Cow::Borrowed)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        } else {
+                            rendered.pixel_payload.as_deref().map(Cow::Borrowed)
+                        }
+                    })
+                };
+
+            let Some(payload) = resolved_payload else {
+                continue;
+            };
+            let payload_owned = payload.into_owned();
+            let payload_len = payload_owned.len();
+            desired.push(ActivePixelGraphic {
+                cache_key: pg.cache_key.clone(),
                 rect: Rect::new(pg.rect.x, pg.rect.y, fit_w, fit_h),
                 protocol: pg.protocol,
                 cols: fit_w,
                 rows: fit_h,
                 payload_len,
-            })
-        });
+            });
+            desired_payloads.push(payload_owned);
+        }
 
         let term_size = (ui.term_width, ui.term_height);
         let plan = guard
             .pixel_tracker
-            .plan_transition(desired.as_ref(), term_size, guard.kitty_used);
+            .plan_transition(&desired, term_size, guard.kitty_used);
 
         if plan.erase_and_redraw {
             if plan.delete_kitty {
@@ -813,68 +843,58 @@ fn draw_frame(
             }
         }
 
-        let mut committed_graphic = desired.clone();
+        let mut committed_graphics = desired.clone();
         if plan.emit_desired {
-            if let Some(graphic) = &desired {
-                let (base_key, crop) = parse_pixel_key(&graphic.cache_key);
-                let payload: Option<Cow<'_, str>> =
-                    app.image_cache.get(base_key).and_then(|rendered| {
-                        if let Some((sx, sy, vw, vh)) = crop {
-                            let safe_max_w = ui.term_width.saturating_sub(graphic.rect.x);
-                            let safe_max_h = ui
-                                .term_height
-                                .saturating_sub(1)
-                                .saturating_sub(graphic.rect.y);
-                            let eff_vw = vw.min(safe_max_w);
-                            let eff_vh = vh.min(safe_max_h);
-                            rendered
-                                .viewport_pixel_payload(sx, sy, eff_vw, eff_vh)
-                                .map(|(p, _, _)| Cow::Owned(p))
-                                .or_else(|| {
-                                    if rendered.cols <= eff_vw && rendered.rows <= eff_vh {
-                                        rendered.pixel_payload.as_deref().map(Cow::Borrowed)
-                                    } else {
-                                        None
-                                    }
-                                })
-                        } else {
-                            rendered.pixel_payload.as_deref().map(Cow::Borrowed)
-                        }
-                    });
-                if let Some(payload) = payload {
-                    if graphic.protocol == TerminalImageProtocol::Kitty {
-                        terminal
-                            .backend_mut()
-                            .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
-                        guard.kitty_used = true;
-                        KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
-                    }
-                    crossterm::queue!(
-                        terminal.backend_mut(),
-                        crossterm::cursor::MoveTo(graphic.rect.x, graphic.rect.y)
-                    )?;
-                    terminal.backend_mut().write_all(payload.as_bytes())?;
-                    terminal.backend_mut().flush()?;
-                    ui.active_pixel_graphic =
-                        Some((graphic.cache_key.clone(), graphic.rect, graphic.protocol));
-                } else {
-                    committed_graphic = None;
-                    ui.active_pixel_graphic = None;
+            let has_kitty = desired
+                .iter()
+                .any(|g| g.protocol == TerminalImageProtocol::Kitty);
+            if has_kitty {
+                terminal
+                    .backend_mut()
+                    .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+                if desired.len() > 1 {
+                    terminal
+                        .backend_mut()
+                        .write_all(img_preview::kitty_delete_all_sequence().as_bytes())?;
                 }
-            } else {
-                committed_graphic = None;
-                ui.active_pixel_graphic = None;
+                guard.kitty_used = true;
+                KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
             }
+
+            let kitty_id_token = format!(",i={},", img_preview::KITTY_PREVIEW_IMAGE_ID);
+            let mut kitty_idx = 0u32;
+            for (graphic, payload) in desired.iter().zip(desired_payloads.iter()) {
+                let emit_bytes: Cow<'_, str> =
+                    if graphic.protocol == TerminalImageProtocol::Kitty && kitty_idx > 0 {
+                        let next_id = img_preview::KITTY_PREVIEW_IMAGE_ID.saturating_add(kitty_idx);
+                        Cow::Owned(payload.replacen(&kitty_id_token, &format!(",i={next_id},"), 1))
+                    } else {
+                        Cow::Borrowed(payload.as_str())
+                    };
+                if graphic.protocol == TerminalImageProtocol::Kitty {
+                    kitty_idx = kitty_idx.saturating_add(1);
+                }
+                crossterm::queue!(
+                    terminal.backend_mut(),
+                    crossterm::cursor::MoveTo(graphic.rect.x, graphic.rect.y)
+                )?;
+                terminal.backend_mut().write_all(emit_bytes.as_bytes())?;
+            }
+            terminal.backend_mut().flush()?;
+            ui.active_pixel_graphic = desired
+                .first()
+                .map(|g| (g.cache_key.clone(), g.rect, g.protocol));
         } else {
             if plan.delete_kitty {
                 guard.kitty_used = false;
             }
-            if desired.is_none() {
+            if desired.is_empty() {
+                committed_graphics.clear();
                 ui.active_pixel_graphic = None;
             }
         }
 
-        guard.pixel_tracker.commit(committed_graphic, term_size);
+        guard.pixel_tracker.commit(committed_graphics, term_size);
 
         if let Some((cx, cy)) = cursor_pos {
             let _ = terminal.show_cursor();
@@ -1533,52 +1553,63 @@ mod tests {
         };
 
         // Initial paint emits desired with no prior erase
-        let init_plan = tracker.plan_transition(Some(&sixel_a), (120, 34), false);
+        let init_plan = tracker.plan_transition(std::slice::from_ref(&sixel_a), (120, 34), false);
         assert!(!init_plan.erase_and_redraw);
         assert!(!init_plan.erase_in_place_only);
         assert!(init_plan.emit_desired);
-        tracker.commit(Some(sixel_a.clone()), (120, 34));
+        tracker.commit(vec![sixel_a.clone()], (120, 34));
 
         // Unchanged spinner tick skips erase and re-emit
-        let noop_plan = tracker.plan_transition(Some(&sixel_a), (120, 34), false);
+        let noop_plan = tracker.plan_transition(std::slice::from_ref(&sixel_a), (120, 34), false);
         assert!(!noop_plan.erase_and_redraw);
         assert!(!noop_plan.erase_in_place_only);
         assert!(!noop_plan.emit_desired);
 
         // Sixel vertical scroll on same rect uses fast in-place rect erase without full clear
-        let scroll_plan = tracker.plan_transition(Some(&sixel_a_scrolled), (120, 34), false);
+        let scroll_plan =
+            tracker.plan_transition(std::slice::from_ref(&sixel_a_scrolled), (120, 34), false);
         assert!(!scroll_plan.erase_and_redraw);
         assert!(scroll_plan.erase_in_place_only);
         assert_eq!(scroll_plan.erase_rects, vec![sixel_a.rect]);
         assert!(scroll_plan.emit_desired);
-        tracker.commit(Some(sixel_a_scrolled.clone()), (120, 34));
+        tracker.commit(vec![sixel_a_scrolled.clone()], (120, 34));
 
-        // Closing modal (desired = None) triggers full erase_and_redraw + rect erase
-        let close_plan = tracker.plan_transition(None, (120, 34), false);
+        // Closing modal (desired = empty) triggers full erase_and_redraw + rect erase
+        let close_plan = tracker.plan_transition(&[], (120, 34), false);
         assert!(close_plan.erase_and_redraw);
         assert!(!close_plan.delete_kitty);
         assert_eq!(close_plan.erase_rects, vec![sixel_a_scrolled.rect]);
         assert!(!close_plan.emit_desired);
 
         // Kitty image closed -> delete_kitty = true
-        tracker.commit(Some(kitty_b.clone()), (120, 34));
-        let kitty_close = tracker.plan_transition(None, (120, 34), true);
+        tracker.commit(vec![kitty_b.clone()], (120, 34));
+        let kitty_close = tracker.plan_transition(&[], (120, 34), true);
         assert!(kitty_close.erase_and_redraw);
         assert!(kitty_close.delete_kitty);
         assert_eq!(kitty_close.erase_rects, vec![kitty_b.rect]);
 
-        // Overlay Z-order guard: modal pixel graphic allowed ONLY when ImagePreview is top overlay
+        // Overlay Z-order guard: modal pixel graphic allowed ONLY when ImagePreview or HtmlPreview is top overlay
         assert!(!pixel_graphics_allowed_for_overlays(&[], "hd:me|p1:0:80:100:Sixel"));
+        assert!(!pixel_graphics_allowed_for_overlays(&[], "html:node1:w80"));
         assert!(!pixel_graphics_allowed_for_overlays(
             &[Overlay::command_palette()],
             "hd:me|p1:0:80:100:Sixel"
         ));
+        let html_overlay = vec![Overlay::HtmlPreview(
+            crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(None, "<p>x</p>".into()),
+        )];
+        assert!(pixel_graphics_allowed_for_overlays(&html_overlay, "html:node1:w80"));
+        assert!(!pixel_graphics_allowed_for_overlays(&html_overlay, "hd:me|p1:0:80:100:Sixel"));
         let confirm_over_preview = vec![
             Overlay::confirm("Quit Microsoft OneNote TUI?", Some(Action::Quit)),
         ];
         assert!(!pixel_graphics_allowed_for_overlays(
             &confirm_over_preview,
             "hd:me|p1:0:80:100:Sixel"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &confirm_over_preview,
+            "html:node1:w80"
         ));
     }
 }

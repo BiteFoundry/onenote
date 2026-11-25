@@ -23,6 +23,21 @@ impl GraphClient {
         if trimmed.is_empty() {
             bail!("OneNote resource URL is empty.");
         }
+        if trimmed.len() >= 11 && trimmed[..11].eq_ignore_ascii_case("data:image/") {
+            let decoded = bitefoundry_html::graphics::decode_data_image_uri(trimmed)
+                .context("Failed to decode inline data:image URI")?;
+            if decoded.is_svg {
+                let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
+                    &decoded.bytes,
+                    1024,
+                    1024,
+                    None,
+                )
+                .context("Failed to rasterize inline data:image/svg+xml URI")?;
+                return Ok(("image/png".to_string(), raster.png_bytes.to_vec()));
+            }
+            return Ok((decoded.mime, decoded.bytes));
+        }
         let use_bearer = should_send_bearer(&self.config.graph_base_url, trimmed);
         let bytes = self
             .get_bytes_with_limit(trimmed, use_bearer, MAX_IN_MEMORY_RESOURCE_BYTES)
@@ -136,16 +151,14 @@ impl GraphClient {
     }
 }
 
-/// Returns `true` only when the resource MIME/filename represents a supported raster image
-/// and the downloaded header bytes are neither HTML nor SVG markup.
+/// Returns `true` when the resource MIME/filename represents a supported image (raster or SVG)
+/// and the downloaded header bytes are not spoofed HTML markup.
 pub(crate) fn is_raster_image_resource(
     mime_type: &str,
     file_name: &str,
     header_bytes: &[u8],
 ) -> bool {
-    if crate::img_preview::looks_like_html_bytes(header_bytes)
-        || crate::img_preview::looks_like_svg_bytes(header_bytes)
-    {
+    if crate::img_preview::looks_like_html_bytes(header_bytes) {
         return false;
     }
     crate::img_preview::is_image_mime_or_name(mime_type, Some(file_name))
@@ -520,20 +533,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_svg_and_html_rejected_as_raster_image() {
+    async fn test_svg_accepted_and_html_rejected_as_image() {
         let dir = tempdir().unwrap();
 
-        // 1. SVG file must never be classified as raster image
+        // 1. SVG file is natively supported via Pure-Rust resvg
         let svg_path = dir.path().join("diagram.svg");
         let svg_bytes = br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>"#;
         std::fs::write(&svg_path, svg_bytes).unwrap();
         let (hdr, sniffed) = sniff_file_header_and_mime(&svg_path).await;
         assert_eq!(sniffed, Some("image/svg+xml"));
-        assert!(!is_raster_image_resource("image/svg+xml", "diagram.svg", &hdr));
-        // Even if server lied and named it .png with image/png hint, SVG bytes are rejected
-        assert!(!is_raster_image_resource("image/png", "diagram.png", &hdr));
+        assert!(is_raster_image_resource("image/svg+xml", "diagram.svg", &hdr));
 
-        // 2. HTML error/login page disguised as .png must be rejected
+        // 2. HTML error/login page disguised as .png must still be rejected
         let html_path = dir.path().join("photo.png");
         let html_bytes = b"<!DOCTYPE html><html><body>Sign in required</body></html>";
         std::fs::write(&html_path, html_bytes).unwrap();
@@ -549,5 +560,44 @@ mod tests {
         let (real_hdr, real_sniffed) = sniff_file_header_and_mime(&png_path).await;
         assert_eq!(real_sniffed, Some("image/png"));
         assert!(is_raster_image_resource("image/png", "real.png", &real_hdr));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_data_image_uri_decodes_locally_without_http() {
+        use base64::Engine as _;
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = "http://127.0.0.1:1/v1.0".to_string();
+        let auth = crate::auth::AuthManager::empty_for_test(cfg.clone());
+        let graph = GraphClient::new(cfg, auth).unwrap();
+
+        // Build a valid 2x2 PNG in-memory and encode as data:image/png;base64,...
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([220, 40, 80, 255]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let data_uri = format!("data:image/png;base64,{b64}");
+
+        let (mime, bytes) = graph
+            .fetch_onenote_resource_bytes(&data_uri)
+            .await
+            .expect("data:image/png should decode locally without HTTP");
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, png_bytes);
+
+        // Percent-encoded SVG data URI is rasterized to PNG locally
+        let svg_uri = "data:image/svg+xml,%3Csvg%20width%3D%2216%22%20height%3D%2216%22%3E%3Crect%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22%23e11d48%22/%3E%3C/svg%3E";
+        let (svg_mime, svg_png) = graph
+            .fetch_onenote_resource_bytes(svg_uri)
+            .await
+            .expect("data:image/svg+xml should rasterize to PNG locally");
+        assert_eq!(svg_mime, "image/png");
+        assert!(svg_png.starts_with(b"\x89PNG"));
+
+        // Spoofed HTML inside data:image/png must be rejected
+        let spoofed = "data:image/png;base64,PGh0bWw+PGJvZHk+SGk8L2JvZHk+PC9odG1sPg==";
+        assert!(graph.fetch_onenote_resource_bytes(spoofed).await.is_err());
     }
 }

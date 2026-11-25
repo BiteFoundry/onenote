@@ -9,7 +9,7 @@
 //! - `j` / `k` / `↑` / `↓` / `PgUp` / `PgDn` / `g` / `G` / wheel scroll + vertical `Scrollbar`
 //! - `Esc` / `q` / `[✕ Esc]` / click-outside close
 
-use std::fmt;
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use bitefoundry_html::{HtmlEffect, HtmlViewSession};
 use ratatui::{
@@ -25,14 +25,22 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    img_preview::{self, FitBox, RenderedTerminalImage, TerminalImageProtocol},
     models::OnenotePageDetail,
     ui::{
         action::Action,
-        app::UiState,
+        app::{PendingPixelGraphic, UiState},
         hitmap::{ButtonId, HitMap, HitTarget},
         overlays::{centered_rect, OverlayOutcome},
     },
 };
+
+struct CachedHtmlGraphic {
+    source_bytes: Arc<[u8]>,
+    cell_px: (u16, u16),
+    bg_rgb: (u8, u8, u8),
+    rendered: RenderedTerminalImage,
+}
 
 pub struct HtmlPreviewOverlay {
     pub session: HtmlViewSession,
@@ -40,6 +48,13 @@ pub struct HtmlPreviewOverlay {
     pub total_lines: usize,
     pub last_width: u16,
     pub follow_focus: bool,
+    graphic_cache: HashMap<(usize, u16, TerminalImageProtocol), CachedHtmlGraphic>,
+}
+
+impl Drop for HtmlPreviewOverlay {
+    fn drop(&mut self) {
+        self.graphic_cache.clear();
+    }
 }
 
 impl fmt::Debug for HtmlPreviewOverlay {
@@ -65,6 +80,7 @@ impl HtmlPreviewOverlay {
             total_lines: 0,
             last_width: 80,
             follow_focus: false,
+            graphic_cache: HashMap::new(),
         }
     }
 
@@ -310,8 +326,8 @@ impl HtmlPreviewOverlay {
         self.apply_effects(effects)
     }
 
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
-        let theme = &ui.theme;
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ui: &mut UiState, hitmap: &mut HitMap) {
+        let theme = ui.theme.clone();
         // Full-screen backdrop so clicking outside the modal closes HtmlPreview cleanly.
         hitmap.add(area, HitTarget::OverlayBackdrop);
 
@@ -415,7 +431,7 @@ impl HtmlPreviewOverlay {
             inner.width
         };
 
-        let (total_lines, control_count, controls_meta, lines_to_render) = {
+        let (total_lines, control_count, controls_meta, mut lines_to_render, graphics) = {
             let rendered = self
                 .session
                 .render(avail_w, &html_theme, ui.show_inline_hrefs);
@@ -429,6 +445,7 @@ impl HtmlPreviewOverlay {
                 rendered.controls.len(),
                 meta,
                 rendered.lines.clone(),
+                rendered.graphics.clone(),
             )
         };
         let focused_line = self
@@ -462,12 +479,134 @@ impl HtmlPreviewOverlay {
         }
         self.session.scroll_y = self.session.scroll_y.min(max_scroll_y);
 
+        // Render intersecting inline graphics (`<svg>`, `<canvas>`, `data:image/*`) into their
+        // reserved line slots without shifting any downstream line indices or control coordinates.
+        let scroll_top = self.session.scroll_y as usize;
+        let scroll_bottom = scroll_top.saturating_add(viewport_h as usize);
+        let caps = ui.graphics_caps;
+        let proto = caps.protocol;
+        let bg_rgb = img_preview::color_to_rgb(theme.bg_elevated, (24, 24, 30));
+        let mut pixel_skip_rects: Vec<Rect> = Vec::new();
+
+        for g in &graphics {
+            let g_end = g.line_start.saturating_add(g.line_count);
+            if g.line_count == 0 || g_end <= scroll_top || g.line_start >= scroll_bottom {
+                continue;
+            }
+            let cache_key = (g.node_id.0, avail_w, proto);
+            let needs_decode = self.graphic_cache.get(&cache_key).is_none_or(|entry| {
+                !Arc::ptr_eq(&entry.source_bytes, &g.image_bytes)
+                    || entry.cell_px != caps.cell_px
+                    || entry.bg_rgb != bg_rgb
+            });
+            if needs_decode {
+                let fit = FitBox::contained(avail_w.max(1), (g.line_count as u16).max(1));
+                let decoded = if proto == TerminalImageProtocol::Halfblock {
+                    img_preview::decode_and_render_halfblocks_with_cell_px(
+                        &g.image_bytes,
+                        fit,
+                        bg_rgb,
+                        caps.cell_px,
+                    )
+                } else {
+                    img_preview::decode_and_render_for_protocol(&g.image_bytes, fit, bg_rgb, caps)
+                };
+                if let Ok(rendered_img) = decoded {
+                    self.graphic_cache.insert(
+                        cache_key,
+                        CachedHtmlGraphic {
+                            source_bytes: Arc::clone(&g.image_bytes),
+                            cell_px: caps.cell_px,
+                            bg_rgb,
+                            rendered: rendered_img,
+                        },
+                    );
+                } else {
+                    continue;
+                }
+            }
+
+            let Some(cached) = self.graphic_cache.get(&cache_key) else {
+                continue;
+            };
+            let rendered_img = &cached.rendered;
+            let slot_end = g_end.min(lines_to_render.len());
+            let slot_len = slot_end.saturating_sub(g.line_start);
+
+            if !proto.is_pixel() || rendered_img.pixel_payload.is_none() {
+                for offset in 0..slot_len {
+                    lines_to_render[g.line_start + offset] = rendered_img
+                        .lines
+                        .get(offset)
+                        .cloned()
+                        .unwrap_or_default();
+                }
+            } else {
+                let vis_start = g.line_start.max(scroll_top);
+                let vis_end = g_end.min(scroll_bottom);
+                let vis_rows = vis_end.saturating_sub(vis_start) as u16;
+                let crop_y = vis_start.saturating_sub(g.line_start) as u16;
+                if vis_rows > 0 {
+                    if let Some((payload, draw_cols, draw_rows)) =
+                        rendered_img.viewport_pixel_payload(0, crop_y, avail_w, vis_rows)
+                    {
+                        let fit_cols = draw_cols.min(avail_w);
+                        let fit_rows = draw_rows.min(vis_rows);
+                        if fit_cols > 0 && fit_rows > 0 {
+                            for offset in 0..slot_len {
+                                lines_to_render[g.line_start + offset] = Line::default();
+                            }
+                            let screen_y = self.content_rect.y + (vis_start - scroll_top) as u16;
+                            let draw_rect =
+                                Rect::new(self.content_rect.x, screen_y, fit_cols, fit_rows);
+                            let pending_key = format!(
+                                "html:n{}:w{}:{}:r{}x{}:c0,{},{},{}:p{:x}",
+                                g.node_id.0,
+                                avail_w,
+                                proto.as_str(),
+                                fit_cols,
+                                fit_rows,
+                                crop_y,
+                                avail_w,
+                                vis_rows,
+                                Arc::as_ptr(&g.image_bytes) as *const () as usize,
+                            );
+                            ui.pending_pixel_graphics.push(PendingPixelGraphic {
+                                cache_key: pending_key,
+                                rect: draw_rect,
+                                protocol: proto,
+                                preencoded_payload: Some(payload),
+                            });
+                            pixel_skip_rects.push(draw_rect);
+                        }
+                    }
+                }
+            }
+        }
+
         frame.render_widget(
             Paragraph::new(lines_to_render)
                 .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
                 .scroll((self.session.scroll_y, 0)),
             self.content_rect,
         );
+
+        if !pixel_skip_rects.is_empty() {
+            let buf = frame.buffer_mut();
+            let clip_right = self.content_rect.right().min(buf.area.right());
+            let clip_bottom = self.content_rect.bottom().min(buf.area.bottom());
+            for draw_rect in pixel_skip_rects {
+                let y_end = draw_rect.bottom().min(clip_bottom);
+                let x_end = draw_rect.right().min(clip_right);
+                for py in draw_rect.y..y_end {
+                    for px in draw_rect.x..x_end {
+                        if let Some(cell) = buf.cell_mut((px, py)) {
+                            cell.set_skip(true);
+                        }
+                    }
+                }
+            }
+        }
 
         if show_scrollbar {
             let sb_area = Rect::new(inner.right().saturating_sub(1), inner.y, 1, viewport_h);
@@ -526,9 +665,15 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
 
-    fn render_overlay(overlay: &mut HtmlPreviewOverlay, ui: &UiState, width: u16, height: u16) -> (HitMap, String) {
+    fn render_overlay(
+        overlay: &mut HtmlPreviewOverlay,
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+    ) -> (HitMap, String) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut hitmap = HitMap::new();
+        ui.pending_pixel_graphics.clear();
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -559,11 +704,11 @@ mod tests {
               </body>
             </html>
         "#;
-        let ui = UiState::from_config(&AppConfig::default());
+        let mut ui = UiState::from_config(&AppConfig::default());
         let mut overlay = HtmlPreviewOverlay::new(None, html.to_string());
         assert!(overlay.session.js_active, "onclick handler should activate on-demand QuickJS");
 
-        let (hitmap, screen0) = render_overlay(&mut overlay, &ui, 100, 28);
+        let (hitmap, screen0) = render_overlay(&mut overlay, &mut ui, 100, 28);
         assert!(screen0.contains("Clicks: 0"));
         assert!(screen0.contains("[ Increment ]"));
 
@@ -585,7 +730,7 @@ mod tests {
         let click_outcome = overlay.handle_click(click_col, click_row, &ui);
         assert_eq!(click_outcome, OverlayOutcome::Handled);
 
-        let (_, screen1) = render_overlay(&mut overlay, &ui, 100, 28);
+        let (_, screen1) = render_overlay(&mut overlay, &mut ui, 100, 28);
         assert!(
             screen1.contains("Clicks: 1"),
             "expected onclick DOM mutation to render 'Clicks: 1', got:\n{screen1}"
@@ -594,7 +739,7 @@ mod tests {
         // Press 'm' to toggle Rendered -> Raw HTML -> Rendered
         assert_eq!(overlay.handle(&Action::Input('m'), &ui), OverlayOutcome::Handled);
         assert!(overlay.session.raw_mode);
-        let (_, raw_screen) = render_overlay(&mut overlay, &ui, 100, 28);
+        let (_, raw_screen) = render_overlay(&mut overlay, &mut ui, 100, 28);
         assert!(raw_screen.contains("<button") && raw_screen.contains("RAW HTML"));
 
         assert_eq!(overlay.handle(&Action::Input('m'), &ui), OverlayOutcome::Handled);
@@ -623,11 +768,11 @@ mod tests {
         for i in 0..40 {
             long_body.push_str(&format!("<p>Line {i} of static HTML content.</p>"));
         }
-        let ui = UiState::from_config(&AppConfig::default());
+        let mut ui = UiState::from_config(&AppConfig::default());
         let mut overlay = HtmlPreviewOverlay::new(Some("Static Doc".into()), long_body);
         assert!(!overlay.session.js_active, "static HTML must keep QuickJS at 0 MB idle");
 
-        let _ = render_overlay(&mut overlay, &ui, 90, 20);
+        let _ = render_overlay(&mut overlay, &mut ui, 90, 20);
         assert!(overlay.total_lines > overlay.content_rect.height as usize);
 
         // Tab focuses text input, Space/Enter enters editing mode, typing updates value
@@ -652,10 +797,119 @@ mod tests {
         overlay.handle(&Action::Input('j'), &ui);
         assert_eq!(overlay.session.scroll_y, 2);
         overlay.handle(&Action::ScrollBottom, &ui);
-        let _ = render_overlay(&mut overlay, &ui, 90, 20);
+        let _ = render_overlay(&mut overlay, &mut ui, 90, 20);
         assert!(overlay.session.scroll_y > 0);
         overlay.handle(&Action::MouseScroll { delta: -3, column: 20, row: 10 }, &ui);
         overlay.handle(&Action::ScrollTop, &ui);
         assert_eq!(overlay.session.scroll_y, 0);
+    }
+
+    #[test]
+    fn test_html_preview_inline_svg_renders_halfblock_and_pixel_preserving_button_click() {
+        let html = r##"
+            <!DOCTYPE html>
+            <html>
+              <head><title>SVG + Button</title></head>
+              <body>
+                <p>Header before graphic</p>
+                <svg width="80" height="40">
+                  <rect width="80" height="40" fill="#e11d48"/>
+                </svg>
+                <p id="out">Init</p>
+                <button onclick="document.getElementById('out').textContent = 'Clicked!'">Run Action</button>
+              </body>
+            </html>
+        "##;
+
+        // 1. Halfblock mode: reserved slot renders `▀` and button below hits exact click_at coordinates
+        let mut ui = UiState::from_config(&AppConfig::default());
+        ui.graphics_caps = img_preview::TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Halfblock,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        };
+        let mut overlay = HtmlPreviewOverlay::new(None, html.to_string());
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        let mut hitmap = HitMap::new();
+        terminal
+            .draw(|frame| {
+                ui.pending_pixel_graphics.clear();
+                overlay.draw(frame, frame.area(), &mut ui, &mut hitmap);
+            })
+            .unwrap();
+
+        let html_theme = ui.theme.to_html_theme();
+        let (graphic_slot, btn_ctrl) = {
+            let r = overlay
+                .session
+                .render(overlay.content_rect.width, &html_theme, false);
+            assert_eq!(r.graphics.len(), 1, "expected 1 inline SVG graphic");
+            assert_eq!(r.controls.len(), 1, "expected 1 button control below SVG");
+            let g = &r.graphics[0];
+            ((g.line_start, g.line_count), r.controls[0].clone())
+        };
+        assert!(
+            btn_ctrl.line >= graphic_slot.0 + graphic_slot.1,
+            "button should sit below the graphic slot"
+        );
+
+        let buf = terminal.backend().buffer();
+        let slot_has_halfblock = (graphic_slot.0..graphic_slot.0 + graphic_slot.1).any(|line_idx| {
+            let y = overlay.content_rect.y + line_idx as u16;
+            (overlay.content_rect.x..overlay.content_rect.right())
+                .any(|x| buf[(x, y)].symbol() == "▀")
+        });
+        assert!(
+            slot_has_halfblock,
+            "expected halfblock '▀' inside reserved graphic slot {:?}",
+            graphic_slot
+        );
+        assert!(ui.pending_pixel_graphics.is_empty());
+
+        // Clicking button below the graphic hits exact coordinates and mutates DOM
+        let click_col = overlay.content_rect.x + btn_ctrl.col_start + 1;
+        let click_row = overlay.content_rect.y + btn_ctrl.line as u16;
+        assert_eq!(
+            overlay.handle_click(click_col, click_row, &ui),
+            OverlayOutcome::Handled
+        );
+        let (_, screen_after) = render_overlay(&mut overlay, &mut ui, 100, 32);
+        assert!(
+            screen_after.contains("Clicked!"),
+            "expected button click below SVG to mutate DOM to 'Clicked!', got:\n{screen_after}"
+        );
+
+        // 2. Pixel protocol (Kitty): queues pending_pixel_graphics and marks covered cells skip=true
+        ui.graphics_caps = img_preview::TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Kitty,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        };
+        let mut covered_cell_skipped = false;
+        terminal
+            .draw(|frame| {
+                ui.pending_pixel_graphics.clear();
+                hitmap.clear();
+                overlay.draw(frame, frame.area(), &mut ui, &mut hitmap);
+                if let Some(pg) = ui.pending_pixel_graphics.first() {
+                    covered_cell_skipped = frame.buffer_mut()[(pg.rect.x, pg.rect.y)].skip;
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            ui.pending_pixel_graphics.len(),
+            1,
+            "expected 1 pending pixel graphic for Kitty"
+        );
+        let pg = &ui.pending_pixel_graphics[0];
+        assert!(pg.cache_key.starts_with("html:"));
+        assert!(pg
+            .preencoded_payload
+            .as_deref()
+            .is_some_and(|p| p.contains("\x1b_G")));
+        assert!(
+            covered_cell_skipped,
+            "expected covered pixel graphic cell to be marked skip=true in frame buffer"
+        );
     }
 }

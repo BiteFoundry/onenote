@@ -406,10 +406,12 @@ impl OnenoteXhtmlParser {
     fn handle_container_element(&mut self, el_ref: ElementRef<'_>, style: &TextStyleFlags) {
         let el = el_ref.value();
         let tag_name = el.name();
+        if is_ignored_noise_tag(tag_name) || has_display_none(el) {
+            return;
+        }
         let next_style = apply_css_style(style, el.attr("style"));
 
         match tag_name {
-            "head" | "title" | "meta" | "script" | "style" | "link" => {}
             "html" | "body" => {
                 self.flush_loose_paragraph(None, None);
                 self.walk_block_container(el_ref, &next_style);
@@ -898,7 +900,7 @@ impl OnenoteXhtmlParser {
                         continue;
                     };
                     let tag_name = el.name();
-                    if matches!(tag_name, "script" | "style" | "head" | "meta" | "title") {
+                    if is_ignored_noise_tag(tag_name) || has_display_none(el) {
                         continue;
                     }
                     let mut next = apply_css_style(style, el.attr("style"));
@@ -1200,10 +1202,7 @@ impl OnenoteXhtmlParser {
         if skip_nested_lists && matches!(tag_name, "ul" | "ol") {
             return;
         }
-        if matches!(
-            tag_name,
-            "script" | "style" | "head" | "meta" | "title" | "table"
-        ) {
+        if is_ignored_noise_tag(tag_name) || tag_name == "table" || has_display_none(el) {
             return;
         }
 
@@ -1438,6 +1437,46 @@ fn parse_data_tag(attr: Option<&str>) -> Option<OnenoteTagKind> {
     } else {
         Some(OnenoteTagKind::Custom(first.to_string()))
     }
+}
+
+fn is_ignored_noise_tag(tag_name: &str) -> bool {
+    matches!(
+        tag_name,
+        "head"
+            | "title"
+            | "meta"
+            | "script"
+            | "style"
+            | "link"
+            | "noscript"
+            | "template"
+            | "xml"
+            | "o:p"
+            | "svg"
+            | "canvas"
+    )
+}
+
+fn has_display_none(el: &scraper::node::Element) -> bool {
+    if el.attr("hidden").is_some() {
+        return true;
+    }
+    let Some(raw) = el.attr("style") else {
+        return false;
+    };
+    for decl in raw.split(';') {
+        let Some((k, v)) = decl.split_once(':') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case("display") {
+            let val = v.trim().to_ascii_lowercase();
+            let val = val.strip_suffix("!important").unwrap_or(&val).trim();
+            if val == "none" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn apply_css_style(base: &TextStyleFlags, style_attr: Option<&str>) -> TextStyleFlags {
@@ -4939,5 +4978,57 @@ let ok = 1 < 2 && 3 > 1;
         assert!(html.contains(" now."), "{html}");
         assert!(!html.contains(") now."), "{html}");
         assert!(html.contains("https://h/a_(1).png"), "{html}");
+    }
+
+    #[test]
+    fn xhtml_walkers_strip_xml_office_svg_canvas_noscript_template_and_display_none() {
+        let xhtml = r#"<!DOCTYPE html>
+<html>
+  <head><title>Noise Check</title><style>.x { color: red; }</style></head>
+  <body>
+    <xml><o:p>meta</o:p></xml>
+    <svg><desc>secret</desc><rect width="10" height="10"/></svg>
+    <canvas>canvas-fallback</canvas>
+    <noscript>noscript-text</noscript>
+    <template><p>template-text</p></template>
+    <div style="display:none">hidden</div>
+    <p>Visible<span style="display: none !important">inline-hidden</span><svg><desc>inline-svg</desc></svg><o:p>inline-op</o:p></p>
+    <table>
+      <tr>
+        <td>CellVisible<xml><o:p>cell-meta</o:p></xml><svg><desc>cell-svg</desc></svg><span style="display:none">cell-hidden</span></td>
+      </tr>
+    </table>
+  </body>
+</html>"#;
+
+        let parsed = parse_onenote_page_xhtml(sample_summary("Noise Check"), xhtml);
+        let plain = &parsed.body_plain;
+        let md = &parsed.body_markdown;
+
+        assert!(plain.contains("Visible"), "expected Visible in plain: {plain}");
+        assert!(plain.contains("CellVisible"), "expected CellVisible in plain: {plain}");
+        for leaked in [
+            "meta",
+            "secret",
+            "canvas-fallback",
+            "noscript-text",
+            "template-text",
+            "hidden",
+            "inline-hidden",
+            "inline-svg",
+            "inline-op",
+            "cell-meta",
+            "cell-svg",
+            "cell-hidden",
+        ] {
+            assert!(
+                !plain.contains(leaked),
+                "leaked noise token '{leaked}' in body_plain:\n{plain}"
+            );
+            assert!(
+                !md.contains(leaked),
+                "leaked noise token '{leaked}' in body_markdown:\n{md}"
+            );
+        }
     }
 }

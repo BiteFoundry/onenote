@@ -56,7 +56,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     let area = frame.area();
     ui.term_width = area.width;
     ui.term_height = area.height;
-    ui.pending_pixel_graphic = None;
+    ui.pending_pixel_graphics.clear();
 
     let mut hitmap = HitMap::new();
     let theme = ui.theme.clone();

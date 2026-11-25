@@ -56,6 +56,9 @@ pub struct PendingPixelGraphic {
     pub cache_key: String,
     pub rect: Rect,
     pub protocol: TerminalImageProtocol,
+    /// Optional pre-encoded terminal escape sequence payload (used by inline HTML preview graphics
+    /// whose rendered images live in `HtmlPreviewOverlay`'s cache rather than `AppState::image_cache`).
+    pub preencoded_payload: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +215,7 @@ pub struct UiState {
     pub onenote_scroll: usize,
     pub onenote_selected_block: usize,
     pub onenote_follow_selection: bool,
-    pub pending_pixel_graphic: Option<PendingPixelGraphic>,
+    pub pending_pixel_graphics: Vec<PendingPixelGraphic>,
     pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
 }
 
@@ -249,7 +252,7 @@ impl UiState {
             onenote_scroll: 0,
             onenote_selected_block: 0,
             onenote_follow_selection: false,
-            pending_pixel_graphic: None,
+            pending_pixel_graphics: Vec::new(),
             active_pixel_graphic: None,
         }
     }
