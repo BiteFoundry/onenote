@@ -17,7 +17,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    img_preview::TerminalImageProtocol,
+    img_preview::{FitBox, TerminalGraphicsCaps, TerminalImageProtocol},
     models::OnenotePageDetail,
     ui::{
         action::Action,
@@ -26,6 +26,25 @@ use crate::{
         overlays::{centered_rect, OverlayOutcome},
     },
 };
+
+/// Builds the canonical cache key for a fullscreen preview render, including viewport size,
+/// zoom percentage, terminal cell pixel geometry, and graphics protocol.
+pub fn preview_image_cache_key(
+    page_key: &str,
+    resource_index: usize,
+    view_cols: u16,
+    view_rows: u16,
+    zoom_pct: u16,
+    cell_px: (u16, u16),
+    proto: TerminalImageProtocol,
+) -> String {
+    format!(
+        "hd:{page_key}:{resource_index}:{view_cols}x{view_rows}:{zoom_pct}%:{}x{}:{}",
+        cell_px.0,
+        cell_px.1,
+        proto.as_str()
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewTarget {
@@ -104,13 +123,18 @@ impl ImagePreviewOverlay {
         &self,
         term_width: u16,
         term_height: u16,
-        proto: TerminalImageProtocol,
+        caps: TerminalGraphicsCaps,
     ) -> Option<String> {
         let target = self.current()?;
-        let (cols, rows) = self.target_dimensions(term_width, term_height);
-        Some(format!(
-            "hd:{}:{}:{}:{}:{:?}",
-            target.page_key, target.resource_index, cols, rows, proto
+        let (view_cols, view_rows) = Self::viewport_dimensions(term_width, term_height);
+        Some(preview_image_cache_key(
+            &target.page_key,
+            target.resource_index,
+            view_cols,
+            view_rows,
+            self.zoom_pct,
+            caps.cell_px,
+            caps.protocol,
         ))
     }
 
@@ -122,20 +146,18 @@ impl ImagePreviewOverlay {
         )
     }
 
-    pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
+    /// Returns the actual inner image viewport `(cols, rows)` inside the modal border.
+    pub fn viewport_dimensions(term_width: u16, term_height: u16) -> (u16, u16) {
         let rect = Self::modal_rect(Rect::new(0, 0, term_width.max(24), term_height.max(12)));
-        let inner_w = rect.width.saturating_sub(2).max(12);
-        let inner_h = rect.height.saturating_sub(3).max(6);
-        let base_cols = rect.width.saturating_sub(4).max(12);
-        let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
-        let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100)
-            .clamp(8, max_cols as u32) as u16;
-        // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
-        // and lets them scroll vertically immediately at 100% zoom.
-        let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
-            .max(scaled_cols as u32)
-            .clamp(6, 240) as u16;
-        (scaled_cols, scrollable_max_rows)
+        let inner_w = rect.width.saturating_sub(2).max(4);
+        let inner_h = rect.height.saturating_sub(2).max(4);
+        (inner_w, inner_h)
+    }
+
+    /// Builds the explicit `FitBox` for the current terminal viewport and overlay zoom.
+    pub fn fit_box(&self, term_width: u16, term_height: u16) -> FitBox {
+        let (view_cols, view_rows) = Self::viewport_dimensions(term_width, term_height);
+        FitBox::scrollable(view_cols, view_rows, self.zoom_pct)
     }
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
@@ -144,7 +166,9 @@ impl ImagePreviewOverlay {
             | Action::OpenImagePreview
             | Action::Input('q')
             | Action::Input('v') => OverlayOutcome::Close,
-            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm | Action::LoadPreviewImage => {
+                OverlayOutcome::NotHandled
+            }
             Action::MoveUp | Action::Input('k') => {
                 self.scroll_y = self.scroll_y.saturating_sub(2);
                 OverlayOutcome::Handled
@@ -324,10 +348,15 @@ impl ImagePreviewOverlay {
         let Some(target) = self.current() else {
             return;
         };
-        let (cols, rows) = self.target_dimensions(ui.term_width, ui.term_height);
-        let cache_key = format!(
-            "hd:{}:{}:{}:{}:{:?}",
-            target.page_key, target.resource_index, cols, rows, proto
+        let (view_cols, view_rows) = Self::viewport_dimensions(ui.term_width, ui.term_height);
+        let cache_key = preview_image_cache_key(
+            &target.page_key,
+            target.resource_index,
+            view_cols,
+            view_rows,
+            self.zoom_pct,
+            ui.graphics_caps.cell_px,
+            proto,
         );
 
         if let Some(rendered) = app.image_cache.get(&cache_key) {
@@ -531,10 +560,9 @@ mod tests {
             };
 
             let mut overlay = make_preview_overlay();
-            let (cols, rows) = overlay.target_dimensions(ui.term_width, ui.term_height);
+            let fit = overlay.fit_box(ui.term_width, ui.term_height);
             let rendered =
-                decode_and_render_for_protocol(&png, cols, rows, (25, 25, 25), ui.graphics_caps)
-                    .unwrap();
+                decode_and_render_for_protocol(&png, fit, (25, 25, 25), ui.graphics_caps).unwrap();
             let total_rows = if proto == TerminalImageProtocol::Halfblock {
                 rendered.lines.len() as u16
             } else {
@@ -548,7 +576,9 @@ mod tests {
                 "expected scrollable tall image for {proto:?}, total_rows={total_rows}, inner_h={inner_h}"
             );
 
-            let base_key = format!("hd:me|page-1:0:{cols}:{rows}:{proto:?}");
+            let base_key = overlay
+                .current_cache_key(ui.term_width, ui.term_height, ui.graphics_caps)
+                .unwrap();
             app.image_cache.insert(base_key.clone(), rendered);
 
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -656,5 +686,41 @@ mod tests {
             ov.handle(&Action::OnenoteOpenWeb),
             OverlayOutcome::Dispatch(Action::OpenUrl("https://example.com/second.png".to_string()))
         );
+    }
+
+    #[test]
+    fn test_preview_cache_key_includes_cell_px() {
+        let k1 = preview_image_cache_key(
+            "me|page-1",
+            0,
+            120,
+            34,
+            100,
+            (10, 20),
+            TerminalImageProtocol::Kitty,
+        );
+        let k2 = preview_image_cache_key(
+            "me|page-1",
+            0,
+            120,
+            34,
+            100,
+            (16, 32),
+            TerminalImageProtocol::Kitty,
+        );
+        let k3 = preview_image_cache_key(
+            "me|page-1",
+            0,
+            120,
+            34,
+            150,
+            (10, 20),
+            TerminalImageProtocol::Kitty,
+        );
+        assert_ne!(k1, k2, "different cell_px must produce distinct preview cache keys");
+        assert_ne!(k1, k3, "different zoom_pct must produce distinct preview cache keys");
+        assert!(k1.contains("10x20"));
+        assert!(k2.contains("16x32"));
+        assert!(k3.contains("150%"));
     }
 }

@@ -1,12 +1,14 @@
 //! Core TUI application state (`AppState`), presentation state (`UiState`), and async `UiMsg` handlers.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
+    sync::Arc,
     time::Instant,
 };
 
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -15,7 +17,7 @@ use crate::{
         AppConfig, DensityMode, DraftStore, ImageProtocolPreference, NoteDraftEntry, ThemePreset,
     },
     graph::GraphClient,
-    img_preview::{RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol},
+    img_preview::{FitBox, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol},
     models::{
         CoreEvent, InlineImageUpload, OnenoteNotebook, OnenotePageDetail, OnenotePageSummary,
         OnenoteScope, OnenoteSearchHit, OnenoteSection, OnenoteSectionGroup, OutgoingOnenotePage,
@@ -90,6 +92,11 @@ impl TaskTracker {
     }
 }
 
+/// Maximum number of raw fetched image byte entries kept in the LRU cache.
+pub const MAX_RAW_IMAGE_CACHE_ENTRIES: usize = 8;
+/// Maximum total raw image bytes (16 MiB) kept in the LRU cache.
+pub const MAX_RAW_IMAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Asynchronous results sent back from background tasks to the TUI event loop.
 #[derive(Debug)]
 pub enum UiMsg {
@@ -138,6 +145,10 @@ pub enum UiMsg {
         file_name: String,
         path: String,
         size_bytes: u64,
+    },
+    ImageBytesFetched {
+        resource_url: String,
+        bytes: Arc<[u8]>,
     },
     ImageLoaded {
         cache_key: String,
@@ -272,6 +283,28 @@ impl UiState {
     pub fn error(&mut self, msg: impl Into<String>) {
         self.toasts.error(msg);
     }
+
+    /// Returns the concrete RGB background color for inline note-canvas image alpha blending.
+    pub fn inline_image_bg_rgb(&self) -> (u8, u8, u8) {
+        let is_light = self.theme.bg_composer == Color::Rgb(255, 255, 255);
+        let fallback = if is_light {
+            (245, 247, 250)
+        } else {
+            (20, 22, 26)
+        };
+        crate::img_preview::color_to_rgb(self.theme.bg_canvas, fallback)
+    }
+
+    /// Returns the concrete RGB background color for fullscreen modal image alpha blending.
+    pub fn modal_image_bg_rgb(&self) -> (u8, u8, u8) {
+        let is_light = self.theme.bg_composer == Color::Rgb(255, 255, 255);
+        let fallback = if is_light {
+            (224, 229, 240)
+        } else {
+            (37, 42, 61)
+        };
+        crate::img_preview::color_to_rgb(self.theme.bg_elevated, fallback)
+    }
 }
 
 pub struct AppState {
@@ -307,6 +340,9 @@ pub struct AppState {
 
     pub image_cache: HashMap<String, RenderedTerminalImage>,
     pub inflight_images: HashSet<String>,
+    pub image_raw_cache: HashMap<String, Arc<[u8]>>,
+    image_raw_order: VecDeque<String>,
+    pub image_raw_bytes: usize,
     pub html_server: bitefoundry_html::NativeHtmlServer,
 
     html_resource_seq: u64,
@@ -379,6 +415,9 @@ impl AppState {
             search_results: Vec::new(),
             image_cache: HashMap::new(),
             inflight_images: HashSet::new(),
+            image_raw_cache: HashMap::new(),
+            image_raw_order: VecDeque::new(),
+            image_raw_bytes: 0,
             html_server: bitefoundry_html::NativeHtmlServer::new(),
             html_resource_seq: 0,
             active_html_resource_req: None,
@@ -390,6 +429,63 @@ impl AppState {
         }
     }
 
+    pub fn insert_raw_image_cache(&mut self, resource_url: String, bytes: Arc<[u8]>) {
+        let entry_bytes = bytes.len();
+        if entry_bytes > MAX_RAW_IMAGE_CACHE_BYTES {
+            return;
+        }
+        if let Some(prev) = self.image_raw_cache.remove(&resource_url) {
+            self.image_raw_bytes = self.image_raw_bytes.saturating_sub(prev.len());
+            self.image_raw_order.retain(|k| k != &resource_url);
+        }
+        self.image_raw_cache.insert(resource_url.clone(), bytes);
+        self.image_raw_order.push_back(resource_url);
+        self.image_raw_bytes = self.image_raw_bytes.saturating_add(entry_bytes);
+
+        while self.image_raw_order.len() > MAX_RAW_IMAGE_CACHE_ENTRIES {
+            let Some(evicted) = self.image_raw_order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.image_raw_cache.remove(&evicted) {
+                self.image_raw_bytes = self.image_raw_bytes.saturating_sub(removed.len());
+            }
+        }
+
+        while self.image_raw_bytes > MAX_RAW_IMAGE_CACHE_BYTES && self.image_raw_order.len() > 1 {
+            let Some(evicted) = self.image_raw_order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.image_raw_cache.remove(&evicted) {
+                self.image_raw_bytes = self.image_raw_bytes.saturating_sub(removed.len());
+            }
+        }
+    }
+
+    fn touch_raw_image_cache(&mut self, resource_url: &str) -> Option<Arc<[u8]>> {
+        let bytes = self.image_raw_cache.get(resource_url).cloned()?;
+        self.image_raw_order.retain(|k| k != resource_url);
+        self.image_raw_order.push_back(resource_url.to_string());
+        Some(bytes)
+    }
+
+    fn evict_raw_image_urls(&mut self, urls: &HashSet<String>) {
+        if urls.is_empty() {
+            return;
+        }
+        for url in urls {
+            if let Some(removed) = self.image_raw_cache.remove(url) {
+                self.image_raw_bytes = self.image_raw_bytes.saturating_sub(removed.len());
+            }
+        }
+        self.image_raw_order.retain(|k| !urls.contains(k));
+    }
+
+    pub fn clear_raw_image_cache(&mut self) {
+        self.image_raw_cache.clear();
+        self.image_raw_order.clear();
+        self.image_raw_bytes = 0;
+    }
+
     pub fn evict_image_cache_for_page(&mut self, page_key: &str) {
         let thumb_prefix = format!("thumb:{page_key}:");
         let hd_prefix = format!("hd:{page_key}:");
@@ -397,6 +493,17 @@ impl AppState {
             .retain(|k, _| !k.starts_with(&thumb_prefix) && !k.starts_with(&hd_prefix));
         self.inflight_images
             .retain(|k| !k.starts_with(&thumb_prefix) && !k.starts_with(&hd_prefix));
+        if let Some(detail) = self.page_details.get(page_key) {
+            let urls: HashSet<String> = detail
+                .resources
+                .iter()
+                .flat_map(|r| {
+                    std::iter::once(r.resource_url.clone())
+                        .chain(r.fullres_url.clone())
+                })
+                .collect();
+            self.evict_raw_image_urls(&urls);
+        }
     }
 
     pub fn clear_drafts_for_page(&mut self, page_key: &str) {
@@ -650,8 +757,8 @@ impl AppState {
         &mut self,
         cache_key: String,
         resource_url: String,
-        cols: u16,
-        rows: u16,
+        fit: FitBox,
+        bg_rgb: (u8, u8, u8),
         caps: TerminalGraphicsCaps,
         halfblock_only: bool,
     ) {
@@ -660,14 +767,16 @@ impl AppState {
             resource_url,
             None,
             None,
-            cols,
-            rows,
+            fit,
+            bg_rgb,
             caps,
             halfblock_only,
         );
     }
 
     /// Requests a OneNote image resource with optional display name & MIME hint.
+    /// Checks the LRU `image_raw_cache` first so zoom (`+`/`-`/`0`), protocol cycle (`p`),
+    /// and resize re-render locally without refetching from Graph API.
     /// When `halfblock_only == false` (fullscreen `LoadPreviewImage`), sniffs bytes via
     /// `bitefoundry_html::sniff_content_kind` and routes `ContentKind::Html` to `Overlay::HtmlPreview`.
     #[allow(clippy::too_many_arguments)]
@@ -677,8 +786,8 @@ impl AppState {
         resource_url: String,
         display_name: Option<String>,
         mime_hint: Option<String>,
-        cols: u16,
-        rows: u16,
+        fit: FitBox,
+        bg_rgb: (u8, u8, u8),
         caps: TerminalGraphicsCaps,
         halfblock_only: bool,
     ) {
@@ -686,15 +795,26 @@ impl AppState {
             return;
         }
         self.inflight_images.insert(cache_key.clone());
+        let cached_raw = self.touch_raw_image_cache(&resource_url);
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            match graph.fetch_onenote_resource_bytes(&resource_url).await {
-                Ok((fetched_mime, bytes)) => {
-                    let effective_mime = if fetched_mime == "application/octet-stream" {
-                        mime_hint.as_deref()
-                    } else {
-                        Some(fetched_mime.as_str())
+            let fetched: anyhow::Result<(Option<String>, Arc<[u8]>)> = match cached_raw {
+                Some(bytes) => Ok((None, bytes)),
+                None => match graph.fetch_onenote_resource_bytes(&resource_url).await {
+                    Ok((fetched_mime, bytes)) => {
+                        let arc: Arc<[u8]> = Arc::from(bytes);
+                        Ok((Some(fetched_mime), arc))
+                    }
+                    Err(err) => Err(err),
+                },
+            };
+
+            match fetched {
+                Ok((fetched_mime_opt, bytes)) => {
+                    let effective_mime = match fetched_mime_opt.as_deref() {
+                        Some("application/octet-stream") | None => mime_hint.as_deref(),
+                        Some(m) => Some(m),
                     };
                     if let Some(html) =
                         sniff_preview_bytes_as_html(effective_mime, display_name.as_deref(), &bytes)
@@ -717,21 +837,25 @@ impl AppState {
                         return;
                     }
 
+                    // Populate LRU raw byte cache on a fresh network fetch.
+                    if fetched_mime_opt.is_some() {
+                        let _ = tx.send(UiMsg::ImageBytesFetched {
+                            resource_url,
+                            bytes: Arc::clone(&bytes),
+                        });
+                    }
+
                     let render_res = tokio::task::spawn_blocking(move || {
                         if halfblock_only {
-                            crate::img_preview::decode_and_render_halfblocks(
+                            crate::img_preview::decode_and_render_halfblocks_with_cell_px(
                                 &bytes,
-                                cols,
-                                rows,
-                                (20, 22, 26),
+                                fit,
+                                bg_rgb,
+                                caps.cell_px,
                             )
                         } else {
                             crate::img_preview::decode_and_render_for_protocol(
-                                &bytes,
-                                cols,
-                                rows,
-                                (20, 22, 26),
-                                caps,
+                                &bytes, fit, bg_rgb, caps,
                             )
                         }
                     })
@@ -1269,8 +1393,8 @@ impl AppState {
                     }
                 }
                 Ok(None) => {
-                    self.page_details.remove(&pk);
                     self.evict_image_cache_for_page(&pk);
+                    self.page_details.remove(&pk);
                 }
                 Err(_) => {}
             }
@@ -1317,8 +1441,8 @@ impl AppState {
                 Err(_) => false,
             };
             if should_evict {
-                self.page_details.remove(&pk);
                 self.evict_image_cache_for_page(&pk);
+                self.page_details.remove(&pk);
             }
         }
     }
@@ -1695,8 +1819,8 @@ impl AppState {
                 self.locally_created_pages.remove(&page_key);
                 self.locally_mutated_pages.remove(&page_key);
                 self.pages.retain(|p| p.page_key != page_key);
-                self.page_details.remove(&page_key);
                 self.evict_image_cache_for_page(&page_key);
+                self.page_details.remove(&page_key);
                 self.clear_drafts_for_page(&page_key);
                 if self.previous_page_key.as_deref() == Some(page_key.as_str()) {
                     self.previous_page_key = None;
@@ -1731,6 +1855,12 @@ impl AppState {
                 ui.tasks.finish(task_id);
                 ui.success(format!("Saved {file_name} ({size_bytes} B) -> {path}"));
             }
+            UiMsg::ImageBytesFetched {
+                resource_url,
+                bytes,
+            } => {
+                self.insert_raw_image_cache(resource_url, bytes);
+            }
             UiMsg::ImageLoaded {
                 cache_key,
                 rendered,
@@ -1744,7 +1874,7 @@ impl AppState {
                     let expected = preview.current_cache_key(
                         ui.term_width,
                         ui.term_height,
-                        ui.graphics_caps.protocol,
+                        ui.graphics_caps,
                     );
                     if expected.as_deref() == Some(cache_key.as_str()) {
                         preview.error = Some(error);
@@ -1764,7 +1894,7 @@ impl AppState {
                             .current_cache_key(
                                 ui.term_width,
                                 ui.term_height,
-                                ui.graphics_caps.protocol,
+                                ui.graphics_caps,
                             )
                             .as_deref()
                             == Some(cache_key.as_str())
@@ -2611,5 +2741,202 @@ mod tests {
         ui.graphics_caps.protocol = TerminalImageProtocol::Kitty;
         apply_ui_settings(&mut config, &ui);
         assert_eq!(config.image_protocol, ImageProtocolPreference::Kitty);
+    }
+
+    #[tokio::test]
+    async fn raw_image_cache_hit_skips_refetch_on_zoom_and_protocol_cycle() {
+        use axum::{extract::State, http::StatusCode, routing::get, Router};
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
+        use std::io::Cursor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 1. Verify LRU count cap, byte budget cap, oversized skip, and page eviction
+        let (mut lru_app, _, _, _) = make_test_app_with_cached_summary();
+        for i in 0..(MAX_RAW_IMAGE_CACHE_ENTRIES + 3) {
+            lru_app.insert_raw_image_cache(
+                format!("https://example.com/img-{i}.png"),
+                Arc::from(vec![i as u8; 1024]),
+            );
+        }
+        assert_eq!(lru_app.image_raw_cache.len(), MAX_RAW_IMAGE_CACHE_ENTRIES);
+        assert_eq!(lru_app.image_raw_bytes, MAX_RAW_IMAGE_CACHE_ENTRIES * 1024);
+        assert!(!lru_app.image_raw_cache.contains_key("https://example.com/img-0.png"));
+
+        let six_mib = 6 * 1024 * 1024;
+        for i in 0..4 {
+            lru_app.insert_raw_image_cache(
+                format!("https://example.com/big-{i}.png"),
+                Arc::from(vec![1u8; six_mib]),
+            );
+        }
+        assert!(lru_app.image_raw_bytes <= MAX_RAW_IMAGE_CACHE_BYTES);
+
+        // Oversized (> 16 MiB) entry is ignored without corrupting cache budget
+        lru_app.insert_raw_image_cache(
+            "https://example.com/huge.png".to_string(),
+            Arc::from(vec![0u8; MAX_RAW_IMAGE_CACHE_BYTES + 1]),
+        );
+        assert!(!lru_app.image_raw_cache.contains_key("https://example.com/huge.png"));
+        assert!(lru_app.image_raw_bytes <= MAX_RAW_IMAGE_CACHE_BYTES);
+        lru_app.clear_raw_image_cache();
+        assert_eq!(lru_app.image_raw_cache.len(), 0);
+        assert_eq!(lru_app.image_raw_bytes, 0);
+
+        // 2. Live mock server verifying zoom (+/- /0) and protocol cycle (p) hit raw_image_cache with 0 refetches
+        let img: RgbaImage = ImageBuffer::from_pixel(32, 32, Rgba([40, 120, 220, 255]));
+        let mut png_buf = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut png_buf, ImageFormat::Png)
+            .unwrap();
+        let png_bytes = Arc::new(png_buf.into_inner());
+        let fetch_hits = Arc::new(AtomicUsize::new(0));
+
+        let app_router = Router::new()
+            .route(
+                "/res/pic.png",
+                get(
+                    |State((hits, body)): State<(Arc<AtomicUsize>, Arc<Vec<u8>>)>| async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::OK, [("content-type", "image/png")], (*body).clone())
+                    },
+                ),
+            )
+            .with_state((Arc::clone(&fetch_hits), Arc::clone(&png_bytes)));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app_router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tokens = StoredTokens {
+            access_token: "raw-cache-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("user-1".to_string()),
+            user_display_name: Some("Tester".to_string()),
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+        ui.term_width = 120;
+        ui.term_height = 34;
+        ui.graphics_caps = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Halfblock,
+            cell_px: (10, 20),
+            cell_px_exact: true,
+        };
+
+        let resource_url = format!("http://{addr}/res/pic.png");
+        let summary = OnenotePageSummary {
+            page_key: "me|page-raw".to_string(),
+            id: "page-raw".to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec-1".to_string(),
+            section_name: Some("Specs".to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("Eng".to_string()),
+            title: "Raw Cache Page".to_string(),
+            level: 0,
+            order: 0,
+            created_at: None,
+            last_modified_at: None,
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        };
+        let detail = OnenotePageDetail {
+            summary,
+            raw_xhtml: String::new(),
+            body_markdown: String::new(),
+            body_plain: String::new(),
+            blocks: Vec::new(),
+            resources: vec![crate::models::OnenoteResource {
+                element_id: Some("img:1".to_string()),
+                resource_url: resource_url.clone(),
+                fullres_url: None,
+                mime_type: "image/png".to_string(),
+                file_name: Some("pic.png".to_string()),
+                is_image: true,
+                alt_text: None,
+            }],
+            primary_div_id: None,
+            synced_at: None,
+        };
+        app.active_page_key = Some("me|page-raw".to_string());
+        app.page_details.insert("me|page-raw".to_string(), detail);
+
+        // Open preview modal -> initial fetch (hits == 1)
+        crate::ui::action::dispatch(crate::ui::action::Action::OpenImagePreview, &mut app, &mut ui);
+        let mut saw_bytes = false;
+        let mut saw_loaded = false;
+        while !saw_bytes || !saw_loaded {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match &msg {
+                UiMsg::ImageBytesFetched { .. } => saw_bytes = true,
+                UiMsg::ImageLoaded { .. } => saw_loaded = true,
+                other => panic!("unexpected msg during initial load: {other:?}"),
+            }
+            app.handle_ui_msg(&mut ui, msg);
+        }
+        assert_eq!(fetch_hits.load(Ordering::SeqCst), 1);
+        assert!(app.image_raw_cache.contains_key(&resource_url));
+
+        // Zoom in (`+`) -> renders from raw_image_cache with 0 additional HTTP fetches
+        crate::ui::action::dispatch(crate::ui::action::Action::Input('+'), &mut app, &mut ui);
+        let msg_zoom = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg_zoom, UiMsg::ImageLoaded { .. }));
+        app.handle_ui_msg(&mut ui, msg_zoom);
+        assert_eq!(fetch_hits.load(Ordering::SeqCst), 1);
+
+        // Cycle protocol (`p`: Halfblock -> Kitty) -> renders from raw_image_cache with 0 additional HTTP fetches
+        crate::ui::action::dispatch(crate::ui::action::Action::Input('p'), &mut app, &mut ui);
+        let msg_proto = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg_proto, UiMsg::ImageLoaded { .. }));
+        app.handle_ui_msg(&mut ui, msg_proto);
+        assert_eq!(fetch_hits.load(Ordering::SeqCst), 1);
+
+        // Resize / cell_px change -> renders from raw_image_cache with 0 additional HTTP fetches
+        ui.term_width = 160;
+        ui.term_height = 44;
+        ui.graphics_caps.cell_px = (12, 24);
+        crate::ui::action::dispatch(crate::ui::action::Action::LoadPreviewImage, &mut app, &mut ui);
+        let msg_resize = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg_resize, UiMsg::ImageLoaded { .. }));
+        app.handle_ui_msg(&mut ui, msg_resize);
+        assert_eq!(fetch_hits.load(Ordering::SeqCst), 1);
+
+        // Evicting page removes both rendered and raw byte cache entries for that page
+        app.evict_image_cache_for_page("me|page-raw");
+        assert!(!app.image_raw_cache.contains_key(&resource_url));
+        assert_eq!(app.image_raw_bytes, 0);
+
+        srv.abort();
     }
 }

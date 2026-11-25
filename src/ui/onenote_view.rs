@@ -640,8 +640,10 @@ fn draw_note_canvas(
 
     // Lazily fetch/decode inline terminal images when inline_images is enabled
     let width = inner.width as usize;
-    let thumb_cols = width.saturating_sub(4).clamp(16, 48) as u16;
-    let thumb_rows = 12u16;
+    let thumb_cols = width.saturating_sub(4).clamp(24, 72) as u16;
+    let thumb_rows = 16u16;
+    let inline_bg = ui.inline_image_bg_rgb();
+    let (cw, ch) = ui.graphics_caps.cell_px;
     let mut cached_thumbs: HashMap<usize, RenderedTerminalImage> = HashMap::new();
 
     if ui.inline_images {
@@ -649,8 +651,16 @@ fn draw_note_canvas(
             if let OnenoteBlockKind::Image { resource_index, .. } = &block.kind {
                 if let Some(res) = detail.resources.get(*resource_index) {
                     let key = format!(
-                        "thumb:{}:{}:{}:{}",
-                        detail.summary.page_key, resource_index, thumb_cols, thumb_rows
+                        "thumb:{}:{}:{}x{}:{}x{}:{:02x}{:02x}{:02x}",
+                        detail.summary.page_key,
+                        resource_index,
+                        thumb_cols,
+                        thumb_rows,
+                        cw,
+                        ch,
+                        inline_bg.0,
+                        inline_bg.1,
+                        inline_bg.2
                     );
                     if let Some(img) = render_terminal_image(&app.image_cache, &key) {
                         cached_thumbs.insert(*resource_index, img);
@@ -664,8 +674,8 @@ fn draw_note_canvas(
                         app.request_onenote_image(
                             key,
                             url,
-                            thumb_cols,
-                            thumb_rows,
+                            crate::img_preview::FitBox::contained(thumb_cols, thumb_rows),
+                            inline_bg,
                             ui.graphics_caps,
                             true,
                         );

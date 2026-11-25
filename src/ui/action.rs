@@ -528,33 +528,33 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
         }
         Action::LoadPreviewImage => {
             let req = if let Some(Overlay::ImagePreview(preview)) = ui.overlays.last() {
-                preview.current().map(|target| {
-                    let (cols, rows) = preview.target_dimensions(ui.term_width, ui.term_height);
-                    let proto = ui.graphics_caps.protocol;
-                    let cache_key = format!(
-                        "hd:{}:{}:{}:{}:{:?}",
-                        target.page_key, target.resource_index, cols, rows, proto
-                    );
-                    (
+                preview.current().and_then(|target| {
+                    let fit = preview.fit_box(ui.term_width, ui.term_height);
+                    let cache_key = preview.current_cache_key(
+                        ui.term_width,
+                        ui.term_height,
+                        ui.graphics_caps,
+                    )?;
+                    Some((
                         cache_key,
                         target.url.clone(),
                         target.display_name.clone(),
                         target.mime_type.clone(),
-                        cols,
-                        rows,
-                    )
+                        fit,
+                    ))
                 })
             } else {
                 None
             };
-            if let Some((cache_key, url, display_name, mime_type, cols, rows)) = req {
+            if let Some((cache_key, url, display_name, mime_type, fit)) = req {
+                let bg_rgb = ui.modal_image_bg_rgb();
                 app.request_onenote_image_with_meta(
                     cache_key,
                     url,
                     Some(display_name),
                     Some(mime_type),
-                    cols,
-                    rows,
+                    fit,
+                    bg_rgb,
                     ui.graphics_caps,
                     false,
                 );
@@ -1027,6 +1027,7 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                 ThemePreset::NoColor => ThemePreset::Auto,
             };
             ui.theme = Theme::detect(ui.theme_preset);
+            app.image_cache.clear();
             app.persist_config(ui);
             ui.info(format!("Theme: {}", ui.theme_preset.label()));
             false
@@ -1858,7 +1859,7 @@ mod tests {
         let detail = app.active_page_detail().unwrap();
         let img_ov = ImagePreviewOverlay::from_onenote_page(detail, Some(2)).unwrap();
         let expected_key = img_ov
-            .current_cache_key(ui.term_width, ui.term_height, ui.graphics_caps.protocol)
+            .current_cache_key(ui.term_width, ui.term_height, ui.graphics_caps)
             .unwrap();
         ui.overlays.push(Overlay::ImagePreview(img_ov));
         app.inflight_images.insert("hd:stale".to_string());

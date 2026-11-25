@@ -585,7 +585,7 @@ fn event_invalidates_hitmap(ev: &CrosstermEvent) -> bool {
 
 async fn process_terminal_event_with_burst(
     first_ev: CrosstermEvent,
-    events: &mut EventStream,
+    events: &mut Option<EventStream>,
     app: &mut AppState,
     ui: &mut UiState,
     dirty: &mut bool,
@@ -594,7 +594,7 @@ async fn process_terminal_event_with_burst(
     let before = UiLayoutSnapshot::capture(app, ui);
     let hitmap_sensitive = event_invalidates_hitmap(&first_ev);
     let CrosstermEvent::Key(first_key) = first_ev else {
-        let step = handle_terminal_event(first_ev, app, ui, dirty, last_activity_sent);
+        let step = handle_terminal_event(first_ev, events, app, ui, dirty, last_activity_sent);
         if matches!(step, LoopStep::Quit) {
             return LoopStep::Quit;
         }
@@ -608,6 +608,7 @@ async fn process_terminal_event_with_burst(
     if !ui.accepts_text_input() || !PasteBurstDetector::is_candidate_key(&first_key) {
         let step = handle_terminal_event(
             CrosstermEvent::Key(first_key),
+            events,
             app,
             ui,
             dirty,
@@ -634,14 +635,15 @@ async fn process_terminal_event_with_burst(
             .keys
             .iter()
             .any(|k| k.code == KeyCode::Enter && k.modifiers == KeyModifiers::NONE);
-        let next_ev = match events.next().now_or_never() {
+        let stream = events.get_or_insert_with(EventStream::new);
+        let next_ev = match stream.next().now_or_never() {
             Some(item) => item,
             None => {
                 let buffered = crossterm::event::poll(Duration::ZERO).unwrap_or(false);
                 if !has_enter && !buffered {
                     break;
                 }
-                match tokio::time::timeout(PASTE_BURST_POLL, events.next()).await {
+                match tokio::time::timeout(PASTE_BURST_POLL, stream.next()).await {
                     Ok(item) => item,
                     Err(_) => break,
                 }
@@ -678,6 +680,7 @@ async fn process_terminal_event_with_burst(
                 if matches!(
                     handle_terminal_event(
                         CrosstermEvent::Key(k),
+                        events,
                         app,
                         ui,
                         dirty,
@@ -695,7 +698,7 @@ async fn process_terminal_event_with_burst(
     if let Some(extra) = trailing_event {
         trailing_invalidates = event_invalidates_hitmap(&extra);
         if matches!(
-            handle_terminal_event(extra, app, ui, dirty, last_activity_sent),
+            handle_terminal_event(extra, events, app, ui, dirty, last_activity_sent),
             LoopStep::Quit
         ) {
             return LoopStep::Quit;
@@ -888,6 +891,7 @@ fn draw_frame(
 
 fn handle_terminal_event(
     ev: CrosstermEvent,
+    events: &mut Option<EventStream>,
     app: &mut AppState,
     ui: &mut UiState,
     dirty: &mut bool,
@@ -966,6 +970,24 @@ fn handle_terminal_event(
             ui.term_width = w;
             ui.term_height = h;
             *dirty = true;
+            // Re-measure cell_px on resize (HiDPI monitor move / font zoom).
+            // On Windows, drop active EventStream before VT probing so stdin has no reader contention,
+            // then re-enforce mouse capture and recreate EventStream.
+            #[cfg(windows)]
+            {
+                *events = None;
+                let _ = img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+                win_console::enforce_windows_mouse_capture();
+                let mut stdout = io::stdout();
+                let _ = write_vt_mouse_enable(&mut stdout);
+                let _ = write_vt_focus_enable(&mut stdout);
+                *events = Some(EventStream::new());
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = events;
+                let _ = img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+            }
             if matches!(
                 ui.overlays.last(),
                 Some(ui::overlays::Overlay::ImagePreview(_))
@@ -1157,7 +1179,7 @@ pub async fn run_with_persona(
         proxy_nudge_rx,
     );
 
-    let mut events = EventStream::new();
+    let mut events: Option<EventStream> = Some(EventStream::new());
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
@@ -1271,7 +1293,7 @@ pub async fn run_with_persona(
                     dirty = true;
                 }
             }
-            maybe_ev = events.next() => {
+            maybe_ev = events.get_or_insert_with(EventStream::new).next() => {
                 match maybe_ev {
                     Some(Ok(ev)) => {
                         match process_terminal_event_with_burst(
@@ -1333,7 +1355,7 @@ pub async fn run_with_persona(
                 }
             }
             while !redraw_immediately && drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
-                match events.next().now_or_never() {
+                match events.get_or_insert_with(EventStream::new).next().now_or_never() {
                     Some(Some(Ok(ev))) => {
                         drained += 1;
                         progressed = true;

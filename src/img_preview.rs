@@ -1,9 +1,14 @@
 //! Inline terminal image preview renderer using `image` (PNG/JPEG/GIF/WebP) ->
 //! Truecolor Unicode Half-Blocks (`▀` U+2580) for `ratatui` + Kitty / iTerm2 / Sixel / ANSI Half-Block rendering for TUI & CLI.
 
+const ENV_PROTOCOL_KEYS: &[&str] = &["ONENOTE_IMAGE_PROTOCOL", "TEAMS_IMAGE_PROTOCOL"];
+const ENV_CELL_PX_KEYS: &[&str] = &["ONENOTE_CELL_PIXEL_SIZE", "TEAMS_CELL_PIXEL_SIZE"];
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Cursor, IsTerminal, Write as _};
+#[cfg(unix)]
+use std::io::Write as _;
+use std::io::{Cursor, IsTerminal};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,10 +29,56 @@ pub const MAX_IMAGE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 /// Fixed Kitty graphics image ID used by the TUI preview overlay so prior placements can be cleanly deleted.
 pub const KITTY_PREVIEW_IMAGE_ID: u32 = 4242;
 
-const MAX_PIXEL_WIDTH: u32 = 1920;
-const MAX_PIXEL_HEIGHT: u32 = 1200;
-const MAX_SCROLLABLE_PIXEL_HEIGHT: u32 = 3600;
+/// Memory safety caps for pixel rendering (supports 4K/HiDPI and 200%-300% zoom).
+pub const MAX_RENDER_PX_W: u32 = 4096;
+pub const MAX_RENDER_PX_H: u32 = 8192;
+
+/// Proportional downscale pixel budget for Sixel raster buffers.
+pub const MAX_SIXEL_PIXELS: u64 = 4_000_000;
+
+/// Maximum entries allowed in the Sixel quantization RGB lookup cache.
+pub const MAX_QUANT_LOOKUP_CACHE: usize = 16_384;
+
 const MAX_ITERM2_RAW_BYTES: usize = 2 * 1024 * 1024;
+const PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Explicit viewport sizing and zoom contract for terminal image rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FitBox {
+    pub view_cols: u16,
+    pub view_rows: u16,
+    pub zoom_pct: u16,
+    pub scrollable: bool,
+}
+
+impl FitBox {
+    /// Non-scrollable contained fit within `(view_cols, view_rows)` at 100% zoom.
+    pub fn contained(view_cols: u16, view_rows: u16) -> Self {
+        Self {
+            view_cols: view_cols.max(1),
+            view_rows: view_rows.max(1),
+            zoom_pct: 100,
+            scrollable: false,
+        }
+    }
+
+    /// Scrollable viewport fit with explicit zoom percentage (`25..=300`).
+    pub fn scrollable(view_cols: u16, view_rows: u16, zoom_pct: u16) -> Self {
+        Self {
+            view_cols: view_cols.max(1),
+            view_rows: view_rows.max(1),
+            zoom_pct: zoom_pct.clamp(25, 300),
+            scrollable: true,
+        }
+    }
+}
+
+/// Constraining axis emitted for Kitty Graphics Protocol placements (never both `c` and `r`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KittyFitAxis {
+    Cols(u16),
+    Rows(u16),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TerminalImageProtocol {
@@ -98,6 +149,66 @@ fn default_fallback_cell_px() -> (u16, u16) {
     }
 }
 
+/// Converts a `ratatui::style::Color` into concrete `(r, g, b)` for alpha compositing,
+/// returning `fallback` when the color is `Color::Reset`.
+pub fn color_to_rgb(color: Color, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 49, 49),
+        Color::Green => (13, 188, 121),
+        Color::Yellow => (229, 229, 16),
+        Color::Blue => (36, 114, 200),
+        Color::Magenta => (188, 63, 188),
+        Color::Cyan => (17, 168, 205),
+        Color::Gray => (204, 204, 204),
+        Color::DarkGray => (118, 118, 118),
+        Color::LightRed => (241, 76, 76),
+        Color::LightGreen => (35, 209, 139),
+        Color::LightYellow => (245, 245, 67),
+        Color::LightBlue => (59, 142, 234),
+        Color::LightMagenta => (214, 112, 214),
+        Color::LightCyan => (41, 184, 219),
+        Color::White => (255, 255, 255),
+        Color::Indexed(idx) => xterm256_to_rgb(idx),
+        Color::Reset => fallback,
+    }
+}
+
+fn xterm256_to_rgb(idx: u8) -> (u8, u8, u8) {
+    const ANSI16: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    if idx < 16 {
+        return ANSI16[idx as usize];
+    }
+    if idx >= 232 {
+        let level = 8 + (idx - 232) * 10;
+        return (level, level, level);
+    }
+    let cube = idx - 16;
+    let r = cube / 36;
+    let g = (cube % 36) / 6;
+    let b = cube % 6;
+    let to_ch = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+    (to_ch(r), to_ch(g), to_ch(b))
+}
+
 #[derive(Debug, Clone)]
 enum PixelScrollBacking {
     SixelIndexed {
@@ -107,11 +218,11 @@ enum PixelScrollBacking {
         palette: Vec<(u8, u8, u8)>,
         indexed: Arc<Vec<u8>>,
     },
-    Rgba {
-        width: u32,
-        height: u32,
+    Source {
+        image: Arc<DynamicImage>,
+        target_px_w: u32,
+        target_px_h: u32,
         cell_px: (u16, u16),
-        rgba: Arc<Vec<u8>>,
     },
 }
 
@@ -121,7 +232,7 @@ impl PixelScrollBacking {
             Self::SixelIndexed {
                 palette, indexed, ..
             } => palette.capacity() * std::mem::size_of::<(u8, u8, u8)>() + indexed.capacity(),
-            Self::Rgba { rgba, .. } => rgba.capacity(),
+            Self::Source { image, .. } => image.as_bytes().len(),
         }
     }
 }
@@ -216,42 +327,57 @@ impl RenderedTerminalImage {
                 );
                 Some((payload, draw_cols, draw_rows))
             }
-            PixelScrollBacking::Rgba {
-                width,
-                height,
+            PixelScrollBacking::Source {
+                image,
+                target_px_w,
+                target_px_h,
                 cell_px,
-                rgba,
             } => {
                 let cell_w = cell_px.0.max(1) as u32;
                 let cell_h = cell_px.1.max(1) as u32;
+                let target_w = (*target_px_w).max(1);
+                let target_h = (*target_px_h).max(1);
                 let x0 = (scroll_x as u32).saturating_mul(cell_w);
                 let y0 = (scroll_y as u32).saturating_mul(cell_h);
-                if x0 >= *width || y0 >= *height {
+                if x0 >= target_w || y0 >= target_h {
                     return None;
                 }
                 let max_w = (view_cols as u32).saturating_mul(cell_w);
                 let max_h = (view_rows as u32).saturating_mul(cell_h);
-                let crop_w = (*width - x0).min(max_w);
-                let crop_h = (*height - y0).min(max_h);
+                let crop_w = (target_w - x0).min(max_w);
+                let crop_h = (target_h - y0).min(max_h);
                 if crop_w == 0 || crop_h == 0 {
                     return None;
                 }
                 let draw_cols = crop_w.div_ceil(cell_w).clamp(1, view_cols as u32) as u16;
                 let draw_rows = crop_h.div_ceil(cell_h).clamp(1, view_rows as u32) as u16;
 
-                let full_stride = (*width as usize) * 4;
-                let row_bytes = (crop_w as usize) * 4;
-                let x_byte_off = (x0 as usize) * 4;
-                let mut sub = Vec::with_capacity(row_bytes * crop_h as usize);
-                for dy in 0..(crop_h as usize) {
-                    let start = (y0 as usize + dy) * full_stride + x_byte_off;
-                    sub.extend_from_slice(&rgba[start..start + row_bytes]);
-                }
-                let sub_img = image::RgbaImage::from_raw(crop_w, crop_h, sub)?;
-                let png_bytes = encode_png(&DynamicImage::ImageRgba8(sub_img)).ok()?;
+                // Reverse-map virtual viewport coordinates onto native source pixels (no double scaling).
+                let src_w = image.width().max(1);
+                let src_h = image.height().max(1);
+                let src_x0 = (((x0 as u64) * (src_w as u64)) / (target_w as u64))
+                    .min((src_w - 1) as u64) as u32;
+                let src_y0 = (((y0 as u64) * (src_h as u64)) / (target_h as u64))
+                    .min((src_h - 1) as u64) as u32;
+                let src_crop_w = ((crop_w as u64) * (src_w as u64))
+                    .div_ceil(target_w as u64)
+                    .clamp(1, (src_w - src_x0) as u64) as u32;
+                let src_crop_h = ((crop_h as u64) * (src_h as u64))
+                    .div_ceil(target_h as u64)
+                    .clamp(1, (src_h - src_y0) as u64) as u32;
+
+                let sub_img = image.crop_imm(src_x0, src_y0, src_crop_w, src_crop_h);
+                let png_bytes = encode_png(&sub_img).ok()?;
                 let payload = match self.protocol {
                     TerminalImageProtocol::Kitty => {
-                        encode_kitty_tui_payload(&png_bytes, draw_cols, draw_rows)
+                        let fit_axis = choose_kitty_fit_axis(
+                            sub_img.width(),
+                            sub_img.height(),
+                            draw_cols,
+                            draw_rows,
+                            *cell_px,
+                        );
+                        encode_kitty_tui_payload(&png_bytes, fit_axis)
                     }
                     TerminalImageProtocol::ITerm2 => {
                         let b64 = B64_STANDARD.encode(&png_bytes);
@@ -328,6 +454,18 @@ pub fn compute_sixel_safe_pixel_height(rows: u16, cell_px_h: u16) -> u32 {
     (budget / 6) * 6
 }
 
+/// Computes rounded cell pixel dimensions `(cell_w, cell_h)` from window pixel dimensions and cell grid size.
+pub fn cell_px_from_window_px(win_w: u32, win_h: u32, cols: u16, rows: u16) -> Option<(u16, u16)> {
+    if win_w == 0 || win_h == 0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    let cols_u32 = cols as u32;
+    let rows_u32 = rows as u32;
+    let cw = ((win_w + cols_u32 / 2) / cols_u32).clamp(4, 64) as u16;
+    let ch = ((win_h + rows_u32 / 2) / rows_u32).clamp(8, 128) as u16;
+    Some((cw, ch))
+}
+
 /// Resolves terminal graphics protocol and cell pixel dimensions without writing queries to stdin/stdout.
 pub fn detect_graphics_caps(pref: ImageProtocolPreference) -> TerminalGraphicsCaps {
     let protocol = resolve_protocol_with(pref, |k| std::env::var(k).ok());
@@ -339,7 +477,7 @@ pub fn detect_graphics_caps(pref: ImageProtocolPreference) -> TerminalGraphicsCa
     }
 }
 
-/// Timeout-bounded (~80ms) active terminal graphics & cell-pixel probing.
+/// Timeout-bounded (`150ms`) active terminal graphics & cell-pixel probing.
 ///
 /// Must be called once on TUI startup while raw mode is active (before `EventStream` starts reading stdin).
 /// Queries:
@@ -356,8 +494,9 @@ pub fn probe_terminal_graphics_caps(pref: ImageProtocolPreference) -> TerminalGr
 
     let get_env = |k: &str| std::env::var(k).ok();
     let is_mux = non_empty_env(&get_env, "TMUX").is_some() || non_empty_env(&get_env, "STY").is_some();
-    let has_env_override = non_empty_env(&get_env, "ONENOTE_IMAGE_PROTOCOL")
-        .or_else(|| non_empty_env(&get_env, "TEAMS_IMAGE_PROTOCOL"))
+    let has_env_override = ENV_PROTOCOL_KEYS
+        .iter()
+        .find_map(|k| non_empty_env(&get_env, k))
         .and_then(|raw| ImageProtocolPreference::parse_str(&raw))
         .is_some_and(|p| p != ImageProtocolPreference::Auto);
 
@@ -381,22 +520,80 @@ pub fn probe_terminal_graphics_caps(pref: ImageProtocolPreference) -> TerminalGr
     // Always end with DA1 sentinel so responsive terminals let us exit the probe loop immediately.
     query.push_str("\x1b[c");
 
-    let mut stdout = std::io::stdout();
-    if stdout.write_all(query.as_bytes()).is_err() || stdout.flush().is_err() {
-        return caps;
-    }
-
-    let reply = read_terminal_probe_reply(Duration::from_millis(80));
+    let reply = write_and_read_terminal_probe(&query, PROBE_TIMEOUT);
     if reply.is_empty() {
         return caps;
     }
 
+    let term_size = crossterm::terminal::size().ok();
+    apply_probe_reply_to_caps(&mut caps, reply.as_bytes(), need_cell_px, need_proto, term_size);
+    caps
+}
+
+/// Refreshes `caps.cell_px` (e.g. on terminal resize / HiDPI monitor move / font size change).
+///
+/// On Unix, reads `TIOCGWINSZ` synchronously via `crossterm::terminal::window_size()` (no `EventStream` contention).
+/// On Windows, caller must drop any active `EventStream` before calling this so the `CSI 16t/14t + DA1` probe
+/// has exclusive access to `CONIN$`, then re-enable mouse capture and recreate `EventStream`.
+/// Returns `true` if `caps.cell_px` or `caps.cell_px_exact` changed.
+pub fn refresh_cell_pixel_size(caps: &mut TerminalGraphicsCaps) -> bool {
+    let prev = (caps.cell_px, caps.cell_px_exact);
+
+    if let Some(parsed) = resolve_cell_pixel_size_with(|k| std::env::var(k).ok()) {
+        caps.cell_px = parsed;
+        caps.cell_px_exact = true;
+        return prev != (caps.cell_px, caps.cell_px_exact);
+    }
+
+    #[cfg(unix)]
+    {
+        if let Ok(ws) = crossterm::terminal::window_size() {
+            if let Some(px) =
+                cell_px_from_window_px(ws.width as u32, ws.height as u32, ws.columns, ws.rows)
+            {
+                caps.cell_px = px;
+                caps.cell_px_exact = true;
+                return prev != (caps.cell_px, caps.cell_px_exact);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            let reply = write_and_read_terminal_probe("\x1b[16t\x1b[14t\x1b[c", PROBE_TIMEOUT);
+            if !reply.is_empty() {
+                let term_size = crossterm::terminal::size().ok();
+                apply_probe_reply_to_caps(caps, reply.as_bytes(), true, false, term_size);
+                return prev != (caps.cell_px, caps.cell_px_exact);
+            }
+        }
+        if let Ok(ws) = crossterm::terminal::window_size() {
+            if let Some(px) =
+                cell_px_from_window_px(ws.width as u32, ws.height as u32, ws.columns, ws.rows)
+            {
+                caps.cell_px = px;
+                caps.cell_px_exact = true;
+            }
+        }
+    }
+
+    prev != (caps.cell_px, caps.cell_px_exact)
+}
+
+fn apply_probe_reply_to_caps(
+    caps: &mut TerminalGraphicsCaps,
+    reply: &[u8],
+    need_cell_px: bool,
+    need_proto: bool,
+    term_size: Option<(u16, u16)>,
+) {
     if need_cell_px {
-        if let Some(px) = parse_csi_cell_size_reply(&reply) {
+        if let Some(px) = parse_csi_cell_size_reply(reply) {
             caps.cell_px = px;
             caps.cell_px_exact = true;
-        } else if let Ok((cols, rows)) = crossterm::terminal::size() {
-            if let Some(px) = parse_csi_win_size_reply(&reply, cols, rows) {
+        } else if let Some((cols, rows)) = term_size {
+            if let Some(px) = parse_csi_win_size_reply(reply, cols, rows) {
                 caps.cell_px = px;
                 caps.cell_px_exact = true;
             }
@@ -404,14 +601,12 @@ pub fn probe_terminal_graphics_caps(pref: ImageProtocolPreference) -> TerminalGr
     }
 
     if need_proto {
-        if parse_kitty_query_ok(&reply) {
+        if parse_kitty_query_ok(reply) {
             caps.protocol = TerminalImageProtocol::Kitty;
-        } else if parse_da1_has_sixel(&reply) {
+        } else if parse_da1_has_sixel(reply) {
             caps.protocol = TerminalImageProtocol::Sixel;
         }
     }
-
-    caps
 }
 
 /// Parses a `CSI 16 t` terminal reply (`\x1b[6;<height>;<width>t`) into `(cell_width_px, cell_height_px)`.
@@ -441,7 +636,7 @@ pub fn parse_csi_cell_size_reply(buf: &[u8]) -> Option<(u16, u16)> {
     None
 }
 
-/// Parses a `CSI 14 t` terminal reply (`\x1b[4;<win_h>;<win_w>t`) and divides by `(cols, rows)`
+/// Parses a `CSI 14 t` terminal reply (`\x1b[4;<win_h>;<win_w>t`) and divides (rounded) by `(cols, rows)`
 /// into `(cell_width_px, cell_height_px)`.
 pub fn parse_csi_win_size_reply(buf: &[u8], cols: u16, rows: u16) -> Option<(u16, u16)> {
     if cols == 0 || rows == 0 {
@@ -457,10 +652,8 @@ pub fn parse_csi_win_size_reply(buf: &[u8], cols: u16, rows: u16) -> Option<(u16
                         if let (Ok(win_h), Ok(win_w)) =
                             (h_str.trim().parse::<u32>(), w_str.trim().parse::<u32>())
                         {
-                            if win_w > 0 && win_h > 0 {
-                                let cw = (win_w / cols as u32).clamp(4, 64) as u16;
-                                let ch = (win_h / rows as u32).clamp(8, 128) as u16;
-                                return Some((cw, ch));
+                            if let Some(px) = cell_px_from_window_px(win_w, win_h, cols, rows) {
+                                return Some(px);
                             }
                         }
                     }
@@ -553,8 +746,69 @@ fn da1_reply_complete(buf: &[u8]) -> bool {
     false
 }
 
+#[cfg(any(windows, test))]
+const WIN_ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+#[cfg(any(windows, test))]
+const WIN_ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+#[cfg(any(windows, test))]
+const WIN_ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+/// Restores Windows console input mode while always setting `ENABLE_EXTENDED_FLAGS` (`0x0080`)
+/// and clearing `ENABLE_QUICK_EDIT_MODE` (`0x0040`) so mouse capture is never clobbered by QuickEdit.
+#[cfg(any(windows, test))]
+pub(crate) fn restore_windows_console_mode_flags(prev_mode: u32) -> u32 {
+    (prev_mode | WIN_ENABLE_EXTENDED_FLAGS) & !WIN_ENABLE_QUICK_EDIT_MODE
+}
+
+/// Enables `ENABLE_VIRTUAL_TERMINAL_INPUT` via RAII `ModeRestore` guard **before** writing `query`
+/// and flushing, then invokes `read_reply`, restoring console mode (with QuickEdit cleared) on drop.
+#[cfg(any(windows, test))]
+fn write_and_read_windows_probe_with<W, FSet, FRead>(
+    prev_mode: u32,
+    query: &str,
+    writer: &mut W,
+    mut set_mode: FSet,
+    read_reply: FRead,
+) -> String
+where
+    W: std::io::Write,
+    FSet: FnMut(u32),
+    FRead: FnOnce() -> Vec<u8>,
+{
+    struct ModeRestore<'a, F: FnMut(u32)> {
+        active: bool,
+        restore_mode: u32,
+        set_mode: &'a mut F,
+    }
+    impl<F: FnMut(u32)> Drop for ModeRestore<'_, F> {
+        fn drop(&mut self) {
+            if self.active {
+                (self.set_mode)(self.restore_mode);
+            }
+        }
+    }
+
+    let restore_mode = restore_windows_console_mode_flags(prev_mode);
+    let probe_mode = restore_mode | WIN_ENABLE_VIRTUAL_TERMINAL_INPUT;
+    let active = prev_mode != probe_mode;
+    if active {
+        set_mode(probe_mode);
+    }
+    let _restore = ModeRestore {
+        active,
+        restore_mode,
+        set_mode: &mut set_mode,
+    };
+
+    if writer.write_all(query.as_bytes()).is_err() || writer.flush().is_err() {
+        return String::new();
+    }
+    let bytes = read_reply();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 #[cfg(unix)]
-fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
+fn write_and_read_terminal_probe(query: &str, timeout: Duration) -> String {
     use std::os::fd::AsRawFd;
 
     #[repr(C)]
@@ -568,6 +822,11 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
     extern "C" {
         fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
         fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    }
+
+    let mut stdout = std::io::stdout();
+    if stdout.write_all(query.as_bytes()).is_err() || stdout.flush().is_err() {
+        return String::new();
     }
 
     let fd = std::io::stdin().as_raw_fd();
@@ -602,23 +861,11 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
         }
     }
 
-    out
-}
-
-#[cfg(any(windows, test))]
-const WIN_ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
-#[cfg(any(windows, test))]
-const WIN_ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
-
-/// Restores Windows console input mode while always setting `ENABLE_EXTENDED_FLAGS` (`0x0080`)
-/// and clearing `ENABLE_QUICK_EDIT_MODE` (`0x0040`) so mouse capture is never clobbered by QuickEdit.
-#[cfg(any(windows, test))]
-pub(crate) fn restore_windows_console_mode_flags(prev_mode: u32) -> u32 {
-    (prev_mode | WIN_ENABLE_EXTENDED_FLAGS) & !WIN_ENABLE_QUICK_EDIT_MODE
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(windows)]
-fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
+fn write_and_read_terminal_probe(query: &str, timeout: Duration) -> String {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -626,7 +873,6 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
     const OPEN_EXISTING: u32 = 3;
     const INVALID_HANDLE_VALUE: isize = -1;
     const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // -10i32 as u32
-    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
     const WAIT_OBJECT_0: u32 = 0x0000_0000;
     const KEY_EVENT: u16 = 0x0001;
 
@@ -701,21 +947,6 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
         }
     }
 
-    struct ModeRestore {
-        handle: isize,
-        prev_mode: u32,
-    }
-    impl Drop for ModeRestore {
-        fn drop(&mut self) {
-            unsafe {
-                SetConsoleMode(
-                    self.handle,
-                    restore_windows_console_mode_flags(self.prev_mode),
-                );
-            }
-        }
-    }
-
     const CONIN_WIDE: [u16; 7] = [
         b'C' as u16,
         b'O' as u16,
@@ -743,113 +974,133 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
         (std_in, OwnedHandle(None))
     };
     if handle == 0 || handle == INVALID_HANDLE_VALUE {
-        return Vec::new();
+        return String::new();
     }
 
     let mut prev_mode = 0u32;
     if unsafe { GetConsoleMode(handle, &mut prev_mode) } == 0 {
-        return Vec::new();
+        return String::new();
     }
 
-    // Declared after `_owned_handle` so `ModeRestore::drop` executes BEFORE `CloseHandle`.
-    let probe_mode = restore_windows_console_mode_flags(prev_mode) | ENABLE_VIRTUAL_TERMINAL_INPUT;
-    let _restore = if prev_mode != probe_mode {
-        let _ = unsafe { SetConsoleMode(handle, probe_mode) };
-        Some(ModeRestore { handle, prev_mode })
-    } else {
-        None
-    };
+    let mut stdout = std::io::stdout();
+    // `_owned_handle` outlives `write_and_read_windows_probe_with`, so `ModeRestore::drop`
+    // always runs BEFORE `CloseHandle`.
+    write_and_read_windows_probe_with(
+        prev_mode,
+        query,
+        &mut stdout,
+        |mode| {
+            let _ = unsafe { SetConsoleMode(handle, mode) };
+        },
+        || {
+            let deadline = Instant::now() + timeout;
+            let mut out = Vec::with_capacity(256);
+            let mut records = [InputRecord {
+                event_type: 0,
+                _padding: 0,
+                event: InputEventUnion { _pad: [0; 4] },
+            }; 64];
 
-    let deadline = Instant::now() + timeout;
-    let mut out = Vec::with_capacity(256);
-    let mut records = [InputRecord {
-        event_type: 0,
-        _padding: 0,
-        event: InputEventUnion { _pad: [0; 4] },
-    }; 64];
-
-    while out.len() < 4096 {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
-        if wait_ms == 0 {
-            break;
-        }
-        let wait_res = unsafe { WaitForSingleObject(handle, wait_ms) };
-        if wait_res != WAIT_OBJECT_0 {
-            break;
-        }
-        let mut avail = 0u32;
-        if unsafe { GetNumberOfConsoleInputEvents(handle, &mut avail) } == 0 || avail == 0 {
-            break;
-        }
-        let to_read = (avail as usize).min(records.len()) as u32;
-        let mut read_count = 0u32;
-        if unsafe { ReadConsoleInputW(handle, records.as_mut_ptr(), to_read, &mut read_count) } == 0
-            || read_count == 0
-        {
-            break;
-        }
-        for rec in &records[..read_count as usize] {
-            if rec.event_type == KEY_EVENT {
-                let ke = unsafe { rec.event.key_event };
-                if ke.b_key_down != 0 && ke.u_char != 0 && ke.u_char <= 0x7f {
-                    out.push(ke.u_char as u8);
+            while out.len() < 4096 {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+                if wait_ms == 0 {
+                    break;
+                }
+                let wait_res = unsafe { WaitForSingleObject(handle, wait_ms) };
+                if wait_res != WAIT_OBJECT_0 {
+                    break;
+                }
+                let mut avail = 0u32;
+                if unsafe { GetNumberOfConsoleInputEvents(handle, &mut avail) } == 0 || avail == 0 {
+                    break;
+                }
+                let to_read = (avail as usize).min(records.len()) as u32;
+                let mut read_count = 0u32;
+                if unsafe {
+                    ReadConsoleInputW(handle, records.as_mut_ptr(), to_read, &mut read_count)
+                } == 0
+                    || read_count == 0
+                {
+                    break;
+                }
+                for rec in &records[..read_count as usize] {
+                    if rec.event_type == KEY_EVENT {
+                        let ke = unsafe { rec.event.key_event };
+                        if ke.b_key_down != 0 && ke.u_char != 0 && ke.u_char <= 0x7f {
+                            out.push(ke.u_char as u8);
+                        }
+                    }
+                }
+                if da1_reply_complete(&out) {
+                    break;
                 }
             }
-        }
-        if da1_reply_complete(&out) {
-            break;
-        }
-    }
 
-    // Non-blocking drain of any trailing KEY_EVENT bytes from the probe burst so nothing leaks into EventStream.
-    for _ in 0..8 {
-        if unsafe { WaitForSingleObject(handle, 0) } != WAIT_OBJECT_0 {
-            break;
-        }
-        let mut avail = 0u32;
-        if unsafe { GetNumberOfConsoleInputEvents(handle, &mut avail) } == 0 || avail == 0 {
-            break;
-        }
-        let to_peek = (avail as usize).min(records.len()) as u32;
-        let mut peeked = 0u32;
-        if unsafe { PeekConsoleInputW(handle, records.as_mut_ptr(), to_peek, &mut peeked) } == 0
-            || peeked == 0
-        {
-            break;
-        }
-        let key_prefix = records[..peeked as usize]
-            .iter()
-            .take_while(|rec| rec.event_type == KEY_EVENT)
-            .count() as u32;
-        if key_prefix == 0 {
-            break;
-        }
-        let mut read_count = 0u32;
-        if unsafe { ReadConsoleInputW(handle, records.as_mut_ptr(), key_prefix, &mut read_count) }
-            == 0
-            || read_count == 0
-        {
-            break;
-        }
-        for rec in &records[..read_count as usize] {
-            if rec.event_type == KEY_EVENT {
-                let ke = unsafe { rec.event.key_event };
-                if ke.b_key_down != 0 && ke.u_char != 0 && ke.u_char <= 0x7f && out.len() < 4096 {
-                    out.push(ke.u_char as u8);
+            // Non-blocking drain of any trailing KEY_EVENT bytes from the probe burst so nothing leaks into EventStream.
+            for _ in 0..8 {
+                if unsafe { WaitForSingleObject(handle, 0) } != WAIT_OBJECT_0 {
+                    break;
+                }
+                let mut avail = 0u32;
+                if unsafe { GetNumberOfConsoleInputEvents(handle, &mut avail) } == 0 || avail == 0 {
+                    break;
+                }
+                let to_peek = (avail as usize).min(records.len()) as u32;
+                let mut peeked = 0u32;
+                if unsafe {
+                    PeekConsoleInputW(handle, records.as_mut_ptr(), to_peek, &mut peeked)
+                } == 0
+                    || peeked == 0
+                {
+                    break;
+                }
+                let key_prefix = records[..peeked as usize]
+                    .iter()
+                    .take_while(|rec| rec.event_type == KEY_EVENT)
+                    .count() as u32;
+                if key_prefix == 0 {
+                    break;
+                }
+                let mut read_count = 0u32;
+                if unsafe {
+                    ReadConsoleInputW(handle, records.as_mut_ptr(), key_prefix, &mut read_count)
+                } == 0
+                    || read_count == 0
+                {
+                    break;
+                }
+                for rec in &records[..read_count as usize] {
+                    if rec.event_type == KEY_EVENT {
+                        let ke = unsafe { rec.event.key_event };
+                        if ke.b_key_down != 0 && ke.u_char != 0 && ke.u_char <= 0x7f && out.len() < 4096 {
+                            out.push(ke.u_char as u8);
+                        }
+                    }
                 }
             }
-        }
-    }
 
-    out
+            out
+        },
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_terminal_probe_reply(_timeout: Duration) -> Vec<u8> {
-    Vec::new()
+fn write_and_read_terminal_probe(_query: &str, _timeout: Duration) -> String {
+    String::new()
+}
+
+/// Returns `true` when running inside a Stackbite-managed PTY environment, where inherited parent
+/// terminal env vars (`WT_SESSION`, etc.) must not be trusted without live DA1/Kitty probing.
+pub fn is_stackbite_env<F>(get_env: &F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    non_empty_env(get_env, "STACKBITE_ROOM_ID").is_some()
+        || non_empty_env(get_env, "STACKBITE_HOME").is_some()
+        || non_empty_env(get_env, "STACKBITE_PTY_BACKEND").is_some()
 }
 
 /// Pure protocol resolver taking an environment variable map (for deterministic testing and diagnostics).
@@ -864,8 +1115,9 @@ fn resolve_protocol_with<F>(pref: ImageProtocolPreference, get_env: F) -> Termin
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(raw) = non_empty_env(&get_env, "ONENOTE_IMAGE_PROTOCOL")
-        .or_else(|| non_empty_env(&get_env, "TEAMS_IMAGE_PROTOCOL"))
+    if let Some(raw) = ENV_PROTOCOL_KEYS
+        .iter()
+        .find_map(|k| non_empty_env(&get_env, k))
     {
         if let Some(parsed) = ImageProtocolPreference::parse_str(&raw) {
             if parsed != ImageProtocolPreference::Auto {
@@ -883,43 +1135,42 @@ where
         return TerminalImageProtocol::Halfblock;
     }
 
+    // Stackbite PTY guard: never trust inherited parent terminal env vars statically;
+    // TUI live probing (Kitty a=q + DA1 ;4) determines actual PTY capabilities.
+    if is_stackbite_env(&get_env) {
+        return TerminalImageProtocol::Halfblock;
+    }
+
     let term_program = lower_env(&get_env, "TERM_PROGRAM");
     let term = lower_env(&get_env, "TERM");
 
-    // Kitty Graphics Protocol (checked first so Kitty/Ghostty launched from another shell always wins).
+    // Kitty Graphics Protocol (Kitty, Ghostty, WezTerm).
     if non_empty_env(&get_env, "KITTY_WINDOW_ID").is_some()
         || non_empty_env(&get_env, "GHOSTTY_RESOURCES_DIR").is_some()
-        || matches!(term_program.as_str(), "kitty" | "ghostty")
+        || non_empty_env(&get_env, "WEZTERM_EXECUTABLE").is_some()
+        || non_empty_env(&get_env, "WEZTERM_PANE").is_some()
+        || matches!(term_program.as_str(), "kitty" | "ghostty" | "wezterm")
         || term.contains("xterm-kitty")
         || term.contains("ghostty")
     {
         return TerminalImageProtocol::Kitty;
     }
 
-    // iTerm2 Inline Images (`OSC 1337`), checked before `WT_SESSION` so WezTerm/Rio/Mintty win under Windows Terminal.
-    if non_empty_env(&get_env, "WEZTERM_EXECUTABLE").is_some()
-        || non_empty_env(&get_env, "WEZTERM_PANE").is_some()
-        || matches!(
-            term_program.as_str(),
-            "wezterm" | "iterm.app" | "rio" | "mintty" | "hyper"
-        )
-    {
+    // iTerm2 Inline Images (`OSC 1337`).
+    if matches!(
+        term_program.as_str(),
+        "iterm.app" | "rio" | "mintty" | "hyper"
+    ) {
         return TerminalImageProtocol::ITerm2;
     }
 
-    // Sixel (`DCS q`)
+    // Sixel (`DCS q`) for known native Linux Sixel terminals.
+    // Note: `WT_SESSION` is intentionally NOT trusted statically so `Auto` always verifies
+    // actual Sixel support via DA1 `;4` probing (avoiding blank renders on WT < 1.22 or inherited hosts).
     if matches!(
         term.as_str(),
         "foot" | "foot-extra" | "mlterm" | "yaft-256color"
     ) || matches!(term_program.as_str(), "foot" | "contour")
-    {
-        return TerminalImageProtocol::Sixel;
-    }
-
-    if non_empty_env(&get_env, "WT_SESSION").is_some()
-        && !matches!(term_program.as_str(), "vscode" | "cursor" | "windsurf")
-        && non_empty_env(&get_env, "VSCODE_PID").is_none()
-        && non_empty_env(&get_env, "VSCODE_INJECTION").is_none()
     {
         return TerminalImageProtocol::Sixel;
     }
@@ -966,10 +1217,10 @@ fn detect_cell_pixel_size() -> ((u16, u16), bool) {
         return (parsed, true);
     }
     if let Ok(ws) = crossterm::terminal::window_size() {
-        if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 {
-            let cw = (ws.width / ws.columns).clamp(4, 64);
-            let ch = (ws.height / ws.rows).clamp(8, 128);
-            return ((cw, ch), true);
+        if let Some(px) =
+            cell_px_from_window_px(ws.width as u32, ws.height as u32, ws.columns, ws.rows)
+        {
+            return (px, true);
         }
     }
     (default_fallback_cell_px(), false)
@@ -979,7 +1230,7 @@ fn resolve_cell_pixel_size_with<F>(get_env: F) -> Option<(u16, u16)>
 where
     F: Fn(&str) -> Option<String>,
 {
-    for key in ["ONENOTE_CELL_PIXEL_SIZE", "TEAMS_CELL_PIXEL_SIZE"] {
+    for key in ENV_CELL_PX_KEYS {
         if let Some(raw) = non_empty_env(&get_env, key) {
             if let Some(parsed) = parse_cell_pixel_size(&raw) {
                 return Some(parsed);
@@ -1131,12 +1382,29 @@ pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> boo
     false
 }
 
-/// Decodes an image buffer and renders aspect-ratio-preserving Truecolor Unicode Half-Blocks (`▀`) for `ratatui`.
+/// Decodes an image buffer and renders aspect-ratio-preserving Truecolor Unicode Half-Blocks (`▀`)
+/// for `ratatui` using a default `1:2` (`8x16`) cell assumption.
 pub fn decode_and_render_halfblocks(
     bytes: &[u8],
     max_cols: u16,
     max_rows: u16,
     bg_rgb: (u8, u8, u8),
+) -> Result<RenderedTerminalImage> {
+    decode_and_render_halfblocks_with_cell_px(
+        bytes,
+        FitBox::contained(max_cols, max_rows),
+        bg_rgb,
+        (8, 16),
+    )
+}
+
+/// Decodes an image buffer and renders Truecolor Unicode Half-Blocks (`▀`) using the terminal's
+/// actual `cell_px` geometry and explicit `FitBox` sizing contract.
+pub fn decode_and_render_halfblocks_with_cell_px(
+    bytes: &[u8],
+    fit: FitBox,
+    bg_rgb: (u8, u8, u8),
+    cell_px: (u16, u16),
 ) -> Result<RenderedTerminalImage> {
     validate_raster_image_bytes(bytes)?;
     let guessed = image::guess_format(bytes).ok();
@@ -1148,7 +1416,7 @@ pub fn decode_and_render_halfblocks(
         bail!("Image dimensions are 0x0");
     }
 
-    let (target_w, target_h) = compute_target_dims(width_px, height_px, max_cols, max_rows);
+    let (target_w, target_h) = compute_halfblock_dims(width_px, height_px, fit, cell_px);
 
     let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
@@ -1207,13 +1475,12 @@ pub fn decode_and_render_halfblocks(
 /// Decodes and renders an image using the requested terminal graphics protocol (`Kitty`, `ITerm2`, `Sixel`, or `Halfblock`).
 pub fn decode_and_render_for_protocol(
     bytes: &[u8],
-    max_cols: u16,
-    max_rows: u16,
+    fit: FitBox,
     bg_rgb: (u8, u8, u8),
     caps: TerminalGraphicsCaps,
 ) -> Result<RenderedTerminalImage> {
     if caps.protocol == TerminalImageProtocol::Halfblock {
-        return decode_and_render_halfblocks(bytes, max_cols, max_rows, bg_rgb);
+        return decode_and_render_halfblocks_with_cell_px(bytes, fit, bg_rgb, caps.cell_px);
     }
 
     validate_raster_image_bytes(bytes)?;
@@ -1225,51 +1492,50 @@ pub fn decode_and_render_for_protocol(
         bail!("Image dimensions are 0x0");
     }
 
-    let (target_px_w, target_px_h, occ_cols, occ_rows) = compute_pixel_fit_for_protocol(
-        width_px,
-        height_px,
-        max_cols,
-        max_rows,
-        caps.cell_px,
-        caps.protocol,
-    );
-    let max_h_bound = if max_rows >= max_cols {
-        MAX_SCROLLABLE_PIXEL_HEIGHT
-    } else {
-        MAX_PIXEL_HEIGHT
-    };
+    let (target_px_w, target_px_h, occ_cols, occ_rows) =
+        compute_pixel_fit_for_protocol(width_px, height_px, fit, caps.cell_px, caps.protocol);
 
     let (payload, scroll_backing) = match caps.protocol {
         TerminalImageProtocol::Kitty => {
+            let bounded_img = if width_px <= MAX_RENDER_PX_W && height_px <= MAX_RENDER_PX_H {
+                dyn_img
+            } else {
+                fit_within_max_bounds(&dyn_img, MAX_RENDER_PX_W, MAX_RENDER_PX_H)
+            };
             let png_owned;
             let png_bytes: &[u8] = if matches!(guessed, Some(ImageFormat::Png))
-                && width_px <= MAX_PIXEL_WIDTH
-                && height_px <= max_h_bound
+                && width_px <= MAX_RENDER_PX_W
+                && height_px <= MAX_RENDER_PX_H
             {
                 bytes
             } else {
-                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, max_h_bound);
-                png_owned = encode_png(&bounded)?;
+                png_owned = encode_png(&bounded_img)?;
                 &png_owned
             };
-            let rgba = dyn_img.to_rgba8();
-            let resized = if width_px == target_px_w && height_px == target_px_h {
-                rgba
-            } else {
-                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
-            };
-            let backing = PixelScrollBacking::Rgba {
-                width: target_px_w,
-                height: target_px_h,
+            let fit_axis = choose_kitty_fit_axis(
+                bounded_img.width(),
+                bounded_img.height(),
+                occ_cols,
+                occ_rows,
+                caps.cell_px,
+            );
+            let backing = PixelScrollBacking::Source {
+                image: Arc::new(bounded_img),
+                target_px_w,
+                target_px_h,
                 cell_px: caps.cell_px,
-                rgba: Arc::new(resized.into_raw()),
             };
             (
-                encode_kitty_tui_payload(png_bytes, occ_cols, occ_rows),
+                encode_kitty_tui_payload(png_bytes, fit_axis),
                 Some(backing),
             )
         }
         TerminalImageProtocol::ITerm2 => {
+            let bounded_img = if width_px <= MAX_RENDER_PX_W && height_px <= MAX_RENDER_PX_H {
+                dyn_img
+            } else {
+                fit_within_max_bounds(&dyn_img, MAX_RENDER_PX_W, MAX_RENDER_PX_H)
+            };
             let encoded_owned;
             let raw_bytes: &[u8] = if matches!(
                 guessed,
@@ -1279,29 +1545,24 @@ pub fn decode_and_render_for_protocol(
                         | ImageFormat::Gif
                         | ImageFormat::WebP
                 )
-            ) && bytes.len() <= MAX_ITERM2_RAW_BYTES
+            ) && width_px <= MAX_RENDER_PX_W
+                && height_px <= MAX_RENDER_PX_H
+                && bytes.len() <= MAX_ITERM2_RAW_BYTES
             {
                 bytes
             } else {
-                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, max_h_bound);
-                encoded_owned = encode_png(&bounded)?;
+                encoded_owned = encode_png(&bounded_img)?;
                 &encoded_owned
             };
             let b64 = B64_STANDARD.encode(raw_bytes);
             let payload = format!(
                 "\x1b]1337;File=inline=1;width={occ_cols};height={occ_rows};preserveAspectRatio=1;doNotMoveCursor=1:{b64}\x07"
             );
-            let rgba = dyn_img.to_rgba8();
-            let resized = if width_px == target_px_w && height_px == target_px_h {
-                rgba
-            } else {
-                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
-            };
-            let backing = PixelScrollBacking::Rgba {
-                width: target_px_w,
-                height: target_px_h,
+            let backing = PixelScrollBacking::Source {
+                image: Arc::new(bounded_img),
+                target_px_w,
+                target_px_h,
                 cell_px: caps.cell_px,
-                rgba: Arc::new(resized.into_raw()),
             };
             (payload, Some(backing))
         }
@@ -1364,7 +1625,25 @@ fn fit_within_max_bounds(img: &DynamicImage, max_w: u32, max_h: u32) -> DynamicI
     img.resize_exact(nw, nh, FilterType::Lanczos3)
 }
 
-fn encode_kitty_tui_payload(png_bytes: &[u8], occ_cols: u16, occ_rows: u16) -> String {
+fn choose_kitty_fit_axis(
+    src_w: u32,
+    src_h: u32,
+    occ_cols: u16,
+    occ_rows: u16,
+    cell_px: (u16, u16),
+) -> KittyFitAxis {
+    let cell_w = cell_px.0.max(1) as u64;
+    let cell_h = cell_px.1.max(1) as u64;
+    let lhs = (src_w as u64).saturating_mul((occ_rows.max(1) as u64).saturating_mul(cell_h));
+    let rhs = (src_h as u64).saturating_mul((occ_cols.max(1) as u64).saturating_mul(cell_w));
+    if lhs >= rhs {
+        KittyFitAxis::Cols(occ_cols.max(1))
+    } else {
+        KittyFitAxis::Rows(occ_rows.max(1))
+    }
+}
+
+fn encode_kitty_tui_payload(png_bytes: &[u8], fit_axis: KittyFitAxis) -> String {
     let b64 = B64_STANDARD.encode(png_bytes);
     let chunks: Vec<&str> = b64
         .as_bytes()
@@ -1373,12 +1652,16 @@ fn encode_kitty_tui_payload(png_bytes: &[u8], occ_cols: u16, occ_rows: u16) -> S
         .collect();
     let total = chunks.len();
     let mut out = String::with_capacity(b64.len() + total * 48);
+    let axis_param = match fit_axis {
+        KittyFitAxis::Cols(c) => format!("c={c}"),
+        KittyFitAxis::Rows(r) => format!("r={r}"),
+    };
     for (idx, chunk) in chunks.into_iter().enumerate() {
         let more = if idx + 1 < total { 1 } else { 0 };
         if idx == 0 {
             let _ = write!(
                 out,
-                "\x1b_Gf=100,a=T,q=2,i={KITTY_PREVIEW_IMAGE_ID},c={occ_cols},r={occ_rows},C=1,m={more};{chunk}\x1b\\"
+                "\x1b_Gf=100,a=T,q=2,i={KITTY_PREVIEW_IMAGE_ID},{axis_param},C=1,m={more};{chunk}\x1b\\"
             );
         } else {
             let _ = write!(out, "\x1b_Gq=2,m={more};{chunk}\x1b\\");
@@ -1387,108 +1670,144 @@ fn encode_kitty_tui_payload(png_bytes: &[u8], occ_cols: u16, occ_rows: u16) -> S
     out
 }
 
-fn compute_target_dims(width_px: u32, height_px: u32, max_cols: u16, max_rows: u16) -> (u32, u32) {
-    let clamped_cols = max_cols.max(4);
-    let clamped_rows = max_rows.max(2);
-    let is_scrollable = clamped_rows >= clamped_cols;
-    let is_tall = (height_px as u64) * 4 > (width_px as u64) * 5;
-    let (eff_cols, eff_rows) = if is_scrollable {
-        if is_tall {
-            let fit_cols = if clamped_rows > 140 {
-                clamped_cols
-            } else {
-                clamped_cols.min(92)
-            };
-            (fit_cols, clamped_rows)
-        } else {
-            (clamped_cols, (clamped_rows / 4).max(4))
-        }
-    } else {
-        (clamped_cols, clamped_rows)
-    };
-
-    let max_px_w = eff_cols as u32;
-    let max_px_h = (eff_rows as u32) * 2;
-
-    let scale = (max_px_w as f64 / width_px as f64)
-        .min(max_px_h as f64 / height_px as f64)
-        .min(1.0);
-    let target_w = ((width_px as f64 * scale).round() as u32).clamp(1, max_px_w);
-    let mut target_h = ((height_px as f64 * scale).round() as u32).clamp(2, max_px_h);
-    if target_h % 2 != 0 {
-        if target_h + 1 <= max_px_h {
-            target_h += 1;
-        } else {
-            target_h = target_h.saturating_sub(1).max(2);
-        }
-    }
-    (target_w, target_h)
-}
-
-fn compute_pixel_fit_for_protocol(
+/// Computes target half-block subpixel dimensions `(target_w, target_h)` (`target_h` always even)
+/// honoring actual terminal `cell_px` geometry and `FitBox` zoom/scroll rules.
+pub fn compute_halfblock_dims(
     width_px: u32,
     height_px: u32,
-    max_cols: u16,
-    max_rows: u16,
+    fit: FitBox,
+    cell_px: (u16, u16),
+) -> (u32, u32) {
+    let cell_w = cell_px.0.max(1) as f64;
+    let cell_h = cell_px.1.max(1) as f64;
+    let view_cols = fit.view_cols.max(1) as u32;
+    let view_rows = fit.view_rows.max(1) as u32;
+    let zoom_pct = fit.zoom_pct.clamp(25, 300);
+
+    // Each half-block subpixel spans `cell_w` x `(cell_h / 2)` physical pixels.
+    let subpx_aspect = cell_h / (2.0 * cell_w);
+    let eff_src_h = (height_px as f64) / subpx_aspect;
+    let vp_sub_w = view_cols as f64;
+    let vp_sub_h = (view_rows as f64) * 2.0;
+
+    let is_tall_image = (height_px as u64) * 4 > (width_px as u64) * 5;
+    let is_tall_scroll = fit.scrollable
+        && is_tall_image
+        && eff_src_h * vp_sub_w > (width_px as f64) * vp_sub_h * 1.5;
+
+    let base_scale = if is_tall_scroll {
+        (vp_sub_w / width_px as f64).min(1.0)
+    } else {
+        (vp_sub_w / width_px as f64)
+            .min(vp_sub_h / eff_src_h)
+            .min(1.0)
+    };
+    let scale = base_scale * (zoom_pct as f64 / 100.0);
+
+    let max_cols = if fit.scrollable { 512 } else { view_cols };
+    let max_rows = if fit.scrollable { 1024 } else { view_rows };
+
+    let target_w = ((width_px as f64 * scale).round() as u32).clamp(1, max_cols);
+    let target_rows = (((eff_src_h * scale) / 2.0).round() as u32).clamp(1, max_rows);
+    (target_w, target_rows * 2)
+}
+
+/// Computes `(target_px_w, target_px_h, occ_cols, occ_rows)` for pixel protocols using explicit `FitBox`.
+pub fn compute_pixel_fit_for_protocol(
+    width_px: u32,
+    height_px: u32,
+    fit: FitBox,
     cell_px: (u16, u16),
     protocol: TerminalImageProtocol,
 ) -> (u32, u32, u16, u16) {
-    let cell_w = cell_px.0.max(1);
-    let cell_h = cell_px.1.max(1);
-    let clamped_cols = max_cols.max(4);
-    let clamped_rows = if protocol == TerminalImageProtocol::Sixel {
-        max_rows.max(1)
+    let cell_w = cell_px.0.max(1) as u32;
+    let cell_h = cell_px.1.max(1) as u32;
+    let view_cols = fit.view_cols.max(1);
+    let view_rows = fit.view_rows.max(1);
+    let zoom_pct = fit.zoom_pct.clamp(25, 300);
+
+    let vp_w = (view_cols as u32).saturating_mul(cell_w).max(1);
+    let raw_vp_h = (view_rows as u32).saturating_mul(cell_h).max(1);
+    let sixel_safe_vp_h = compute_sixel_safe_pixel_height(view_rows, cell_px.1.max(1));
+    let vp_h = if protocol == TerminalImageProtocol::Sixel && !fit.scrollable && sixel_safe_vp_h >= 6 {
+        sixel_safe_vp_h
     } else {
-        max_rows.max(2)
+        raw_vp_h
     };
 
-    let is_scrollable = clamped_rows >= clamped_cols;
-    let is_tall = (height_px as u64) * 4 > (width_px as u64) * 5;
-    let (eff_cols, eff_rows, px_height_cap) = if is_scrollable {
-        if is_tall {
-            let fit_cols = if clamped_rows > 140 {
-                clamped_cols
-            } else {
-                clamped_cols.min(92)
-            };
-            (fit_cols, clamped_rows, MAX_SCROLLABLE_PIXEL_HEIGHT)
-        } else {
-            (
-                clamped_cols,
-                (clamped_rows / 4).max(4),
-                MAX_SCROLLABLE_PIXEL_HEIGHT,
-            )
+    // Only tall portrait screenshots whose fit-to-width height exceeds 1.5x viewport height scroll vertically at 100%.
+    // Standard aspect ratios (including 16:9 on wide/low terminals) always fit wholly inside the viewport at 100%.
+    let is_tall_image = (height_px as u64) * 4 > (width_px as u64) * 5;
+    let is_tall_scroll = fit.scrollable
+        && is_tall_image
+        && (height_px as u64).saturating_mul(vp_w as u64)
+            > (width_px as u64)
+                .saturating_mul(vp_h as u64)
+                .saturating_mul(3)
+                / 2;
+
+    let base_scale = if is_tall_scroll {
+        (vp_w as f64 / width_px as f64).min(1.0)
+    } else {
+        (vp_w as f64 / width_px as f64)
+            .min(vp_h as f64 / height_px as f64)
+            .min(1.0)
+    };
+
+    let mut scale = base_scale * (zoom_pct as f64 / 100.0);
+
+    let cap_scale = (MAX_RENDER_PX_W as f64 / width_px as f64)
+        .min(MAX_RENDER_PX_H as f64 / height_px as f64);
+    if scale > cap_scale {
+        scale = cap_scale;
+    }
+
+    if protocol == TerminalImageProtocol::Sixel {
+        let est_w = (width_px as f64 * scale).max(1.0);
+        let est_h = (height_px as f64 * scale).max(1.0);
+        let est_px = est_w * est_h;
+        if est_px > MAX_SIXEL_PIXELS as f64 {
+            scale *= (MAX_SIXEL_PIXELS as f64 / est_px).sqrt();
         }
+    }
+
+    let max_w = if fit.scrollable {
+        MAX_RENDER_PX_W
     } else {
-        (clamped_cols, clamped_rows, MAX_PIXEL_HEIGHT)
+        vp_w.min(MAX_RENDER_PX_W)
+    };
+    let max_h = if fit.scrollable {
+        MAX_RENDER_PX_H
+    } else {
+        vp_h.min(MAX_RENDER_PX_H)
     };
 
-    let max_target_w = (eff_cols as u32 * cell_w as u32).clamp(1, MAX_PIXEL_WIDTH);
-    let raw_max_h = (eff_rows as u32 * cell_h as u32).clamp(1, px_height_cap);
-    let max_target_h = if protocol == TerminalImageProtocol::Sixel {
-        let sixel_safe_h = compute_sixel_safe_pixel_height(eff_rows, cell_h);
-        if sixel_safe_h >= 6 {
-            sixel_safe_h.min(raw_max_h)
-        } else {
-            raw_max_h
+    let mut target_px_w = ((width_px as f64 * scale).round() as u32).clamp(1, max_w);
+    let mut target_px_h = ((height_px as f64 * scale).round() as u32).clamp(1, max_h);
+
+    if protocol == TerminalImageProtocol::Sixel {
+        if !fit.scrollable && sixel_safe_vp_h >= 6 && target_px_h > sixel_safe_vp_h {
+            target_px_h = sixel_safe_vp_h;
         }
-    } else {
-        raw_max_h
-    };
+        if fit.scrollable && !is_tall_scroll && zoom_pct <= 100 && sixel_safe_vp_h >= 6 && target_px_h > sixel_safe_vp_h {
+            let ratio = sixel_safe_vp_h as f64 / target_px_h as f64;
+            target_px_h = sixel_safe_vp_h;
+            target_px_w = ((target_px_w as f64 * ratio).round() as u32).clamp(1, max_w);
+        }
+        if (target_px_w as u64) * (target_px_h as u64) > MAX_SIXEL_PIXELS {
+            let ratio =
+                (MAX_SIXEL_PIXELS as f64 / ((target_px_w as f64) * (target_px_h as f64))).sqrt();
+            target_px_w = ((target_px_w as f64 * ratio).floor() as u32).max(1);
+            target_px_h = ((target_px_h as f64 * ratio).floor() as u32).max(1);
+        }
+    }
 
-    let scale = (max_target_w as f64 / width_px as f64)
-        .min(max_target_h as f64 / height_px as f64)
-        .min(2.0);
-
-    let target_px_w = ((width_px as f64 * scale).round() as u32).clamp(1, max_target_w);
-    let target_px_h = ((height_px as f64 * scale).round() as u32).clamp(1, max_target_h);
-
-    let occ_cols = (target_px_w.div_ceil(cell_w as u32)).clamp(1, eff_cols.max(1) as u32) as u16;
+    let occ_cols = target_px_w.div_ceil(cell_w).clamp(1, u16::MAX as u32) as u16;
     let occ_rows = if protocol == TerminalImageProtocol::Sixel {
         let band_px_h = target_px_h.div_ceil(6) * 6;
-        (band_px_h.div_ceil(cell_h as u32)).clamp(1, eff_rows.max(1) as u32) as u16
+        band_px_h.div_ceil(cell_h).clamp(1, u16::MAX as u32) as u16
     } else {
-        (target_px_h.div_ceil(cell_h as u32)).clamp(1, eff_rows.max(1) as u32) as u16
+        target_px_h.div_ceil(cell_h).clamp(1, u16::MAX as u32) as u16
     };
 
     (target_px_w, target_px_h, occ_cols, occ_rows)
@@ -1601,6 +1920,19 @@ fn write_sixel_rle(masks: &[u8], out: &mut String) {
     }
 }
 
+/// Integer-only Redmean perceptually weighted squared color distance.
+#[inline]
+pub fn redmean_dist_sq(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> u32 {
+    let r_mean = (r1 as i32 + r2 as i32) / 2;
+    let dr = r1 as i32 - r2 as i32;
+    let dg = g1 as i32 - g2 as i32;
+    let db = b1 as i32 - b2 as i32;
+    let wr = ((512 + r_mean) * dr * dr) >> 8;
+    let wg = 4 * dg * dg;
+    let wb = ((767 - r_mean) * db * db) >> 8;
+    (wr + wg + wb) as u32
+}
+
 #[derive(Clone, Copy)]
 struct ColorBucket {
     r_avg: u8,
@@ -1617,22 +1949,31 @@ fn quantize_rgba_to_256(
     width: usize,
     height: usize,
 ) -> (Vec<(u8, u8, u8)>, Vec<u8>) {
+    let (palette, indexed, _cache_len) = quantize_rgba_to_256_with_cache_len(flat_rgba, width, height);
+    (palette, indexed)
+}
+
+fn quantize_rgba_to_256_with_cache_len(
+    flat_rgba: &[u8],
+    width: usize,
+    height: usize,
+) -> (Vec<(u8, u8, u8)>, Vec<u8>, usize) {
     let pixel_count = width.saturating_mul(height);
     // Fast lossless path when the image uses <= 256 distinct RGB colors.
     let mut exact_map: HashMap<u32, u8> = HashMap::with_capacity(256);
     let mut exact_palette: Vec<(u8, u8, u8)> = Vec::with_capacity(256);
-    let mut indexed = Vec::with_capacity(pixel_count);
+    let mut exact_indexed = Vec::with_capacity(pixel_count);
     let mut overflow = false;
 
     for px in flat_rgba.chunks_exact(4).take(pixel_count) {
         let key = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
         if let Some(&idx) = exact_map.get(&key) {
-            indexed.push(idx);
+            exact_indexed.push(idx);
         } else if exact_palette.len() < 256 {
             let idx = exact_palette.len() as u8;
             exact_map.insert(key, idx);
             exact_palette.push((px[0], px[1], px[2]));
-            indexed.push(idx);
+            exact_indexed.push(idx);
         } else {
             overflow = true;
             break;
@@ -1640,10 +1981,10 @@ fn quantize_rgba_to_256(
     }
 
     if !overflow {
-        return (exact_palette, indexed);
+        return (exact_palette, exact_indexed, 0);
     }
 
-    // Median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
+    // Perceptually weighted median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
     let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
     for px in flat_rgba.chunks_exact(4).take(pixel_count) {
         let qkey = (((px[0] as u16) >> 3) << 10)
@@ -1699,18 +2040,19 @@ fn quantize_rgba_to_256(
                 pop += b.count as u64;
             }
 
-            let span_r = max_r - min_r;
-            let span_g = max_g - min_g;
-            let span_b = max_b - min_b;
-            let (channel, max_span) = if span_r >= span_g && span_r >= span_b {
-                (0u8, span_r)
-            } else if span_g >= span_b {
-                (1u8, span_g)
+            let w_r = (max_r - min_r) as u64 * 2;
+            let w_g = (max_g - min_g) as u64 * 4;
+            let w_b = (max_b - min_b) as u64 * 3;
+            let (channel, weighted_span) = if w_g >= w_r && w_g >= w_b {
+                (1u8, w_g)
+            } else if w_b >= w_r {
+                (2u8, w_b)
             } else {
-                (2u8, span_b)
+                (0u8, w_r)
             };
 
-            let score = (max_span as u64) * pop;
+            let sqrt_pop = (pop as f64).sqrt().ceil() as u64;
+            let score = weighted_span.saturating_mul(sqrt_pop.max(1));
             if score > best_score {
                 best_score = score;
                 best_box_idx = Some(bi);
@@ -1732,15 +2074,19 @@ fn quantize_rgba_to_256(
         let total_pop: u64 = slice.iter().map(|b| b.count as u64).sum();
         let half_pop = total_pop / 2;
         let mut accum = 0u64;
-        let mut split_rel = 1usize;
+        let mut split_rel = None;
         for (idx, b) in slice.iter().enumerate() {
             accum += b.count as u64;
-            if accum >= half_pop && idx + 1 < slice.len() {
-                split_rel = (idx + 1).max(1);
+            if accum >= half_pop {
+                if idx + 1 < slice.len() {
+                    split_rel = Some((idx + 1).max(1));
+                } else {
+                    split_rel = Some(idx.max(1));
+                }
                 break;
             }
         }
-        let mid = start + split_rel;
+        let mid = start + split_rel.unwrap_or(1);
         boxes[bi] = (start, mid);
         boxes.push((mid, end));
     }
@@ -1766,34 +2112,36 @@ fn quantize_rgba_to_256(
         })
         .collect();
 
-    indexed.clear();
+    let mut indexed = vec![0u8; pixel_count];
     let mut lookup_cache: HashMap<u32, u8> = HashMap::with_capacity(2048);
     let mut used = vec![false; raw_palette.len()];
 
-    // Floyd-Steinberg error diffusion (7/16, 3/16, 5/16, 1/16) with edge & channel clamping
-    // so screenshots and photographs avoid blocky color banding in 256-color Sixel output.
-    let mut err_curr = vec![[0i32; 3]; width];
-    let mut err_next = vec![[0i32; 3]; width];
+    // Serpentine Floyd-Steinberg error diffusion with [-48, 48] error clamp and flat-region guard.
+    let mut err_curr = vec![[0.0f32; 3]; width];
+    let mut err_next = vec![[0.0f32; 3]; width];
 
     for y in 0..height {
         let row_base = y * width;
-        for x in 0..width {
+        let left_to_right = (y & 1) == 0;
+        for step in 0..width {
+            let x = if left_to_right { step } else { width - 1 - step };
             let off = (row_base + x) * 4;
-            let r = (flat_rgba[off] as i32 + (err_curr[x][0] / 16)).clamp(0, 255) as u8;
-            let g = (flat_rgba[off + 1] as i32 + (err_curr[x][1] / 16)).clamp(0, 255) as u8;
-            let b = (flat_rgba[off + 2] as i32 + (err_curr[x][2] / 16)).clamp(0, 255) as u8;
+            let orig_r = flat_rgba[off];
+            let orig_g = flat_rgba[off + 1];
+            let orig_b = flat_rgba[off + 2];
+
+            let r = (orig_r as f32 + err_curr[x][0]).round().clamp(0.0, 255.0) as u8;
+            let g = (orig_g as f32 + err_curr[x][1]).round().clamp(0.0, 255.0) as u8;
+            let b = (orig_b as f32 + err_curr[x][2]).round().clamp(0.0, 255.0) as u8;
 
             let key = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
             let idx = if let Some(&cached) = lookup_cache.get(&key) {
                 cached
             } else {
                 let mut best_idx = 0u8;
-                let mut best_dist = i32::MAX;
+                let mut best_dist = u32::MAX;
                 for (pi, &(pr, pg, pb)) in raw_palette.iter().enumerate() {
-                    let dr = r as i32 - pr as i32;
-                    let dg = g as i32 - pg as i32;
-                    let db = b as i32 - pb as i32;
-                    let dist = dr * dr + dg * dg + db * db;
+                    let dist = redmean_dist_sq(r, g, b, pr, pg, pb);
                     if dist < best_dist {
                         best_dist = dist;
                         best_idx = pi as u8;
@@ -1802,42 +2150,90 @@ fn quantize_rgba_to_256(
                         }
                     }
                 }
-                lookup_cache.insert(key, best_idx);
+                if lookup_cache.len() < MAX_QUANT_LOOKUP_CACHE {
+                    lookup_cache.insert(key, best_idx);
+                }
                 best_idx
             };
 
             used[idx as usize] = true;
-            indexed.push(idx);
+            indexed[row_base + x] = idx;
 
             let (pr, pg, pb) = raw_palette[idx as usize];
-            let er = r as i32 - pr as i32;
-            let eg = g as i32 - pg as i32;
-            let eb = b as i32 - pb as i32;
+            let er = (r as f32 - pr as f32).clamp(-48.0, 48.0);
+            let eg = (g as f32 - pg as f32).clamp(-48.0, 48.0);
+            let eb = (b as f32 - pb as f32).clamp(-48.0, 48.0);
 
-            if x + 1 < width {
-                err_curr[x + 1][0] += er * 7;
-                err_curr[x + 1][1] += eg * 7;
-                err_curr[x + 1][2] += eb * 7;
+            let tiny_err = er.abs() <= 3.0 && eg.abs() <= 3.0 && eb.abs() <= 3.0;
+            let same_left = x > 0
+                && orig_r == flat_rgba[off - 4]
+                && orig_g == flat_rgba[off - 3]
+                && orig_b == flat_rgba[off - 2];
+            let same_up = y > 0 && {
+                let up_off = ((y - 1) * width + x) * 4;
+                orig_r == flat_rgba[up_off]
+                    && orig_g == flat_rgba[up_off + 1]
+                    && orig_b == flat_rgba[up_off + 2]
+            };
+            let orig_dist = redmean_dist_sq(orig_r, orig_g, orig_b, pr, pg, pb);
+            if tiny_err || ((same_left || same_up) && orig_dist <= 64) {
+                continue;
             }
-            if y + 1 < height {
-                if x > 0 {
-                    err_next[x - 1][0] += er * 3;
-                    err_next[x - 1][1] += eg * 3;
-                    err_next[x - 1][2] += eb * 3;
-                }
-                err_next[x][0] += er * 5;
-                err_next[x][1] += eg * 5;
-                err_next[x][2] += eb * 5;
+
+            const W7: f32 = 7.0 / 16.0;
+            const W3: f32 = 3.0 / 16.0;
+            const W5: f32 = 5.0 / 16.0;
+            const W1: f32 = 1.0 / 16.0;
+
+            if left_to_right {
                 if x + 1 < width {
-                    err_next[x + 1][0] += er;
-                    err_next[x + 1][1] += eg;
-                    err_next[x + 1][2] += eb;
+                    err_curr[x + 1][0] += er * W7;
+                    err_curr[x + 1][1] += eg * W7;
+                    err_curr[x + 1][2] += eb * W7;
+                }
+                if y + 1 < height {
+                    if x > 0 {
+                        err_next[x - 1][0] += er * W3;
+                        err_next[x - 1][1] += eg * W3;
+                        err_next[x - 1][2] += eb * W3;
+                    }
+                    err_next[x][0] += er * W5;
+                    err_next[x][1] += eg * W5;
+                    err_next[x][2] += eb * W5;
+                    if x + 1 < width {
+                        err_next[x + 1][0] += er * W1;
+                        err_next[x + 1][1] += eg * W1;
+                        err_next[x + 1][2] += eb * W1;
+                    }
+                }
+            } else {
+                if x > 0 {
+                    err_curr[x - 1][0] += er * W7;
+                    err_curr[x - 1][1] += eg * W7;
+                    err_curr[x - 1][2] += eb * W7;
+                }
+                if y + 1 < height {
+                    if x + 1 < width {
+                        err_next[x + 1][0] += er * W3;
+                        err_next[x + 1][1] += eg * W3;
+                        err_next[x + 1][2] += eb * W3;
+                    }
+                    err_next[x][0] += er * W5;
+                    err_next[x][1] += eg * W5;
+                    err_next[x][2] += eb * W5;
+                    if x > 0 {
+                        err_next[x - 1][0] += er * W1;
+                        err_next[x - 1][1] += eg * W1;
+                        err_next[x - 1][2] += eb * W1;
+                    }
                 }
             }
         }
         std::mem::swap(&mut err_curr, &mut err_next);
-        err_next.fill([0, 0, 0]);
+        err_next.fill([0.0, 0.0, 0.0]);
     }
+
+    let cache_len = lookup_cache.len();
 
     // Compact palette so every emitted `#idx;2;...` entry is actually referenced.
     let mut remap = vec![0u8; raw_palette.len()];
@@ -1852,7 +2248,7 @@ fn quantize_rgba_to_256(
         *idx = remap[*idx as usize];
     }
 
-    (compact_palette, indexed)
+    (compact_palette, indexed, cache_len)
 }
 
 /// Renders an image for direct CLI terminal stdout (auto-detecting Kitty / iTerm2 / Sixel / 24-bit ANSI Half-Blocks).
@@ -1878,6 +2274,7 @@ fn render_ansi_stdout_with_caps(
     caps: TerminalGraphicsCaps,
 ) -> Result<String> {
     validate_raster_image_bytes(bytes)?;
+    let fit = FitBox::contained(max_cols, max_rows);
     match caps.protocol {
         TerminalImageProtocol::ITerm2 => {
             let guessed = image::guess_format(bytes).ok();
@@ -1886,7 +2283,7 @@ fn render_ansi_stdout_with_caps(
             if width_px == 0 || height_px == 0 {
                 bail!("Image dimensions are 0x0");
             }
-            let (cols, _) = compute_target_dims(width_px, height_px, max_cols, max_rows);
+            let (cols, _) = compute_halfblock_dims(width_px, height_px, fit, caps.cell_px);
             let encoded_owned;
             let raw_bytes: &[u8] = if matches!(
                 guessed,
@@ -1896,18 +2293,19 @@ fn render_ansi_stdout_with_caps(
                         | ImageFormat::Gif
                         | ImageFormat::WebP
                 )
-            ) && bytes.len() <= MAX_ITERM2_RAW_BYTES
+            ) && width_px <= MAX_RENDER_PX_W
+                && height_px <= MAX_RENDER_PX_H
+                && bytes.len() <= MAX_ITERM2_RAW_BYTES
             {
                 bytes
             } else {
-                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, MAX_PIXEL_HEIGHT);
+                let bounded = fit_within_max_bounds(&dyn_img, MAX_RENDER_PX_W, MAX_RENDER_PX_H);
                 encoded_owned = encode_png(&bounded)?;
                 &encoded_owned
             };
             let b64 = B64_STANDARD.encode(raw_bytes);
             Ok(format!(
-                "\x1b]1337;File=inline=1;width={};preserveAspectRatio=1:{b64}\x07\n",
-                cols
+                "\x1b]1337;File=inline=1;width={cols};preserveAspectRatio=1:{b64}\x07\n"
             ))
         }
         TerminalImageProtocol::Kitty => {
@@ -1919,12 +2317,12 @@ fn render_ansi_stdout_with_caps(
             }
             let png_owned;
             let png_bytes: &[u8] = if matches!(guessed, Some(ImageFormat::Png))
-                && width_px <= MAX_PIXEL_WIDTH
-                && height_px <= MAX_PIXEL_HEIGHT
+                && width_px <= MAX_RENDER_PX_W
+                && height_px <= MAX_RENDER_PX_H
             {
                 bytes
             } else {
-                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, MAX_PIXEL_HEIGHT);
+                let bounded = fit_within_max_bounds(&dyn_img, MAX_RENDER_PX_W, MAX_RENDER_PX_H);
                 png_owned = encode_png(&bounded)?;
                 &png_owned
             };
@@ -1948,14 +2346,14 @@ fn render_ansi_stdout_with_caps(
             Ok(out)
         }
         TerminalImageProtocol::Sixel => {
-            let rendered =
-                decode_and_render_for_protocol(bytes, max_cols, max_rows, (0, 0, 0), caps)?;
+            let rendered = decode_and_render_for_protocol(bytes, fit, (0, 0, 0), caps)?;
             let mut out = rendered.pixel_payload.unwrap_or_default();
             out.push('\n');
             Ok(out)
         }
         TerminalImageProtocol::Halfblock => {
-            let rendered = decode_and_render_halfblocks(bytes, max_cols, max_rows, (0, 0, 0))?;
+            let rendered =
+                decode_and_render_halfblocks_with_cell_px(bytes, fit, (0, 0, 0), caps.cell_px)?;
             let mut out = String::new();
             for line in &rendered.lines {
                 for span in &line.spans {
@@ -2016,6 +2414,8 @@ fn encode_png(img: &DynamicImage) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use image::{ImageBuffer, RgbaImage};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn make_test_png(w: u32, h: u32) -> Vec<u8> {
         let img: RgbaImage = ImageBuffer::from_fn(w, h, |x, y| {
@@ -2027,6 +2427,423 @@ mod tests {
         });
         let dyn_img = DynamicImage::ImageRgba8(img);
         encode_png(&dyn_img).unwrap()
+    }
+
+    fn decode_kitty_payload_png(payload: &str) -> DynamicImage {
+        let mut b64 = String::new();
+        for frame in payload.split("\x1b\\") {
+            if let Some((_, chunk)) = frame.split_once(';') {
+                b64.push_str(chunk);
+            }
+        }
+        let decoded_png = B64_STANDARD.decode(&b64).unwrap();
+        image::load_from_memory(&decoded_png).unwrap()
+    }
+
+    #[test]
+    fn test_probe_vt_mode_enabled_before_query_write_and_restored() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Step {
+            SetMode(u32),
+            Write(String),
+            Flush,
+            ReadReply,
+        }
+
+        struct RecordingWriter {
+            log: Rc<RefCell<Vec<Step>>>,
+        }
+        impl std::io::Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.log
+                    .borrow_mut()
+                    .push(Step::Write(String::from_utf8_lossy(buf).into_owned()));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.log.borrow_mut().push(Step::Flush);
+                Ok(())
+            }
+        }
+
+        let log = Rc::new(RefCell::new(Vec::<Step>::new()));
+        let mut writer = RecordingWriter {
+            log: Rc::clone(&log),
+        };
+        let prev_mode = 0x0018 | WIN_ENABLE_QUICK_EDIT_MODE; // QuickEdit initially ON, VT input OFF
+
+        let reply = write_and_read_windows_probe_with(
+            prev_mode,
+            "\x1b[16t\x1b[c",
+            &mut writer,
+            |mode| log.borrow_mut().push(Step::SetMode(mode)),
+            || {
+                log.borrow_mut().push(Step::ReadReply);
+                b"\x1b[6;20;10t\x1b[?61;4c".to_vec()
+            },
+        );
+
+        assert_eq!(reply, "\x1b[6;20;10t\x1b[?61;4c");
+        let steps = log.borrow();
+        assert_eq!(steps.len(), 5, "unexpected probe step sequence: {steps:?}");
+
+        // 1. ENABLE_VIRTUAL_TERMINAL_INPUT MUST be set BEFORE write_all(query)
+        match steps[0] {
+            Step::SetMode(m) => {
+                assert_ne!(m & WIN_ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+                assert_ne!(m & WIN_ENABLE_EXTENDED_FLAGS, 0);
+                assert_eq!(m & WIN_ENABLE_QUICK_EDIT_MODE, 0);
+            }
+            ref other => panic!("expected SetMode first, got {other:?}"),
+        }
+        assert_eq!(steps[1], Step::Write("\x1b[16t\x1b[c".to_string()));
+        assert_eq!(steps[2], Step::Flush);
+        assert_eq!(steps[3], Step::ReadReply);
+
+        // 2. Drop restores mode with VT input cleared, EXTENDED_FLAGS set, and QUICK_EDIT cleared
+        match steps[4] {
+            Step::SetMode(m) => {
+                assert_eq!(m & WIN_ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+                assert_ne!(m & WIN_ENABLE_EXTENDED_FLAGS, 0);
+                assert_eq!(m & WIN_ENABLE_QUICK_EDIT_MODE, 0);
+                assert_eq!(m & 0x0018, 0x0018);
+            }
+            ref other => panic!("expected restore SetMode last, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cell_px_rounded_division_avoids_truncation() {
+        assert_eq!(cell_px_from_window_px(1590, 995, 100, 50), Some((16, 20)));
+        assert_eq!(
+            parse_csi_win_size_reply(b"\x1b[4;995;1590t", 100, 50),
+            Some((16, 20))
+        );
+    }
+
+    #[test]
+    fn test_protocol_detection_wt_requires_da1_stackbite_suppressed_wezterm_kitty() {
+        // 1. WT_SESSION alone -> Halfblock statically (never forces Sixel without DA1 ;4)
+        let mut wt_only = HashMap::new();
+        wt_only.insert("WT_SESSION", "00000000-0000-0000-0000-000000000001");
+        assert_eq!(
+            resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wt_only),
+            TerminalImageProtocol::Halfblock
+        );
+
+        // 2. WT_SESSION + DA1 ;4 -> Sixel; WT_SESSION + DA1 without ;4 -> Halfblock
+        let mut caps_sixel = TerminalGraphicsCaps {
+            protocol: resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wt_only),
+            ..Default::default()
+        };
+        apply_probe_reply_to_caps(&mut caps_sixel, b"\x1b[?61;4c", false, true, None);
+        assert_eq!(caps_sixel.protocol, TerminalImageProtocol::Sixel);
+
+        let mut caps_no_sixel = TerminalGraphicsCaps {
+            protocol: resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wt_only),
+            ..Default::default()
+        };
+        apply_probe_reply_to_caps(&mut caps_no_sixel, b"\x1b[?61;1c", false, true, None);
+        assert_eq!(caps_no_sixel.protocol, TerminalImageProtocol::Halfblock);
+
+        // 3. WT_SESSION + STACKBITE_ROOM_ID -> Halfblock statically (probe results only)
+        let mut sb_env = HashMap::new();
+        sb_env.insert("WT_SESSION", "00000000-0000-0000-0000-000000000001");
+        sb_env.insert("STACKBITE_ROOM_ID", "room-123");
+        assert!(is_stackbite_env(&|k| sb_env.get(k).map(|v| (*v).to_string())));
+        assert_eq!(
+            resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &sb_env),
+            TerminalImageProtocol::Halfblock
+        );
+
+        // 4. WezTerm -> Kitty (promoted ahead of iTerm2)
+        let mut wez_exec = HashMap::new();
+        wez_exec.insert("WEZTERM_EXECUTABLE", "C:\\Program Files\\WezTerm\\wezterm-gui.exe");
+        wez_exec.insert("WT_SESSION", "00000000-0000-0000-0000-000000000001");
+        assert_eq!(
+            resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wez_exec),
+            TerminalImageProtocol::Kitty
+        );
+
+        let mut wez_tp = HashMap::new();
+        wez_tp.insert("TERM_PROGRAM", "WezTerm");
+        assert_eq!(
+            resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wez_tp),
+            TerminalImageProtocol::Kitty
+        );
+    }
+
+    #[test]
+    fn test_kitty_single_axis_emits_only_constraining_dimension() {
+        let caps = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Kitty,
+            cell_px: (10, 20),
+            cell_px_exact: true,
+        };
+
+        // Width-constrained 1600x900 in 80x40 cells -> emits ONLY `c=`, NEVER `,r=`
+        let wide_png = make_test_png(1600, 900);
+        let wide_rendered =
+            decode_and_render_for_protocol(&wide_png, FitBox::contained(80, 40), (0, 0, 0), caps)
+                .unwrap();
+        let wide_payload = wide_rendered.pixel_payload.as_deref().unwrap();
+        let wide_hdr = wide_payload.split(';').next().unwrap();
+        assert!(
+            wide_hdr.contains(",c="),
+            "expected width-constrained Kitty header to contain ,c=: {wide_hdr}"
+        );
+        assert!(
+            !wide_hdr.contains(",r="),
+            "width-constrained Kitty header must NOT contain ,r=: {wide_hdr}"
+        );
+
+        // Height-constrained 400x1200 in 80x20 cells -> emits ONLY `r=`, NEVER `,c=`
+        let tall_png = make_test_png(400, 1200);
+        let tall_rendered =
+            decode_and_render_for_protocol(&tall_png, FitBox::contained(80, 20), (0, 0, 0), caps)
+                .unwrap();
+        let tall_payload = tall_rendered.pixel_payload.as_deref().unwrap();
+        let tall_hdr = tall_payload.split(';').next().unwrap();
+        assert!(
+            tall_hdr.contains(",r="),
+            "expected height-constrained Kitty header to contain ,r=: {tall_hdr}"
+        );
+        assert!(
+            !tall_hdr.contains(",c="),
+            "height-constrained Kitty header must NOT contain ,c=: {tall_hdr}"
+        );
+    }
+
+    #[test]
+    fn test_pixel_scroll_backing_crops_native_source_without_double_scaling() {
+        let tall_png = make_test_png(800, 2400);
+        let caps = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Kitty,
+            cell_px: (10, 20),
+            cell_px_exact: true,
+        };
+        // Virtual viewport 40x20 cells (400x400px); native width is 800px
+        let rendered = decode_and_render_for_protocol(
+            &tall_png,
+            FitBox::scrollable(40, 20, 100),
+            (0, 0, 0),
+            caps,
+        )
+        .unwrap();
+        assert_eq!(rendered.cols, 40);
+        assert!(rendered.rows > 20);
+
+        let (payload, draw_c, draw_r) = rendered
+            .viewport_pixel_payload(0, 10, 40, 20)
+            .expect("expected viewport crop payload");
+        assert!(draw_c <= 40 && draw_r <= 20);
+        let cropped_img = decode_kitty_payload_png(&payload);
+        assert_eq!(
+            cropped_img.width(),
+            800,
+            "cropped viewport PNG must preserve native 800px width, not downscaled 400px buffer"
+        );
+        assert_eq!(cropped_img.height(), 800);
+    }
+
+    #[test]
+    fn test_fit_box_no_forced_crop_on_wide_low_terminal_at_100pct() {
+        let fit = FitBox::scrollable(176, 25, 100);
+        for cell_px in [(10, 20), (8, 16), (9, 19)] {
+            for proto in [
+                TerminalImageProtocol::Kitty,
+                TerminalImageProtocol::ITerm2,
+                TerminalImageProtocol::Sixel,
+            ] {
+                let (_tw, _th, occ_cols, occ_rows) =
+                    compute_pixel_fit_for_protocol(1920, 1080, fit, cell_px, proto);
+                assert!(
+                    occ_rows <= 25 && occ_cols <= 176,
+                    "1920x1080 at 100% zoom must fit within 176x25 without forced crop for {proto:?} cell_px={cell_px:?}, got {occ_cols}x{occ_rows}"
+                );
+            }
+            let (hb_w, hb_h) = compute_halfblock_dims(1920, 1080, fit, cell_px);
+            assert!(
+                hb_w <= 176 && (hb_h / 2) <= 25,
+                "halfblock 1920x1080 must fit within 176x25 for cell_px={cell_px:?}, got {hb_w}x{}",
+                hb_h / 2
+            );
+        }
+    }
+
+    #[test]
+    fn test_tall_screenshot_uses_full_width_past_92_cols_and_zoom_300pct_scales() {
+        let cell_px = (10, 20);
+        let (tw100, th100, cols100, _rows100) = compute_pixel_fit_for_protocol(
+            1200,
+            4000,
+            FitBox::scrollable(140, 30, 100),
+            cell_px,
+            TerminalImageProtocol::Kitty,
+        );
+        assert!(
+            cols100 > 92,
+            "tall screenshot in 140-col viewport must use full width past old 92-col cap, got {cols100}"
+        );
+
+        let (tw200, th200, _cols200, _rows200) = compute_pixel_fit_for_protocol(
+            1200,
+            4000,
+            FitBox::scrollable(140, 30, 200),
+            cell_px,
+            TerminalImageProtocol::Kitty,
+        );
+        let (tw300, th300, _cols300, _rows300) = compute_pixel_fit_for_protocol(
+            1200,
+            4000,
+            FitBox::scrollable(140, 30, 300),
+            cell_px,
+            TerminalImageProtocol::Kitty,
+        );
+
+        assert!(tw200 > tw100 && th200 > th100, "200% zoom must scale beyond 100%");
+        assert!(
+            tw200 > 1920,
+            "200% zoom must not be blocked by old 1920px width cap, got {tw200}"
+        );
+        assert!(
+            tw300 > tw200 && th300 > th200,
+            "300% zoom must scale strictly beyond 200% (got {tw200}x{th200} -> {tw300}x{th300})"
+        );
+    }
+
+    #[test]
+    fn test_sixel_preserves_ui_accent_suppresses_flat_dither_and_bounds_cache() {
+        // Synthetic UI screenshot: ~98% flat gray background (240, 240, 240) + ~2% vivid blue/red accent +
+        // small gradient strip so unique RGB count > 256 (forcing median-cut + dithering path).
+        let w = 160usize;
+        let h = 100usize;
+        let mut flat = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let off = (y * w + x) * 4;
+                let (r, g, b) = if y == 0 {
+                    // 160 unique gradient pixels on row 0
+                    ((x * 255 / w) as u8, 40, (255 - x * 255 / w) as u8)
+                } else if y == 1 {
+                    // another 160 unique gradient pixels on row 1 -> > 300 distinct colors total
+                    (40, (x * 255 / w) as u8, ((x * 3) % 256) as u8)
+                } else if (20..24).contains(&y) && (10..50).contains(&x) {
+                    // Vivid blue UI accent text (~1% pixels)
+                    (0, 102, 255)
+                } else if (30..34).contains(&y) && (10..50).contains(&x) {
+                    // Vivid red UI accent text (~1% pixels)
+                    (230, 25, 45)
+                } else {
+                    // Flat gray UI canvas
+                    (240, 240, 240)
+                };
+                flat[off] = r;
+                flat[off + 1] = g;
+                flat[off + 2] = b;
+                flat[off + 3] = 255;
+            }
+        }
+
+        let (palette, indexed, cache_len) = quantize_rgba_to_256_with_cache_len(&flat, w, h);
+        assert!(palette.len() <= 256);
+        assert!(cache_len <= MAX_QUANT_LOOKUP_CACHE);
+
+        // (a) Both vivid blue and vivid red UI accents are preserved accurately in the palette
+        let min_blue_dist = palette
+            .iter()
+            .map(|&(r, g, b)| redmean_dist_sq(0, 102, 255, r, g, b))
+            .min()
+            .unwrap();
+        let min_red_dist = palette
+            .iter()
+            .map(|&(r, g, b)| redmean_dist_sq(230, 25, 45, r, g, b))
+            .min()
+            .unwrap();
+        assert!(
+            min_blue_dist <= 200,
+            "blue UI accent lost in palette (min redmean dist = {min_blue_dist})"
+        );
+        assert!(
+            min_red_dist <= 200,
+            "red UI accent lost in palette (min redmean dist = {min_red_dist})"
+        );
+
+        // (b) Interior flat background region (y = 50..95, x = 10..150) has ZERO dither noise (single index)
+        let ref_idx = indexed[50 * w + 10];
+        for y in 50..95 {
+            for x in 10..150 {
+                assert_eq!(
+                    indexed[y * w + x],
+                    ref_idx,
+                    "unexpected dither noise at ({x},{y}) in flat background region"
+                );
+            }
+        }
+
+        // (c) Large smooth gradient with > 20,000 unique RGB colors still respects MAX_QUANT_LOOKUP_CACHE
+        let gw = 200usize;
+        let gh = 160usize;
+        let mut grad = Vec::with_capacity(gw * gh * 4);
+        for y in 0..gh {
+            for x in 0..gw {
+                grad.extend_from_slice(&[
+                    ((x * 255) / gw) as u8,
+                    ((y * 255) / gh) as u8,
+                    (((x * 7 + y * 13) * 3) % 256) as u8,
+                    255,
+                ]);
+            }
+        }
+        let (_gp, _gi, grad_cache_len) = quantize_rgba_to_256_with_cache_len(&grad, gw, gh);
+        assert!(
+            grad_cache_len <= MAX_QUANT_LOOKUP_CACHE,
+            "lookup_cache exceeded cap: {grad_cache_len} > {MAX_QUANT_LOOKUP_CACHE}"
+        );
+    }
+
+    #[test]
+    fn test_halfblock_aspect_ratio_matches_actual_cell_px() {
+        let sq: RgbaImage = ImageBuffer::from_pixel(200, 200, Rgba([60, 140, 220, 255]));
+        let png = encode_png(&DynamicImage::ImageRgba8(sq)).unwrap();
+        let rendered = decode_and_render_halfblocks_with_cell_px(
+            &png,
+            FitBox::contained(40, 20),
+            (0, 0, 0),
+            (9, 22),
+        )
+        .unwrap();
+        let phys_aspect = (rendered.cols as f64 * 9.0) / (rendered.rows as f64 * 22.0);
+        assert!(
+            (0.90..=1.10).contains(&phys_aspect),
+            "expected square physical aspect in 0.90..=1.10 for cell_px=(9,22), got {phys_aspect:.3} ({}x{})",
+            rendered.cols,
+            rendered.rows
+        );
+    }
+
+    #[test]
+    fn test_inline_halfblock_uses_light_theme_bg_for_transparent_png() {
+        let transparent: RgbaImage = ImageBuffer::from_pixel(8, 8, Rgba([0, 0, 0, 0]));
+        let png = encode_png(&DynamicImage::ImageRgba8(transparent)).unwrap();
+        let light_bg = color_to_rgb(Color::Rgb(245, 247, 250), (20, 22, 26));
+        assert_eq!(light_bg, (245, 247, 250));
+        assert_eq!(color_to_rgb(Color::Reset, (245, 247, 250)), (245, 247, 250));
+
+        let rendered = decode_and_render_halfblocks_with_cell_px(
+            &png,
+            FitBox::contained(16, 8),
+            light_bg,
+            (10, 20),
+        )
+        .unwrap();
+        assert!(!rendered.lines.is_empty());
+        for line in &rendered.lines {
+            for span in &line.spans {
+                assert_eq!(span.style.fg, Some(Color::Rgb(245, 247, 250)));
+                assert_eq!(span.style.bg, Some(Color::Rgb(245, 247, 250)));
+            }
+        }
     }
 
     #[test]
@@ -2073,7 +2890,6 @@ mod tests {
 
     #[test]
     fn test_protocol_auto_detection_matrix() {
-        // Explicit preference overrides auto-detection when TEAMS_IMAGE_PROTOCOL is absent or "auto"
         let empty = HashMap::new();
         assert_eq!(
             resolve_protocol_from_env_map(ImageProtocolPreference::Kitty, &empty),
@@ -2149,37 +2965,28 @@ mod tests {
             TerminalImageProtocol::Kitty
         );
 
-        // WezTerm + WT_SESSION both set -> ITerm2 wins over WT_SESSION
+        // WezTerm + WT_SESSION both set -> Kitty wins
         let mut wez_wt_env = HashMap::new();
         wez_wt_env.insert("WEZTERM_EXECUTABLE", "C:\\Program Files\\WezTerm\\wezterm-gui.exe");
         wez_wt_env.insert("WT_SESSION", "00000000-0000-0000-0000-000000000001");
         assert_eq!(
             resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wez_wt_env),
+            TerminalImageProtocol::Kitty
+        );
+
+        // iTerm2 / Rio / Mintty / Hyper remain ITerm2
+        let mut iterm_env = HashMap::new();
+        iterm_env.insert("TERM_PROGRAM", "iTerm.app");
+        assert_eq!(
+            resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &iterm_env),
             TerminalImageProtocol::ITerm2
         );
 
-        // WT_SESSION alone -> Sixel
+        // WT_SESSION alone stays Halfblock statically so Auto always probes DA1 ;4
         let mut wt_only = HashMap::new();
         wt_only.insert("WT_SESSION", "00000000-0000-0000-0000-000000000001");
         assert_eq!(
             resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wt_only),
-            TerminalImageProtocol::Sixel
-        );
-
-        // WT_SESSION inside VS Code / Cursor / Windsurf integrated xterm.js -> Halfblock
-        let mut wt_vscode = HashMap::new();
-        wt_vscode.insert("WT_SESSION", "00000000-0000-0000-0000-000000000001");
-        wt_vscode.insert("TERM_PROGRAM", "vscode");
-        assert_eq!(
-            resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wt_vscode),
-            TerminalImageProtocol::Halfblock
-        );
-
-        let mut wt_vscode_pid = HashMap::new();
-        wt_vscode_pid.insert("WT_SESSION", "00000000-0000-0000-0000-000000000001");
-        wt_vscode_pid.insert("VSCODE_PID", "9876");
-        assert_eq!(
-            resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wt_vscode_pid),
             TerminalImageProtocol::Halfblock
         );
 
@@ -2194,7 +3001,6 @@ mod tests {
 
     #[test]
     fn test_sixel_encoder_solid_and_multiband_and_gradient() {
-        // Solid 10x8 red image: single color, RLE `!`, 2 bands (`-` separator), ST terminator
         let solid: RgbaImage = ImageBuffer::from_pixel(10, 8, Rgba([255, 0, 0, 255]));
         let solid_png = encode_png(&DynamicImage::ImageRgba8(solid)).unwrap();
         let caps = TerminalGraphicsCaps {
@@ -2202,8 +3008,13 @@ mod tests {
             cell_px: (8, 16),
             cell_px_exact: true,
         };
-        let rendered =
-            decode_and_render_for_protocol(&solid_png, 40, 20, (0, 0, 0), caps).unwrap();
+        let rendered = decode_and_render_for_protocol(
+            &solid_png,
+            FitBox::contained(40, 20),
+            (0, 0, 0),
+            caps,
+        )
+        .unwrap();
         assert_eq!(rendered.protocol, TerminalImageProtocol::Sixel);
         assert!(rendered.lines.is_empty());
         let payload = rendered.pixel_payload.as_deref().unwrap();
@@ -2215,7 +3026,6 @@ mod tests {
         assert!(!payload.ends_with('\n'));
         assert!(rendered.approx_heap_bytes() > std::mem::size_of::<RenderedTerminalImage>());
 
-        // Multi-color (>256 unique RGB colors) gradient tests median-cut quantization path
         let grad: RgbaImage = ImageBuffer::from_fn(32, 16, |x, y| {
             Rgba([
                 ((x * 8) % 256) as u8,
@@ -2225,8 +3035,13 @@ mod tests {
             ])
         });
         let grad_png = encode_png(&DynamicImage::ImageRgba8(grad)).unwrap();
-        let grad_rendered =
-            decode_and_render_for_protocol(&grad_png, 20, 10, (12, 24, 36), caps).unwrap();
+        let grad_rendered = decode_and_render_for_protocol(
+            &grad_png,
+            FitBox::contained(20, 10),
+            (12, 24, 36),
+            caps,
+        )
+        .unwrap();
         let grad_payload = grad_rendered.pixel_payload.as_deref().unwrap();
         assert!(grad_payload.starts_with("\x1bP0;1;q\"1;1;"));
         assert!(grad_payload.contains(";2;"));
@@ -2238,19 +3053,21 @@ mod tests {
     fn test_kitty_and_iterm2_tui_vs_cli_stdout_payloads() {
         let png = make_test_png(16, 8);
 
-        // TUI Kitty payload: fixed image id 4242, q=2, c=..., r=..., C=1, no trailing newline
+        // TUI Kitty payload: fixed image id 4242, q=2, single constraining axis (`c=`), C=1, no trailing newline
         let kitty_caps = TerminalGraphicsCaps {
             protocol: TerminalImageProtocol::Kitty,
             cell_px: (8, 16),
             cell_px_exact: true,
         };
         let kitty_tui =
-            decode_and_render_for_protocol(&png, 20, 10, (0, 0, 0), kitty_caps).unwrap();
+            decode_and_render_for_protocol(&png, FitBox::contained(20, 10), (0, 0, 0), kitty_caps)
+                .unwrap();
         let kitty_payload = kitty_tui.pixel_payload.as_deref().unwrap();
         assert!(kitty_payload.starts_with(&format!(
-            "\x1b_Gf=100,a=T,q=2,i={KITTY_PREVIEW_IMAGE_ID},c={},r={},C=1,m=",
-            kitty_tui.cols, kitty_tui.rows
+            "\x1b_Gf=100,a=T,q=2,i={KITTY_PREVIEW_IMAGE_ID},c={},C=1,m=",
+            kitty_tui.cols
         )));
+        assert!(!kitty_payload.split(';').next().unwrap().contains(",r="));
         assert!(kitty_payload.ends_with("\x1b\\"));
         assert!(!kitty_payload.ends_with('\n'));
         assert_eq!(
@@ -2265,7 +3082,8 @@ mod tests {
             cell_px_exact: true,
         };
         let iterm_tui =
-            decode_and_render_for_protocol(&png, 20, 10, (0, 0, 0), iterm_caps).unwrap();
+            decode_and_render_for_protocol(&png, FitBox::contained(20, 10), (0, 0, 0), iterm_caps)
+                .unwrap();
         let iterm_payload = iterm_tui.pixel_payload.as_deref().unwrap();
         assert!(iterm_payload.starts_with(&format!(
             "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=1;doNotMoveCursor=1:",
@@ -2438,7 +3256,6 @@ mod tests {
 
     #[test]
     fn test_terminal_probe_reply_parsers() {
-        // CSI 16 t: height;width -> (width, height)
         assert_eq!(
             parse_csi_cell_size_reply(b"\x1b[6;24;12t"),
             Some((12, 24))
@@ -2449,13 +3266,11 @@ mod tests {
         );
         assert_eq!(parse_csi_cell_size_reply(b"\x1b[6;0;10t"), None);
         assert_eq!(parse_csi_cell_size_reply(b"\x1b[4;1080;1920t"), None);
-        // Extreme values clamp cleanly
         assert_eq!(
             parse_csi_cell_size_reply(b"\x1b[6;500;200t"),
             Some((64, 128))
         );
 
-        // CSI 14 t: window height;width divided by (cols, rows)
         assert_eq!(
             parse_csi_win_size_reply(b"\x1b[4;960;1920t", 160, 40),
             Some((12, 24))
@@ -2467,14 +3282,12 @@ mod tests {
         assert_eq!(parse_csi_win_size_reply(b"\x1b[4;800;1200t", 0, 40), None);
         assert_eq!(parse_csi_win_size_reply(b"\x1b[4;0;1200t", 120, 40), None);
 
-        // Kitty Graphics query OK
         assert!(parse_kitty_query_ok(b"\x1b_Gi=31;OK\x1b\\"));
         assert!(parse_kitty_query_ok(b"\x1b[6;20;10t\x1b_Gi=31,s=1;OK\x07\x1b[?62c"));
         assert!(!parse_kitty_query_ok(b"\x1b_Gi=31;ENOENT:not found\x1b\\"));
         assert!(!parse_kitty_query_ok(b"\x1b_Gi=99;OK\x1b\\"));
         assert!(!parse_kitty_query_ok(b"\x1b[?62;4c"));
 
-        // DA1 Sixel attribute `;4`
         assert!(parse_da1_has_sixel(b"\x1b[?62;1;4;6;9;15;22c"));
         assert!(parse_da1_has_sixel(b"\x1b[6;20;10t\x1b[?64;4c"));
         assert!(!parse_da1_has_sixel(b"\x1b[?64;1;6;14;22c"));
@@ -2492,33 +3305,26 @@ mod tests {
         dyn_img.write_to(&mut jpeg_buf, ImageFormat::Jpeg).unwrap();
         let jpeg_bytes = jpeg_buf.into_inner();
 
-        // Small TUI box (20x10 cells with 8x16 cell_px = 160x160 box),
-        // yet Kitty must preserve full 640x480 resolution so the terminal GPU scales crisply.
         let caps = TerminalGraphicsCaps {
             protocol: TerminalImageProtocol::Kitty,
             cell_px: (8, 16),
             cell_px_exact: true,
         };
-        let rendered =
-            decode_and_render_for_protocol(&jpeg_bytes, 20, 10, (0, 0, 0), caps).unwrap();
+        let rendered = decode_and_render_for_protocol(
+            &jpeg_bytes,
+            FitBox::contained(20, 10),
+            (0, 0, 0),
+            caps,
+        )
+        .unwrap();
         let payload = rendered.pixel_payload.as_deref().unwrap();
-
-        // Reassemble base64 chunks from Kitty APC frames
-        let mut b64 = String::new();
-        for frame in payload.split("\x1b\\") {
-            if let Some((_, chunk)) = frame.split_once(';') {
-                b64.push_str(chunk);
-            }
-        }
-        let decoded_png = B64_STANDARD.decode(&b64).unwrap();
-        let decoded_img = image::load_from_memory(&decoded_png).unwrap();
+        let decoded_img = decode_kitty_payload_png(payload);
         assert_eq!(decoded_img.width(), 640);
         assert_eq!(decoded_img.height(), 480);
     }
 
     #[test]
     fn test_sixel_floyd_steinberg_dithering_smooth_gradient_and_edge_dims() {
-        // 32x16 smooth gradient (>256 unique RGB colors) exercises Floyd-Steinberg diffusion
         let mut flat = Vec::with_capacity(32 * 16 * 4);
         for y in 0..16u32 {
             for x in 0..32u32 {
@@ -2535,7 +3341,6 @@ mod tests {
         assert_eq!(indexed.len(), 32 * 16);
         assert!(indexed.iter().all(|&i| (i as usize) < palette.len()));
 
-        // Edge dimensions: 1x1, 1x8, 8x1 must never panic during error diffusion
         for (w, h) in [(1usize, 1usize), (1, 8), (8, 1)] {
             let buf = vec![128u8; w * h * 4];
             let s = encode_sixel_rgba(&buf, w as u32, h as u32);
@@ -2563,14 +3368,12 @@ mod tests {
         assert!(!looks_like_svg_bytes(html_doc));
         assert!(!looks_like_svg_bytes(&png));
 
-        // MIME/name classifier rejects SVG and HTML even with parameters
         assert!(!is_image_mime_or_name("image/svg+xml", None));
         assert!(!is_image_mime_or_name("image/svg+xml; charset=utf-8", Some("icon.svg")));
         assert!(!is_image_mime_or_name("text/html; charset=utf-8", Some("photo.png")));
         assert!(!is_image_mime_or_name("application/octet-stream", Some("logo.svg")));
         assert!(is_image_mime_or_name("image/png; charset=binary", None));
 
-        // decode_and_render_* return descriptive errors for HTML and SVG bytes
         let html_err = decode_and_render_halfblocks(html_doc, 20, 10, (0, 0, 0))
             .unwrap_err()
             .to_string();
@@ -2592,13 +3395,23 @@ mod tests {
                 cell_px: (8, 16),
                 cell_px_exact: true,
             };
-            let err_h = decode_and_render_for_protocol(html_doc, 20, 10, (0, 0, 0), caps)
-                .unwrap_err()
-                .to_string();
+            let err_h = decode_and_render_for_protocol(
+                html_doc,
+                FitBox::contained(20, 10),
+                (0, 0, 0),
+                caps,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err_h.contains("HTML"));
-            let err_s = decode_and_render_for_protocol(svg_xml, 20, 10, (0, 0, 0), caps)
-                .unwrap_err()
-                .to_string();
+            let err_s = decode_and_render_for_protocol(
+                svg_xml,
+                FitBox::contained(20, 10),
+                (0, 0, 0),
+                caps,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err_s.contains("SVG"));
             assert!(render_ansi_stdout_with_caps(html_doc, 20, 10, caps).is_err());
             assert!(render_ansi_stdout_with_caps(svg_raw, 20, 10, caps).is_err());
@@ -2617,8 +3430,7 @@ mod tests {
                     let (_tw, th, _occ_cols, occ_rows) = compute_pixel_fit_for_protocol(
                         img_w,
                         img_h,
-                        40,
-                        max_rows,
+                        FitBox::contained(40, max_rows),
                         cell_px,
                         TerminalImageProtocol::Sixel,
                     );
@@ -2632,19 +3444,15 @@ mod tests {
             }
         }
 
-        // Erase sequence starts with SGR reset, covers rect expanded by +2/+2 clamped to terminal bounds
         let seq = erase_pixel_rect_sequence(10, 5, 8, 3, 40, 20);
         assert!(seq.starts_with("\x1b[0m"));
-        // rows 5..=9 (y=5, height=3 -> +2 = 5 rows => 1-based rows 6..=10), col 11, width 10 spaces
         assert!(seq.contains("\x1b[6;11H          "));
         assert!(seq.contains("\x1b[10;11H          "));
         assert!(!seq.contains("\x1b[11;11H"));
 
-        // Clamps cleanly to terminal right/bottom edge
         let clamped = erase_pixel_rect_sequence(38, 19, 5, 5, 40, 20);
         assert_eq!(clamped, "\x1b[0m\x1b[20;39H  ");
 
-        // Out-of-bounds or empty returns empty string
         assert!(erase_pixel_rect_sequence(40, 5, 5, 5, 40, 20).is_empty());
         assert!(erase_pixel_rect_sequence(5, 5, 0, 5, 40, 20).is_empty());
         assert_eq!(kitty_delete_all_sequence(), "\x1b_Ga=d,d=A,q=2\x1b\\");
@@ -2652,13 +3460,11 @@ mod tests {
 
     #[test]
     fn test_restore_windows_console_mode_flags_sets_extended_and_clears_quick_edit() {
-        // QuickEdit set without ENABLE_EXTENDED_FLAGS -> clears QuickEdit, sets ExtendedFlags
         let restored = restore_windows_console_mode_flags(0x0040 | 0x0018);
         assert_eq!(restored & WIN_ENABLE_QUICK_EDIT_MODE, 0);
         assert_ne!(restored & WIN_ENABLE_EXTENDED_FLAGS, 0);
         assert_eq!(restored & 0x0018, 0x0018);
 
-        // Zero mode still includes ENABLE_EXTENDED_FLAGS so QuickEdit stays off
         let from_zero = restore_windows_console_mode_flags(0);
         assert_eq!(from_zero, WIN_ENABLE_EXTENDED_FLAGS);
     }
@@ -2684,9 +3490,13 @@ mod tests {
                 cell_px: (8, 16),
                 cell_px_exact: true,
             };
-            // max_rows >= max_cols triggers scrollable tall-image layout
-            let rendered =
-                decode_and_render_for_protocol(&tall_png, 50, 120, (10, 10, 10), caps).unwrap();
+            let rendered = decode_and_render_for_protocol(
+                &tall_png,
+                FitBox::scrollable(50, 16, 100),
+                (10, 10, 10),
+                caps,
+            )
+            .unwrap();
             assert!(
                 rendered.rows > 20,
                 "expected tall rendered rows > 20 for {proto:?}, got {}",
