@@ -1,8 +1,9 @@
 //! TUI entry shell: terminal raw mode, mouse capture, keyboard enhancement, event loop, external editor.
 
 use std::borrow::Cow;
-use std::io::{self, Stdout};
+use std::io::{self, BufWriter, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -10,16 +11,15 @@ use anyhow::Result;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
     DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-    Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
-use crossterm::execute;
+use crossterm::{execute, queue};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, BeginSynchronizedUpdate,
     EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
@@ -318,7 +318,11 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter(
         image_protocol: ImageProtocolPreference,
-    ) -> Result<(Self, Terminal<CrosstermBackend<Stdout>>, TerminalGraphicsCaps)> {
+    ) -> Result<(
+        Self,
+        Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+        TerminalGraphicsCaps,
+    )> {
         #[cfg(windows)]
         let orig_conin_mode = win_console::snapshot_console_mode();
 
@@ -368,7 +372,7 @@ impl TerminalGuard {
             let _ = write_vt_focus_enable(&mut stdout);
         }
 
-        let backend = CrosstermBackend::new(stdout);
+        let backend = CrosstermBackend::new(BufWriter::with_capacity(64 * 1024, stdout));
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
         terminal.clear()?;
@@ -473,6 +477,115 @@ const MAX_COALESCED_EVENTS: usize = 64;
 const ACTIVITY_THROTTLE: Duration = Duration::from_secs(5);
 const PASTE_BURST_POLL: Duration = Duration::from_millis(2);
 const MAX_PASTE_BURST_EVENTS: usize = 4096;
+const EVENT_READER_POLL: Duration = Duration::from_millis(25);
+
+enum ReaderMsg {
+    Event(CrosstermEvent),
+    Eof,
+}
+
+/// Lock-free terminal event reader backed by a dedicated OS thread and Tokio unbounded channel.
+///
+/// Avoids `crossterm::event::EventStream::next().now_or_never()`, which on `crossterm 0.28`
+/// poisons `EventStream`'s background waker with `noop_waker` (causing up to 200ms timer-tick
+/// input stalls) and blocks the main thread on `INTERNAL_EVENT_READER` on Windows until the next
+/// console event arrives.
+struct TerminalEventReader {
+    rx: mpsc::UnboundedReceiver<ReaderMsg>,
+    tx: mpsc::UnboundedSender<ReaderMsg>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TerminalEventReader {
+    fn start() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = Self {
+            rx,
+            tx,
+            stop,
+            handle: None,
+        };
+        reader.resume();
+        reader
+    }
+
+    #[cfg(test)]
+    fn from_channel(
+        tx: mpsc::UnboundedSender<ReaderMsg>,
+        rx: mpsc::UnboundedReceiver<ReaderMsg>,
+    ) -> Self {
+        Self {
+            rx,
+            tx,
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: None,
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+        self.stop.store(false, Ordering::Release);
+        let stop = self.stop.clone();
+        let tx = self.tx.clone();
+        self.handle = std::thread::Builder::new()
+            .name("tui-event-reader".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match crossterm::event::poll(EVENT_READER_POLL) {
+                        Ok(true) => match crossterm::event::read() {
+                            Ok(ev) => {
+                                if tx.send(ReaderMsg::Event(ev)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = tx.send(ReaderMsg::Eof);
+                                break;
+                            }
+                        },
+                        Ok(false) => continue,
+                        Err(_) => {
+                            let _ = tx.send(ReaderMsg::Eof);
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+
+    fn pause(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    async fn recv(&mut self) -> Option<CrosstermEvent> {
+        match self.rx.recv().await {
+            Some(ReaderMsg::Event(ev)) => Some(ev),
+            Some(ReaderMsg::Eof) | None => None,
+        }
+    }
+
+    fn try_recv(&mut self) -> std::result::Result<CrosstermEvent, mpsc::error::TryRecvError> {
+        match self.rx.try_recv() {
+            Ok(ReaderMsg::Event(ev)) => Ok(ev),
+            Ok(ReaderMsg::Eof) => Err(mpsc::error::TryRecvError::Disconnected),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl Drop for TerminalEventReader {
+    fn drop(&mut self) {
+        self.pause();
+    }
+}
 
 #[derive(Debug, Default)]
 struct PasteBurstDetector {
@@ -587,7 +700,7 @@ fn event_invalidates_hitmap(ev: &CrosstermEvent) -> bool {
 
 async fn process_terminal_event_with_burst(
     first_ev: CrosstermEvent,
-    events: &mut Option<EventStream>,
+    events: &mut TerminalEventReader,
     app: &mut AppState,
     ui: &mut UiState,
     dirty: &mut bool,
@@ -637,37 +750,42 @@ async fn process_terminal_event_with_burst(
             .keys
             .iter()
             .any(|k| k.code == KeyCode::Enter && k.modifiers == KeyModifiers::NONE);
-        let stream = events.get_or_insert_with(EventStream::new);
-        let next_ev = match stream.next().now_or_never() {
-            Some(item) => item,
-            None => {
-                // `EventStream::poll_next` already polled with `Duration::ZERO` and woke its
-                // background reader thread. Never call `crossterm::event::poll(Duration::ZERO)`
-                // here — on Windows that contends on `INTERNAL_EVENT_READER` until the next key!
-                if !has_enter {
+        let next_ev = match events.try_recv() {
+            Ok(ev) => Some(ev),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                stream_ended = true;
+                break;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                // Only wait briefly after Enter when Enter would otherwise submit an overlay form.
+                // In the direct inline canvas editor, Enter always inserts a newline, so return immediately.
+                let wait_after_enter =
+                    has_enter && (ui.inline_editor.is_none() || !ui.overlays.is_empty());
+                if !wait_after_enter {
                     break;
                 }
-                match tokio::time::timeout(PASTE_BURST_POLL, stream.next()).await {
-                    Ok(item) => item,
+                match tokio::time::timeout(PASTE_BURST_POLL, events.recv()).await {
+                    Ok(Some(ev)) => Some(ev),
+                    Ok(None) => {
+                        stream_ended = true;
+                        break;
+                    }
                     Err(_) => break,
                 }
             }
         };
         match next_ev {
-            Some(Ok(CrosstermEvent::Key(k))) if k.kind == KeyEventKind::Release => {
+            Some(CrosstermEvent::Key(k)) if k.kind == KeyEventKind::Release => {
                 continue;
             }
-            Some(Ok(CrosstermEvent::Key(k))) if PasteBurstDetector::is_candidate_key(&k) => {
+            Some(CrosstermEvent::Key(k)) if PasteBurstDetector::is_candidate_key(&k) => {
                 detector.push(k);
             }
-            Some(Ok(other)) => {
+            Some(other) => {
                 trailing_event = Some(other);
                 break;
             }
-            Some(Err(_)) | None => {
-                stream_ended = true;
-                break;
-            }
+            None => break,
         }
     }
 
@@ -726,19 +844,26 @@ fn notify_activity_throttled(app: &AppState, last_activity_sent: &mut Option<Ins
 }
 
 fn draw_frame(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     app: &mut AppState,
     ui: &mut UiState,
     guard: &mut TerminalGuard,
 ) -> Result<()> {
     use std::io::Write;
 
-    let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+    let _ = queue!(terminal.backend_mut(), BeginSynchronizedUpdate);
 
     let draw_res: Result<()> = (|| {
         let mut cursor_pos = None;
+        let mut cursor_set_in_draw = false;
         terminal.draw(|frame| {
             cursor_pos = ui::draw(frame, app, ui);
+            if ui.pending_pixel_graphics.is_empty() {
+                if let Some((cx, cy)) = cursor_pos {
+                    frame.set_cursor_position((cx, cy));
+                    cursor_set_in_draw = true;
+                }
+            }
         })?;
 
         // Resolve all desired pixel graphics with overlay Z-order and bottom-row safety guards.
@@ -900,11 +1025,13 @@ fn draw_frame(
 
         guard.pixel_tracker.commit(committed_graphics, term_size);
 
-        if let Some((cx, cy)) = cursor_pos {
-            let _ = terminal.show_cursor();
-            let _ = terminal.set_cursor_position((cx, cy));
-        } else {
-            let _ = terminal.hide_cursor();
+        if plan.erase_and_redraw || plan.emit_desired || plan.erase_in_place_only || !cursor_set_in_draw {
+            if let Some((cx, cy)) = cursor_pos {
+                let _ = terminal.show_cursor();
+                let _ = terminal.set_cursor_position((cx, cy));
+            } else {
+                let _ = terminal.hide_cursor();
+            }
         }
         Ok(())
     })();
@@ -915,7 +1042,7 @@ fn draw_frame(
 
 fn handle_terminal_event(
     ev: CrosstermEvent,
-    events: &mut Option<EventStream>,
+    events: &mut TerminalEventReader,
     app: &mut AppState,
     ui: &mut UiState,
     dirty: &mut bool,
@@ -995,17 +1122,17 @@ fn handle_terminal_event(
             ui.term_height = h;
             *dirty = true;
             // Re-measure cell_px on resize (HiDPI monitor move / font zoom).
-            // On Windows, drop active EventStream before VT probing so stdin has no reader contention,
-            // then re-enforce mouse capture and recreate EventStream.
+            // On Windows, pause the dedicated event reader before VT probing so stdin has no reader contention,
+            // then re-enforce mouse capture and resume the reader.
             #[cfg(windows)]
             {
-                *events = None;
+                events.pause();
                 let _ = img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
                 win_console::enforce_windows_mouse_capture();
                 let mut stdout = io::stdout();
                 let _ = write_vt_mouse_enable(&mut stdout);
                 let _ = write_vt_focus_enable(&mut stdout);
-                *events = Some(EventStream::new());
+                events.resume();
             }
             #[cfg(not(windows))]
             {
@@ -1203,7 +1330,7 @@ pub async fn run_with_persona(
         proxy_nudge_rx,
     );
 
-    let mut events: Option<EventStream> = Some(EventStream::new());
+    let mut events = TerminalEventReader::start();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
@@ -1212,6 +1339,7 @@ pub async fn run_with_persona(
     loop {
         if ui.editor_requested {
             ui.editor_requested = false;
+            events.pause();
             if guard.kitty_used || KITTY_USED_GLOBAL.load(Ordering::Relaxed) {
                 use std::io::Write;
                 let _ = terminal
@@ -1270,6 +1398,7 @@ pub async fn run_with_persona(
                 let _ = write_vt_mouse_enable(&mut stdout);
             }
             terminal.clear()?;
+            events.resume();
             dirty = true;
 
             match result {
@@ -1330,9 +1459,9 @@ pub async fn run_with_persona(
                     dirty = true;
                 }
             }
-            maybe_ev = events.get_or_insert_with(EventStream::new).next() => {
+            maybe_ev = events.recv() => {
                 match maybe_ev {
-                    Some(Ok(ev)) => {
+                    Some(ev) => {
                         match process_terminal_event_with_burst(
                             ev,
                             &mut events,
@@ -1348,7 +1477,7 @@ pub async fn run_with_persona(
                             LoopStep::Continue => {}
                         }
                     }
-                    Some(Err(_)) | None => should_quit = true,
+                    None => should_quit = true,
                 }
             }
         }
@@ -1392,8 +1521,8 @@ pub async fn run_with_persona(
                 }
             }
             while !redraw_immediately && drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
-                match events.get_or_insert_with(EventStream::new).next().now_or_never() {
-                    Some(Some(Ok(ev))) => {
+                match events.try_recv() {
+                    Ok(ev) => {
                         drained += 1;
                         progressed = true;
                         match process_terminal_event_with_burst(
@@ -1417,11 +1546,11 @@ pub async fn run_with_persona(
                             LoopStep::Continue => {}
                         }
                     }
-                    Some(Some(Err(_)) | None) => {
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
                         should_quit = true;
                         break;
                     }
-                    None => break,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
                 }
             }
             if should_quit || redraw_immediately || !progressed {
@@ -1448,6 +1577,7 @@ pub async fn run_with_persona(
     }
     app.html_server.shutdown();
     let _ = sync_ctrl.request(SyncCommand::Shutdown);
+    events.pause();
     drop(guard);
     Ok(())
 }
@@ -1636,5 +1766,65 @@ mod tests {
             &confirm_over_preview,
             "html:node1:w80"
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_event_reader_try_recv_is_non_blocking_and_wakes_immediately() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut reader = TerminalEventReader::from_channel(tx.clone(), rx);
+
+        // Empty queue returns immediately without blocking.
+        let t0 = Instant::now();
+        assert!(matches!(
+            reader.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(t0.elapsed() < Duration::from_millis(5));
+
+        // Async recv wakes immediately on single keystroke without waiting for any tick.
+        let tx_bg = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = tx_bg.send(ReaderMsg::Event(CrosstermEvent::Key(press(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            ))));
+        });
+        let t1 = Instant::now();
+        let ev = tokio::time::timeout(Duration::from_millis(100), reader.recv())
+            .await
+            .expect("recv must wake immediately");
+        assert!(matches!(
+            ev,
+            Some(CrosstermEvent::Key(KeyEvent {
+                code: KeyCode::Char('a'),
+                ..
+            }))
+        ));
+        assert!(t1.elapsed() < Duration::from_millis(80));
+
+        // Subsequent try_recv does not poison future async recv wakers.
+        assert!(matches!(
+            reader.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let _ = tx.send(ReaderMsg::Event(CrosstermEvent::Key(press(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        ))));
+        let ev2 = tokio::time::timeout(Duration::from_millis(50), reader.recv())
+            .await
+            .expect("second recv must wake immediately after try_recv");
+        assert!(matches!(
+            ev2,
+            Some(CrosstermEvent::Key(KeyEvent {
+                code: KeyCode::Char('b'),
+                ..
+            }))
+        ));
+
+        // Explicit EOF reports clean termination even while sender handle exists.
+        let _ = tx.send(ReaderMsg::Eof);
+        assert!(reader.recv().await.is_none());
     }
 }
