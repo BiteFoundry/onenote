@@ -256,8 +256,9 @@ pub fn draw_section_ribbon(
     if active_idx > 0 {
         let mut needed = 0usize;
         for s in sections.iter().take(active_idx + 1).rev() {
-            let tab_txt = format!(" ▌{} ", truncate_clean(&s.display_name, 16));
-            let w = UnicodeWidthStr::width(tab_txt.as_str()) + 3;
+            let short_w = UnicodeWidthStr::width(truncate_clean(&s.display_name, 16).as_str());
+            // `[ ▌name ]` = short_w + 5, plus 1-col trailing space gap = short_w + 6
+            let w = short_w + 6;
             if needed + w > budget_for_tabs && needed > 0 {
                 break;
             }
@@ -275,7 +276,8 @@ pub fn draw_section_ribbon(
     for (idx, sec) in sections.iter().enumerate().skip(start_idx) {
         let is_active = active_section_key == Some(sec.section_key.as_str());
         let short_name = truncate_clean(&sec.display_name, 16);
-        let tab_w = (UnicodeWidthStr::width(short_name.as_str()) + 6) as u16; // `[ ▌name ]`
+        // Rendered width: "[ " (2) + "▌" (1) + short_name (W) + " ]" (2) = W + 5; stride with " " = W + 6
+        let tab_w = (UnicodeWidthStr::width(short_name.as_str()) + 5) as u16;
         if x.saturating_sub(area.x) + tab_w + add_w + 1 > area.width && idx > start_idx {
             break;
         }
@@ -449,6 +451,7 @@ fn draw_page_list_column(
         .border_style(theme.border_style(false));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    hitmap.add(area, HitTarget::PanePages);
 
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -602,6 +605,7 @@ fn draw_note_canvas(
     theme: &Theme,
     hitmap: &mut HitMap,
 ) {
+    hitmap.add(area, HitTarget::PaneCanvas);
     let inner = Rect::new(
         area.x.saturating_add(1),
         area.y,

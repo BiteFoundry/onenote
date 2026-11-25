@@ -531,7 +531,56 @@ impl PasteBurstDetector {
 
 enum LoopStep {
     Continue,
+    RedrawNow,
     Quit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UiLayoutSnapshot {
+    overlays_len: usize,
+    top_overlay_kind: Option<ui::overlays::OverlayKind>,
+    focus: ui::app::Focus,
+    show_nav_rail: bool,
+    density: crate::config::DensityMode,
+    onenote_scroll: usize,
+    onenote_selected_block: usize,
+    active_notebook_key: Option<String>,
+    active_section_key: Option<String>,
+    active_page_key: Option<String>,
+    notebooks_len: usize,
+    sections_len: usize,
+    pages_len: usize,
+}
+
+impl UiLayoutSnapshot {
+    fn capture(app: &AppState, ui: &UiState) -> Self {
+        Self {
+            overlays_len: ui.overlays.len(),
+            top_overlay_kind: ui.overlays.last().map(ui::overlays::Overlay::kind),
+            focus: ui.focus,
+            show_nav_rail: ui.show_nav_rail,
+            density: ui.density,
+            onenote_scroll: ui.onenote_scroll,
+            onenote_selected_block: ui.onenote_selected_block,
+            active_notebook_key: app.active_notebook_key.clone(),
+            active_section_key: app.active_section_key.clone(),
+            active_page_key: app.active_page_key.clone(),
+            notebooks_len: app.notebooks.len(),
+            sections_len: app.sections.len(),
+            pages_len: app.pages.len(),
+        }
+    }
+}
+
+fn event_invalidates_hitmap(ev: &CrosstermEvent) -> bool {
+    match ev {
+        CrosstermEvent::Resize(_, _) => true,
+        CrosstermEvent::Mouse(m) => matches!(
+            m.kind,
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ),
+        _ => false,
+    }
 }
 
 async fn process_terminal_event_with_burst(
@@ -542,17 +591,37 @@ async fn process_terminal_event_with_burst(
     dirty: &mut bool,
     last_activity_sent: &mut Option<Instant>,
 ) -> LoopStep {
+    let before = UiLayoutSnapshot::capture(app, ui);
+    let hitmap_sensitive = event_invalidates_hitmap(&first_ev);
     let CrosstermEvent::Key(first_key) = first_ev else {
-        return handle_terminal_event(first_ev, app, ui, dirty, last_activity_sent);
+        let step = handle_terminal_event(first_ev, app, ui, dirty, last_activity_sent);
+        if matches!(step, LoopStep::Quit) {
+            return LoopStep::Quit;
+        }
+        let after = UiLayoutSnapshot::capture(app, ui);
+        return if hitmap_sensitive || before != after {
+            LoopStep::RedrawNow
+        } else {
+            LoopStep::Continue
+        };
     };
     if !ui.accepts_text_input() || !PasteBurstDetector::is_candidate_key(&first_key) {
-        return handle_terminal_event(
+        let step = handle_terminal_event(
             CrosstermEvent::Key(first_key),
             app,
             ui,
             dirty,
             last_activity_sent,
         );
+        if matches!(step, LoopStep::Quit) {
+            return LoopStep::Quit;
+        }
+        let after = UiLayoutSnapshot::capture(app, ui);
+        return if before != after {
+            LoopStep::RedrawNow
+        } else {
+            LoopStep::Continue
+        };
     }
 
     let mut detector = PasteBurstDetector::default();
@@ -622,7 +691,9 @@ async fn process_terminal_event_with_burst(
         }
     }
 
+    let mut trailing_invalidates = false;
     if let Some(extra) = trailing_event {
+        trailing_invalidates = event_invalidates_hitmap(&extra);
         if matches!(
             handle_terminal_event(extra, app, ui, dirty, last_activity_sent),
             LoopStep::Quit
@@ -633,6 +704,8 @@ async fn process_terminal_event_with_burst(
 
     if stream_ended {
         LoopStep::Quit
+    } else if trailing_invalidates || before != UiLayoutSnapshot::capture(app, ui) {
+        LoopStep::RedrawNow
     } else {
         LoopStep::Continue
     }
@@ -1170,6 +1243,7 @@ pub async fn run_with_persona(
         }
 
         let mut should_quit = false;
+        let mut redraw_immediately = false;
         tokio::select! {
             _ = tick.tick() => {
                 let before = ui.toasts.len();
@@ -1200,19 +1274,19 @@ pub async fn run_with_persona(
             maybe_ev = events.next() => {
                 match maybe_ev {
                     Some(Ok(ev)) => {
-                        if matches!(
-                            process_terminal_event_with_burst(
-                                ev,
-                                &mut events,
-                                &mut app,
-                                &mut ui,
-                                &mut dirty,
-                                &mut last_activity_sent
-                            )
-                            .await,
-                            LoopStep::Quit
-                        ) {
-                            should_quit = true;
+                        match process_terminal_event_with_burst(
+                            ev,
+                            &mut events,
+                            &mut app,
+                            &mut ui,
+                            &mut dirty,
+                            &mut last_activity_sent,
+                        )
+                        .await
+                        {
+                            LoopStep::Quit => should_quit = true,
+                            LoopStep::RedrawNow => redraw_immediately = true,
+                            LoopStep::Continue => {}
                         }
                     }
                     Some(Err(_)) | None => should_quit = true,
@@ -1223,9 +1297,11 @@ pub async fn run_with_persona(
             break;
         }
 
-        // Coalesce burst events (scroll wheel, fast typing, sync batches) before redrawing.
+        // Coalesce burst events (fast typing, sync batches) before redrawing,
+        // but break immediately after mouse clicks/scrolls, resizes, or overlay/navigation/list
+        // changes so the next click never queries a stale `ui.hitmap`.
         let mut drained = 0usize;
-        while drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
+        while !redraw_immediately && drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
             let mut progressed = false;
             while drained < MAX_COALESCED_EVENTS {
                 match core_rx.try_recv() {
@@ -1256,25 +1332,30 @@ pub async fn run_with_persona(
                     Err(_) => break,
                 }
             }
-            while drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
+            while !redraw_immediately && drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
                 match events.next().now_or_never() {
                     Some(Some(Ok(ev))) => {
                         drained += 1;
                         progressed = true;
-                        if matches!(
-                            process_terminal_event_with_burst(
-                                ev,
-                                &mut events,
-                                &mut app,
-                                &mut ui,
-                                &mut dirty,
-                                &mut last_activity_sent
-                            )
-                            .await,
-                            LoopStep::Quit
-                        ) {
-                            should_quit = true;
-                            break;
+                        match process_terminal_event_with_burst(
+                            ev,
+                            &mut events,
+                            &mut app,
+                            &mut ui,
+                            &mut dirty,
+                            &mut last_activity_sent,
+                        )
+                        .await
+                        {
+                            LoopStep::Quit => {
+                                should_quit = true;
+                                break;
+                            }
+                            LoopStep::RedrawNow => {
+                                redraw_immediately = true;
+                                break;
+                            }
+                            LoopStep::Continue => {}
                         }
                     }
                     Some(Some(Err(_)) | None) => {
@@ -1284,7 +1365,7 @@ pub async fn run_with_persona(
                     None => break,
                 }
             }
-            if should_quit || !progressed {
+            if should_quit || redraw_immediately || !progressed {
                 break;
             }
         }

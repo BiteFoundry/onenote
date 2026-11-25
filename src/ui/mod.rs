@@ -115,9 +115,12 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
 
     draw_status_bar(frame, status, app, ui, &mut hitmap);
 
-    // Render overlay stack (bottom to top)
+    // Render overlay stack (bottom to top).
+    // Register a full-screen backdrop before each overlay so only the top-most modal
+    // can receive mouse clicks (preventing click-through to lower modals or main UI).
     let mut overlays = std::mem::take(&mut ui.overlays);
     for ov in &mut overlays {
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         ov.draw(frame, area, app, ui, &mut hitmap);
     }
     ui.overlays = overlays;

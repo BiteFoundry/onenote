@@ -100,6 +100,20 @@ impl ImagePreviewOverlay {
         self.items.get(self.index)
     }
 
+    pub fn current_cache_key(
+        &self,
+        term_width: u16,
+        term_height: u16,
+        proto: TerminalImageProtocol,
+    ) -> Option<String> {
+        let target = self.current()?;
+        let (cols, rows) = self.target_dimensions(term_width, term_height);
+        Some(format!(
+            "hd:{}:{}:{}:{}:{:?}",
+            target.page_key, target.resource_index, cols, rows, proto
+        ))
+    }
+
     pub fn modal_rect(area: Rect) -> Rect {
         centered_rect(
             area,
@@ -236,6 +250,7 @@ impl ImagePreviewOverlay {
         hitmap: &mut HitMap,
     ) {
         let theme = ui.theme.clone();
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         let rect = Self::modal_rect(area);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);

@@ -21,7 +21,7 @@ use crate::{
         action::Action,
         app::UiState,
         composer,
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
         nav_pane::ONENOTE_PURPLE,
         overlays::{centered_rect, OverlayOutcome},
     },
@@ -61,6 +61,8 @@ pub struct OnenoteFormOverlay {
     pub pending_preview: Option<RenderedTerminalImage>,
     pub field: usize,
     pub button_idx: usize,
+    pub body_scroll: usize,
+    pub follow_body_bottom: bool,
     pub error: Option<String>,
 }
 
@@ -74,6 +76,8 @@ impl OnenoteFormOverlay {
             pending_preview: None,
             field: 0,
             button_idx: 0,
+            body_scroll: 0,
+            follow_body_bottom: true,
             error: None,
         }
     }
@@ -90,6 +94,8 @@ impl OnenoteFormOverlay {
             pending_preview: None,
             field: 0,
             button_idx: 0,
+            body_scroll: 0,
+            follow_body_bottom: true,
             error: None,
         }
     }
@@ -107,6 +113,8 @@ impl OnenoteFormOverlay {
             pending_preview: None,
             field: 0,
             button_idx: 0,
+            body_scroll: 0,
+            follow_body_bottom: true,
             error: None,
         }
     }
@@ -123,6 +131,8 @@ impl OnenoteFormOverlay {
             pending_preview: None,
             field: 0,
             button_idx: 0,
+            body_scroll: 0,
+            follow_body_bottom: true,
             error: None,
         }
     }
@@ -148,6 +158,8 @@ impl OnenoteFormOverlay {
             pending_preview: None,
             field: 0,
             button_idx: 0,
+            body_scroll: 0,
+            follow_body_bottom: true,
             error: None,
         }
     }
@@ -196,6 +208,25 @@ impl OnenoteFormOverlay {
             }
             _ => false,
         }
+    }
+
+    pub fn has_multiline_body(&self) -> bool {
+        matches!(
+            self.mode,
+            OnenoteFormMode::CreatePage { .. }
+                | OnenoteFormMode::AppendMarkdown { .. }
+                | OnenoteFormMode::EditBlock { .. }
+        )
+    }
+
+    pub fn focus_submit_button(&mut self) {
+        self.field = self.button_field_index();
+        self.button_idx = 0;
+    }
+
+    pub fn focus_cancel_button(&mut self) {
+        self.field = self.button_field_index();
+        self.button_idx = 1;
     }
 
     pub fn supports_images(&self) -> bool {
@@ -437,8 +468,12 @@ impl OnenoteFormOverlay {
                     }
                     return OverlayOutcome::Handled;
                 }
+                let is_body = self.is_multiline_body_field();
                 if let Some(buf) = self.active_text_mut() {
                     buf.push(*ch);
+                    if is_body {
+                        self.follow_body_bottom = true;
+                    }
                 }
                 OverlayOutcome::Handled
             }
@@ -448,6 +483,7 @@ impl OnenoteFormOverlay {
                 if let Some(buf) = self.active_text_mut() {
                     if is_body {
                         buf.push_str(&composer::normalize(text));
+                        self.follow_body_bottom = true;
                     } else {
                         buf.push_str(&text.replace(['\r', '\n'], " "));
                     }
@@ -457,6 +493,9 @@ impl OnenoteFormOverlay {
             Action::PasteClipboard => {
                 self.error = None;
                 self.paste_from_system_clipboard();
+                if self.is_multiline_body_field() {
+                    self.follow_body_bottom = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::ClearPendingImages => {
@@ -466,8 +505,12 @@ impl OnenoteFormOverlay {
             }
             Action::Backspace => {
                 self.error = None;
+                let is_body = self.is_multiline_body_field();
                 if let Some(buf) = self.active_text_mut() {
                     buf.pop();
+                    if is_body {
+                        self.follow_body_bottom = true;
+                    }
                 }
                 OverlayOutcome::Handled
             }
@@ -476,6 +519,7 @@ impl OnenoteFormOverlay {
                     if let Some(buf) = self.active_text_mut() {
                         buf.push('\n');
                     }
+                    self.follow_body_bottom = true;
                     OverlayOutcome::Handled
                 } else {
                     self.submit()
@@ -488,6 +532,35 @@ impl OnenoteFormOverlay {
             }
             Action::PrevFocus => {
                 self.field = (self.field + total_fields - 1) % total_fields;
+                OverlayOutcome::Handled
+            }
+            Action::MoveDown if self.is_multiline_body_field() => {
+                self.body_scroll = self.body_scroll.saturating_add(1);
+                OverlayOutcome::Handled
+            }
+            Action::MoveUp if self.is_multiline_body_field() => {
+                self.body_scroll = self.body_scroll.saturating_sub(1);
+                self.follow_body_bottom = false;
+                OverlayOutcome::Handled
+            }
+            Action::PageDown if self.is_multiline_body_field() => {
+                self.body_scroll = self.body_scroll.saturating_add(6);
+                OverlayOutcome::Handled
+            }
+            Action::PageUp if self.is_multiline_body_field() => {
+                self.body_scroll = self.body_scroll.saturating_sub(6);
+                self.follow_body_bottom = false;
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } if self.has_multiline_body() => {
+                if *delta < 0 {
+                    self.body_scroll = self
+                        .body_scroll
+                        .saturating_sub(delta.unsigned_abs() as usize);
+                    self.follow_body_bottom = false;
+                } else {
+                    self.body_scroll = self.body_scroll.saturating_add(*delta as usize);
+                }
                 OverlayOutcome::Handled
             }
             Action::MoveDown if !self.is_multiline_body_field() => {
@@ -514,6 +587,7 @@ impl OnenoteFormOverlay {
                     if let Some(buf) = self.active_text_mut() {
                         buf.push('\n');
                     }
+                    self.follow_body_bottom = true;
                     return OverlayOutcome::Handled;
                 }
                 if matches!(
@@ -526,7 +600,7 @@ impl OnenoteFormOverlay {
                 OverlayOutcome::Handled
             }
             Action::CloseOverlay => OverlayOutcome::Close,
-            Action::Quit => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
         }
     }
@@ -567,8 +641,9 @@ impl OnenoteFormOverlay {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         let is_compact = matches!(
             self.mode,
             OnenoteFormMode::CreateNotebook | OnenoteFormMode::CreateSection { .. }
@@ -586,6 +661,7 @@ impl OnenoteFormOverlay {
 
         let rect = centered_rect(area, modal_w, modal_h);
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
 
         let title = self.header_title();
         let block = Block::default()
@@ -732,16 +808,32 @@ impl OnenoteFormOverlay {
             Paragraph::new(btn_line),
             Rect::new(inner.x, footer_y, inner.width, 1),
         );
-        hitmap.add_line(
-            inner.x,
-            footer_y,
-            UnicodeWidthStr::width(submit_label) as u16,
-            HitTarget::OverlayItem { index: btn_field },
-        );
+        let submit_w = (UnicodeWidthStr::width(submit_label) as u16).min(inner.width);
+        if submit_w > 0 {
+            hitmap.add_line(
+                inner.x,
+                footer_y,
+                submit_w,
+                HitTarget::Button(ButtonId::FormSubmit),
+            );
+        }
+        let cancel_x = inner.x.saturating_add(submit_w + 2);
+        if cancel_x < inner.right() {
+            let cancel_w = (UnicodeWidthStr::width(cancel_label) as u16)
+                .min(inner.right().saturating_sub(cancel_x));
+            if cancel_w > 0 {
+                hitmap.add_line(
+                    cancel_x,
+                    footer_y,
+                    cancel_w,
+                    HitTarget::Button(ButtonId::FormCancel),
+                );
+            }
+        }
     }
 
     fn draw_markdown_editor_box(
-        &self,
+        &mut self,
         frame: &mut Frame,
         inner: Rect,
         y: &mut u16,
@@ -793,9 +885,18 @@ impl OnenoteFormOverlay {
             self.body.split('\n').collect()
         };
         let visible = avail_h as usize;
-        let start = raw_lines.len().saturating_sub(visible);
+        let max_scroll = raw_lines.len().saturating_sub(visible);
+        if self.follow_body_bottom {
+            self.body_scroll = max_scroll;
+        } else {
+            self.body_scroll = self.body_scroll.min(max_scroll);
+            if self.body_scroll == max_scroll {
+                self.follow_body_bottom = true;
+            }
+        }
+        let start = self.body_scroll;
         let mut rendered_lines = Vec::with_capacity(visible);
-        for (i, line_str) in raw_lines.iter().enumerate().skip(start) {
+        for (i, line_str) in raw_lines.iter().enumerate().skip(start).take(visible) {
             let is_last = i + 1 == raw_lines.len();
             if focused && is_last {
                 rendered_lines.push(Line::from(vec![

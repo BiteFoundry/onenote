@@ -59,6 +59,7 @@ pub enum Action {
     CloseOverlay,
     OpenOverlay(OverlayKind),
     OpenSearch,
+    OpenSearchWithQuery(String),
     OpenFilePicker,
     OpenLinkExtractor,
     OpenImagePreview,
@@ -133,11 +134,33 @@ pub enum Action {
 
     // Mouse
     MouseClick { target: HitTarget, col: u16, row: u16 },
+    MouseRightClick { col: u16, row: u16 },
     MouseScroll { delta: i32, column: u16, row: u16 },
 }
 
 /// Dispatches an `Action` against `AppState` and `UiState`. Returns `true` when the TUI should quit.
 pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
+    // Block right-clicks while any modal overlay is open, except when replacing an open ContextMenu
+    // by right-clicking outside the menu itself.
+    if let Action::MouseRightClick { col, row } = action {
+        if !ui.overlays.is_empty() {
+            if ui.overlays.len() == 1
+                && matches!(ui.overlays.last(), Some(Overlay::ContextMenu(_)))
+            {
+                if matches!(
+                    ui.hitmap.hit(row, col),
+                    Some(HitTarget::OverlayBody | HitTarget::OverlayItem { .. })
+                ) {
+                    return false;
+                }
+                ui.overlays.pop();
+            } else {
+                return false;
+            }
+        }
+        return dispatch_inner(Action::MouseRightClick { col, row }, app, ui);
+    }
+
     // Allow top overlay to handle actions first unless it's a direct mouse click outside.
     if !ui.overlays.is_empty() && !matches!(action, Action::MouseClick { .. } | Action::MouseScroll { .. }) {
         // Special case: Ctrl+F inside OnenoteForm opens FilePicker on top of OnenoteForm!
@@ -158,16 +181,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         let outcome = if let Some(mut top) = ui.overlays.pop() {
             let outcome = top.handle(&action, app, ui);
             match &outcome {
-                OverlayOutcome::Close | OverlayOutcome::CloseAndDispatch(_) => {
-                    // Auto-stash draft if closing a OneNote form via Esc
-                    if matches!(action, Action::CloseOverlay) {
-                        if let Overlay::OnenoteForm(ref form) = top {
-                            if let Some((key, entry)) = form.draft_entry_snapshot() {
-                                app.save_draft_entry(key, entry);
-                            }
+                OverlayOutcome::Close => {
+                    // Auto-stash draft whenever a OneNote form is closed without submitting
+                    // (Esc, backdrop click, Cancel button click, or Enter/Space on Cancel).
+                    if let Overlay::OnenoteForm(ref form) = top {
+                        if let Some((key, entry)) = form.draft_entry_snapshot() {
+                            app.save_draft_entry(key, entry);
                         }
                     }
                 }
+                OverlayOutcome::CloseAndDispatch(_) => {}
                 _ => {
                     ui.overlays.push(top);
                 }
@@ -285,28 +308,80 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
             false
         }
         Action::PageUp => {
-            ui.onenote_scroll = ui.onenote_scroll.saturating_sub(12);
-            ui.onenote_follow_selection = false;
+            match ui.focus {
+                Focus::Nav => move_notebook_selection(app, ui, -8),
+                Focus::Pages => move_page_selection(app, ui, -8),
+                Focus::Canvas | Focus::Overlay => {
+                    ui.onenote_scroll = ui.onenote_scroll.saturating_sub(12);
+                    ui.onenote_follow_selection = false;
+                }
+            }
             false
         }
         Action::PageDown => {
-            ui.onenote_scroll = ui.onenote_scroll.saturating_add(12);
-            ui.onenote_follow_selection = false;
+            match ui.focus {
+                Focus::Nav => move_notebook_selection(app, ui, 8),
+                Focus::Pages => move_page_selection(app, ui, 8),
+                Focus::Canvas | Focus::Overlay => {
+                    ui.onenote_scroll = ui.onenote_scroll.saturating_add(12);
+                    ui.onenote_follow_selection = false;
+                }
+            }
             false
         }
         Action::ScrollTop => {
-            ui.onenote_scroll = 0;
-            ui.onenote_selected_block = 0;
-            ui.onenote_follow_selection = false;
+            match ui.focus {
+                Focus::Nav => {
+                    if let Some(first) = app.notebooks.first() {
+                        let key = first.notebook_key.clone();
+                        if app.active_notebook_key.as_deref() != Some(key.as_str()) {
+                            app.select_notebook(key, ui);
+                        }
+                    }
+                }
+                Focus::Pages => {
+                    if let Some(first) = app.pages.first() {
+                        let key = first.page_key.clone();
+                        if app.active_page_key.as_deref() != Some(key.as_str()) {
+                            app.select_page(key, ui);
+                        }
+                    }
+                }
+                Focus::Canvas | Focus::Overlay => {
+                    ui.onenote_scroll = 0;
+                    ui.onenote_selected_block = 0;
+                    ui.onenote_follow_selection = false;
+                }
+            }
             false
         }
         Action::ScrollBottom => {
-            let block_count = app
-                .active_page_detail()
-                .map(|d| d.blocks.len())
-                .unwrap_or(0);
-            ui.onenote_selected_block = block_count.saturating_sub(1);
-            ui.onenote_follow_selection = true;
+            match ui.focus {
+                Focus::Nav => {
+                    if let Some(last) = app.notebooks.last() {
+                        let key = last.notebook_key.clone();
+                        if app.active_notebook_key.as_deref() != Some(key.as_str()) {
+                            app.select_notebook(key, ui);
+                        }
+                    }
+                }
+                Focus::Pages => {
+                    if let Some(last) = app.pages.last() {
+                        let key = last.page_key.clone();
+                        if app.active_page_key.as_deref() != Some(key.as_str()) {
+                            app.select_page(key, ui);
+                        }
+                    }
+                }
+                Focus::Canvas | Focus::Overlay => {
+                    let block_count = app
+                        .active_page_detail()
+                        .map(|d| d.blocks.len())
+                        .unwrap_or(0);
+                    ui.onenote_selected_block = block_count.saturating_sub(1);
+                    ui.onenote_follow_selection = true;
+                }
+            }
             false
         }
         Action::Activate => {
@@ -361,6 +436,7 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
             false
         }
         Action::CloseOverlay => {
+            app.cancel_pending_html_resource_load();
             ui.overlays.pop();
             false
         }
@@ -368,7 +444,11 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
             match kind {
                 OverlayKind::CommandPalette => ui.overlays.push(Overlay::command_palette()),
                 OverlayKind::Settings => ui.overlays.push(Overlay::settings()),
-                OverlayKind::Search => ui.overlays.push(Overlay::search()),
+                OverlayKind::Search => {
+                    app.search_query.clear();
+                    app.search_results.clear();
+                    ui.overlays.push(Overlay::search());
+                }
                 OverlayKind::Attachments => ui.overlays.push(Overlay::attachments()),
                 OverlayKind::PathInput => ui.overlays.push(Overlay::path_input()),
                 OverlayKind::FilePicker => ui.overlays.push(Overlay::file_picker()),
@@ -381,7 +461,21 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
             false
         }
         Action::OpenSearch => {
+            app.search_query.clear();
+            app.search_results.clear();
             ui.overlays.push(Overlay::search());
+            false
+        }
+        Action::OpenSearchWithQuery(query) => {
+            app.search_query = query.clone();
+            app.search_results = if query.trim().is_empty() {
+                Vec::new()
+            } else {
+                app.storage
+                    .search_onenote_pages(&query, None, 40)
+                    .unwrap_or_default()
+            };
+            ui.overlays.push(Overlay::search_with_query(query));
             false
         }
         Action::OpenFilePicker => {
@@ -497,10 +591,84 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
             false
         }
         Action::OpenContextMenu { col, row } => {
+            if !ui.overlays.is_empty() {
+                return false;
+            }
             let target = match ui.focus {
                 Focus::Pages => ContextTarget::PageItem,
                 Focus::Canvas => ContextTarget::CanvasBlock,
                 _ => ContextTarget::Global,
+            };
+            let menu = ContextMenu::build(target, (col, row), app, ui);
+            ui.overlays.push(Overlay::context_menu(menu));
+            false
+        }
+        Action::MouseRightClick { col, row } => {
+            if !ui.overlays.is_empty() {
+                return false;
+            }
+            let target = match ui.hitmap.hit_under_overlay(row, col) {
+                Some(HitTarget::OnenotePageItem(idx)) => {
+                    ui.focus = Focus::Pages;
+                    sync_narrow_from_focus(ui);
+                    if let Some(p) = app.pages.get(idx) {
+                        let key = p.page_key.clone();
+                        if app.active_page_key.as_deref() != Some(key.as_str()) {
+                            app.select_page(key, ui);
+                        }
+                    }
+                    ContextTarget::PageItem
+                }
+                Some(HitTarget::PanePages) => {
+                    ui.focus = Focus::Pages;
+                    sync_narrow_from_focus(ui);
+                    ContextTarget::PageItem
+                }
+                Some(HitTarget::OnenoteBlock(idx) | HitTarget::OnenoteTodoToggle(idx)) => {
+                    ui.focus = Focus::Canvas;
+                    sync_narrow_from_focus(ui);
+                    ui.onenote_selected_block = idx;
+                    ContextTarget::CanvasBlock
+                }
+                Some(HitTarget::OnenoteResource(_) | HitTarget::PaneCanvas) => {
+                    ui.focus = Focus::Canvas;
+                    sync_narrow_from_focus(ui);
+                    ContextTarget::CanvasBlock
+                }
+                Some(HitTarget::NavRow(idx)) => {
+                    ui.focus = Focus::Nav;
+                    sync_narrow_from_focus(ui);
+                    if let Some(nb) = app.notebooks.get(idx) {
+                        let key = nb.notebook_key.clone();
+                        if app.active_notebook_key.as_deref() != Some(key.as_str()) {
+                            app.select_notebook(key, ui);
+                        }
+                    }
+                    ContextTarget::Global
+                }
+                Some(HitTarget::PaneNav) => {
+                    ui.focus = Focus::Nav;
+                    sync_narrow_from_focus(ui);
+                    ContextTarget::Global
+                }
+                Some(HitTarget::OnenoteSectionTab(idx)) => {
+                    let secs: Vec<String> = app
+                        .sections_for_active_notebook()
+                        .into_iter()
+                        .map(|s| s.section_key.clone())
+                        .collect();
+                    if let Some(sk) = secs.get(idx) {
+                        if app.active_section_key.as_deref() != Some(sk.as_str()) {
+                            app.select_section(sk.clone(), ui);
+                        }
+                    }
+                    ContextTarget::Global
+                }
+                _ => match ui.focus {
+                    Focus::Pages => ContextTarget::PageItem,
+                    Focus::Canvas => ContextTarget::CanvasBlock,
+                    _ => ContextTarget::Global,
+                },
             };
             let menu = ContextMenu::build(target, (col, row), app, ui);
             ui.overlays.push(Overlay::context_menu(menu));
@@ -731,10 +899,13 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
         }
         Action::SearchLocalPages(query) => {
             app.search_query = query.clone();
-            app.search_results = app
-                .storage
-                .search_onenote_pages(&query, None, 40)
-                .unwrap_or_default();
+            app.search_results = if query.trim().is_empty() {
+                Vec::new()
+            } else {
+                app.storage
+                    .search_onenote_pages(&query, None, 40)
+                    .unwrap_or_default()
+            };
             false
         }
         Action::JumpToSearchHit(idx) => {
@@ -902,7 +1073,10 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                 let _ = preview.handle(&Action::MouseScroll { delta, column, row });
                 return false;
             }
-            if matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))) {
+            if matches!(
+                ui.overlays.last(),
+                Some(Overlay::HtmlPreview(_) | Overlay::OnenoteForm(_) | Overlay::Help(_))
+            ) {
                 if let Some(mut top) = ui.overlays.pop() {
                     let _ = top.handle(&Action::MouseScroll { delta, column, row }, app, ui);
                     ui.overlays.push(top);
@@ -918,10 +1092,10 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                 return dispatch(act, app, ui);
             }
             match ui.hitmap.hit(row, column) {
-                Some(HitTarget::NavRow(_)) => {
+                Some(HitTarget::NavRow(_) | HitTarget::PaneNav) => {
                     move_notebook_selection(app, ui, if delta < 0 { -1 } else { 1 });
                 }
-                Some(HitTarget::OnenotePageItem(_)) => {
+                Some(HitTarget::OnenotePageItem(_) | HitTarget::PanePages) => {
                     move_page_selection(app, ui, if delta < 0 { -1 } else { 1 });
                 }
                 _ => {
@@ -975,10 +1149,11 @@ fn move_notebook_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
         .as_deref()
         .and_then(|k| app.notebooks.iter().position(|n| n.notebook_key == k))
         .unwrap_or(0);
+    let step = delta.unsigned_abs() as usize;
     let next = if delta < 0 {
-        cur.saturating_sub(1)
+        cur.saturating_sub(step)
     } else {
-        (cur + 1).min(app.notebooks.len() - 1)
+        cur.saturating_add(step).min(app.notebooks.len() - 1)
     };
     if let Some(nb) = app.notebooks.get(next) {
         let key = nb.notebook_key.clone();
@@ -997,10 +1172,11 @@ fn move_page_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
         .as_deref()
         .and_then(|k| app.pages.iter().position(|p| p.page_key == k))
         .unwrap_or(0);
+    let step = delta.unsigned_abs() as usize;
     let next = if delta < 0 {
-        cur.saturating_sub(1)
+        cur.saturating_sub(step)
     } else {
-        (cur + 1).min(app.pages.len() - 1)
+        cur.saturating_add(step).min(app.pages.len() - 1)
     };
     if let Some(p) = app.pages.get(next) {
         let key = p.page_key.clone();
@@ -1018,10 +1194,7 @@ fn handle_mouse_click(
     ui: &mut UiState,
 ) -> bool {
     match target {
-        HitTarget::OverlayBackdrop => {
-            ui.overlays.pop();
-            false
-        }
+        HitTarget::OverlayBackdrop => dispatch(Action::CloseOverlay, app, ui),
         HitTarget::OverlayBody => {
             if matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))) {
                 let outcome = if let Some(Overlay::HtmlPreview(mut preview)) = ui.overlays.pop() {
@@ -1044,14 +1217,40 @@ fn handle_mouse_click(
             false
         }
         HitTarget::OverlayItem { index } => {
+            let is_form = matches!(ui.overlays.last(), Some(Overlay::OnenoteForm(_)));
             if let Some(top) = ui.overlays.last_mut() {
                 top.select(index);
             }
-            dispatch(Action::Activate, app, ui)
+            if is_form {
+                // Clicking a text input field in OnenoteForm only focuses that field;
+                // never submit, jump focus away, or insert '\n'.
+                false
+            } else {
+                dispatch(Action::Activate, app, ui)
+            }
+        }
+        HitTarget::PaneNav => {
+            ui.overlays.clear();
+            ui.focus = Focus::Nav;
+            sync_narrow_from_focus(ui);
+            false
+        }
+        HitTarget::PanePages => {
+            ui.overlays.clear();
+            ui.focus = Focus::Pages;
+            sync_narrow_from_focus(ui);
+            false
+        }
+        HitTarget::PaneCanvas => {
+            ui.overlays.clear();
+            ui.focus = Focus::Canvas;
+            sync_narrow_from_focus(ui);
+            false
         }
         HitTarget::NavRow(idx) => {
             ui.overlays.clear();
             ui.focus = Focus::Nav;
+            sync_narrow_from_focus(ui);
             if let Some(nb) = app.notebooks.get(idx) {
                 let key = nb.notebook_key.clone();
                 app.select_notebook(key, ui);
@@ -1073,6 +1272,7 @@ fn handle_mouse_click(
         HitTarget::OnenotePageItem(idx) => {
             ui.overlays.clear();
             ui.focus = Focus::Pages;
+            sync_narrow_from_focus(ui);
             if let Some(p) = app.pages.get(idx) {
                 let key = p.page_key.clone();
                 app.select_page(key, ui);
@@ -1082,12 +1282,14 @@ fn handle_mouse_click(
         HitTarget::OnenoteBlock(idx) => {
             ui.overlays.clear();
             ui.focus = Focus::Canvas;
+            sync_narrow_from_focus(ui);
             ui.onenote_selected_block = idx;
             false
         }
         HitTarget::OnenoteTodoToggle(idx) => {
             ui.overlays.clear();
             ui.focus = Focus::Canvas;
+            sync_narrow_from_focus(ui);
             ui.onenote_selected_block = idx;
             app.spawn_toggle_todo(idx, ui);
             false
@@ -1116,6 +1318,8 @@ fn handle_mouse_click(
                 btn,
                 ButtonId::ConfirmOk
                     | ButtonId::ConfirmCancel
+                    | ButtonId::FormSubmit
+                    | ButtonId::FormCancel
                     | ButtonId::HtmlToggleRaw
                     | ButtonId::HtmlServeBrowser
             ) {
@@ -1123,7 +1327,27 @@ fn handle_mouse_click(
             }
             match btn {
                 ButtonId::ConfirmOk => dispatch(Action::Activate, app, ui),
-                ButtonId::ConfirmCancel => dispatch(Action::CloseOverlay, app, ui),
+                ButtonId::ConfirmCancel => {
+                    if matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))) {
+                        // `[✕ Esc]` closes HtmlPreview immediately even while editing an `<input>`.
+                        ui.overlays.pop();
+                        false
+                    } else {
+                        dispatch(Action::CloseOverlay, app, ui)
+                    }
+                }
+                ButtonId::FormSubmit => {
+                    if let Some(Overlay::OnenoteForm(ref mut form)) = ui.overlays.last_mut() {
+                        form.focus_submit_button();
+                    }
+                    dispatch(Action::OverlaySubmit, app, ui)
+                }
+                ButtonId::FormCancel => {
+                    if let Some(Overlay::OnenoteForm(ref mut form)) = ui.overlays.last_mut() {
+                        form.focus_cancel_button();
+                    }
+                    dispatch(Action::CloseOverlay, app, ui)
+                }
                 ButtonId::HtmlPreview => dispatch(Action::OpenHtmlPreview, app, ui),
                 ButtonId::HtmlToggleRaw => {
                     if let Some(Overlay::HtmlPreview(ref mut preview)) = ui.overlays.last_mut() {
@@ -1630,21 +1854,611 @@ mod tests {
                 .is_none()
         );
 
-        // Simulate ImagePreview open -> ImageRoutedToHtml arrives -> swaps ImagePreview for HtmlPreview
+        // Simulate ImagePreview open -> stale key ignored, matching key swaps ImagePreview for HtmlPreview
         let detail = app.active_page_detail().unwrap();
         let img_ov = ImagePreviewOverlay::from_onenote_page(detail, Some(2)).unwrap();
+        let expected_key = img_ov
+            .current_cache_key(ui.term_width, ui.term_height, ui.graphics_caps.protocol)
+            .unwrap();
         ui.overlays.push(Overlay::ImagePreview(img_ov));
-        app.inflight_images.insert("hd:key".to_string());
+        app.inflight_images.insert("hd:stale".to_string());
         app.handle_ui_msg(
             &mut ui,
             UiMsg::ImageRoutedToHtml {
-                cache_key: "hd:key".to_string(),
+                cache_key: "hd:stale".to_string(),
+                title: "stale.html".to_string(),
+                html: "<p>stale</p>".to_string(),
+            },
+        );
+        assert!(!app.inflight_images.contains("hd:stale"));
+        assert!(matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))));
+
+        app.inflight_images.insert(expected_key.clone());
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ImageRoutedToHtml {
+                cache_key: expected_key.clone(),
                 title: "photo.png".to_string(),
                 html: sniffed.unwrap(),
             },
         );
-        assert!(!app.inflight_images.contains("hd:key"));
+        assert!(!app.inflight_images.contains(&expected_key));
         assert_eq!(ui.overlays.len(), 1);
         assert!(matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))));
+    }
+
+    #[test]
+    fn test_stacked_confirm_backdrop_click_does_not_quit_or_lose_form_draft() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+
+        // Open CreatePage form and enter unsaved draft text
+        dispatch(Action::OpenOnenoteCreatePage { level: 0 }, &mut app, &mut ui);
+        if let Some(Overlay::OnenoteForm(ref mut form)) = ui.overlays.last_mut() {
+            form.title = "Important Draft".to_string();
+            form.body = "Do not lose this body".to_string();
+        }
+        // Stack Quit ConfirmDialog on top of OnenoteForm
+        dispatch(Action::QuitConfirm, &mut app, &mut ui);
+        assert_eq!(ui.overlays.len(), 2);
+
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // Right-click while modal is open must be blocked (no ContextMenu pushed)
+        let rclick = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        if let Some(act) = crate::ui::event::mouse_to_action(rclick, &ui.hitmap) {
+            assert!(!dispatch(act, &mut app, &mut ui));
+        }
+        assert_eq!(ui.overlays.len(), 2);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::Confirm(_))));
+
+        // Clicking outside ConfirmDialog hits OverlayBackdrop, closes ONLY ConfirmDialog, does NOT quit
+        let hit = ui.hitmap.hit(0, 0).expect("backdrop must cover (0,0)");
+        assert_eq!(hit, HitTarget::OverlayBackdrop);
+        let quit = dispatch(
+            Action::MouseClick {
+                target: hit,
+                col: 0,
+                row: 0,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(!quit, "backdrop click must never trigger Quit");
+        assert_eq!(ui.overlays.len(), 1);
+        match ui.overlays.last() {
+            Some(Overlay::OnenoteForm(form)) => {
+                assert_eq!(form.title, "Important Draft");
+                assert_eq!(form.body, "Do not lose this body");
+            }
+            other => panic!("expected OnenoteForm preserved underneath, got {other:?}"),
+        }
+
+        // Redraw with only OnenoteForm open -> clicking outside closes form and stashes draft cleanly
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+        let form_backdrop = ui.hitmap.hit(0, 0).unwrap();
+        assert_eq!(form_backdrop, HitTarget::OverlayBackdrop);
+        dispatch(
+            Action::MouseClick {
+                target: form_backdrop,
+                col: 0,
+                row: 0,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.overlays.is_empty());
+        let stashed = app
+            .drafts
+            .get_note("create:me|sec1")
+            .expect("backdrop close of OnenoteForm must stash draft");
+        assert_eq!(stashed.title, "Important Draft");
+        assert_eq!(stashed.body, "Do not lose this body");
+    }
+
+    #[test]
+    fn test_onenote_form_field_clicks_focus_without_submit_or_newline_and_cancel_and_scroll() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+
+        dispatch(Action::OpenOnenoteCreatePage { level: 0 }, &mut app, &mut ui);
+        if let Some(Overlay::OnenoteForm(ref mut form)) = ui.overlays.last_mut() {
+            form.title = "My Note".to_string();
+            form.body = (1..=30)
+                .map(|i| format!("Line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            form.field = 2; // buttons
+        }
+
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // Modal registers OverlayBody, FormSubmit, FormCancel
+        assert!(ui.hitmap.region_of(HitTarget::OverlayBody).is_some());
+        let submit_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::FormSubmit))
+            .expect("FormSubmit button must be registered");
+        let cancel_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::FormCancel))
+            .expect("FormCancel button must be registered");
+        assert!(cancel_rect.x > submit_rect.x);
+
+        // Click title field (index 0): focuses field 0, does NOT jump focus or submit
+        let title_rect = ui
+            .hitmap
+            .region_of(HitTarget::OverlayItem { index: 0 })
+            .unwrap();
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::OverlayItem { index: 0 },
+                col: title_rect.x,
+                row: title_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        let Some(Overlay::OnenoteForm(form)) = ui.overlays.last() else {
+            panic!("form must stay open on title click");
+        };
+        assert_eq!(form.field, 0);
+
+        // Click body field (index 1): focuses field 1, does NOT append '\n'
+        let body_before = form.body.clone();
+        let body_rect = ui
+            .hitmap
+            .region_of(HitTarget::OverlayItem { index: 1 })
+            .unwrap();
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::OverlayItem { index: 1 },
+                col: body_rect.x,
+                row: body_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        let Some(Overlay::OnenoteForm(form)) = ui.overlays.last() else {
+            panic!("form must stay open on body click");
+        };
+        assert_eq!(form.field, 1);
+        assert_eq!(form.body, body_before, "clicking body field must not insert newline");
+
+        // Wheel scroll up moves body_scroll up
+        let scroll_at_bottom = form.body_scroll;
+        assert!(scroll_at_bottom > 0, "30-line body must have positive bottom scroll");
+        dispatch(
+            Action::MouseScroll {
+                delta: -3,
+                column: body_rect.x,
+                row: body_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        let Some(Overlay::OnenoteForm(form)) = ui.overlays.last() else {
+            panic!("form must stay open on wheel scroll");
+        };
+        assert!(form.body_scroll < scroll_at_bottom);
+        assert!(!form.follow_body_bottom);
+
+        // Click Cancel button -> closes form and stashes draft cleanly
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::FormCancel),
+                col: cancel_rect.x,
+                row: cancel_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.overlays.is_empty());
+        assert_eq!(
+            app.drafts.get_note("create:me|sec1").map(|d| d.title.as_str()),
+            Some("My Note")
+        );
+    }
+
+    #[test]
+    fn test_right_click_selects_clicked_page_before_opening_context_menu() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        app.pages.push(OnenotePageSummary {
+            page_key: "me|p2".to_string(),
+            id: "p2".to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec1".to_string(),
+            section_name: Some("Notes".to_string()),
+            notebook_id: Some("nb1".to_string()),
+            notebook_name: Some("Eng".to_string()),
+            title: "Page 2".to_string(),
+            level: 0,
+            order: 1,
+            created_at: None,
+            last_modified_at: None,
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        });
+        assert_eq!(app.active_page_key.as_deref(), Some("me|p1"));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        let p2_rect = ui
+            .hitmap
+            .region_of(HitTarget::OnenotePageItem(1))
+            .expect("second page row must be registered");
+        let rclick = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: p2_rect.x + 1,
+            row: p2_rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let act = crate::ui::event::mouse_to_action(rclick, &ui.hitmap).unwrap();
+        dispatch(act, &mut app, &mut ui);
+
+        assert_eq!(
+            app.active_page_key.as_deref(),
+            Some("me|p2"),
+            "right-click must select the clicked page before opening context menu"
+        );
+        assert_eq!(ui.focus, Focus::Pages);
+        match ui.overlays.last() {
+            Some(Overlay::ContextMenu(menu)) => {
+                assert_eq!(menu.context, ContextTarget::PageItem);
+            }
+            other => panic!("expected PageItem ContextMenu, got {other:?}"),
+        }
+
+        // Redraw with ContextMenu open, then right-click on NavRow(0) -> replaces ContextMenu
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+        let nav_rect = ui
+            .hitmap
+            .region_of(HitTarget::NavRow(0))
+            .expect("nav row must remain underneath backdrop");
+        let rclick_nav = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: nav_rect.x + 1,
+            row: nav_rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let act_nav = crate::ui::event::mouse_to_action(rclick_nav, &ui.hitmap).unwrap();
+        dispatch(act_nav, &mut app, &mut ui);
+        assert_eq!(ui.overlays.len(), 1);
+        assert_eq!(ui.focus, Focus::Nav);
+        match ui.overlays.last() {
+            Some(Overlay::ContextMenu(menu)) => {
+                assert_eq!(menu.context, ContextTarget::Global);
+            }
+            other => panic!("expected Global ContextMenu replacement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_section_ribbon_hitmap_exact_alignment_with_multiple_tabs() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        app.sections.clear();
+        for (i, name) in ["Alpha", "Beta", "Gamma", "Delta"].iter().enumerate() {
+            app.sections.push(OnenoteSection {
+                section_key: format!("me|sec{i}"),
+                id: format!("sec{i}"),
+                scope: OnenoteScope::Me,
+                notebook_id: Some("nb1".to_string()),
+                notebook_name: Some("Eng".to_string()),
+                parent_section_group_id: None,
+                parent_section_group_name: None,
+                display_name: (*name).to_string(),
+                color: None,
+                is_default: i == 0,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: None,
+                web_url: None,
+            });
+        }
+        app.active_section_key = Some("me|sec0".to_string());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        let tab0 = ui.hitmap.region_of(HitTarget::OnenoteSectionTab(0)).unwrap();
+        let buf = terminal.backend().buffer();
+        let row_text: String = (0..120)
+            .map(|x| buf[(x, tab0.y)].symbol().to_string())
+            .collect();
+
+        for (i, name) in ["Alpha", "Beta", "Gamma", "Delta"].iter().enumerate() {
+            let rect = ui
+                .hitmap
+                .region_of(HitTarget::OnenoteSectionTab(i))
+                .expect("section tab must be registered");
+            let rendered_slice: String = (rect.x..rect.right())
+                .map(|x| buf[(x, rect.y)].symbol().to_string())
+                .collect();
+            assert_eq!(
+                rendered_slice,
+                format!("[ ▌{name} ]"),
+                "tab {i} hitmap must match exact rendered cells (row: {row_text:?})"
+            );
+        }
+
+        let add_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::OnenoteNewSection))
+            .expect("[+Section S] must be registered");
+        let add_slice: String = (add_rect.x..add_rect.right())
+            .map(|x| buf[(x, add_rect.y)].symbol().to_string())
+            .collect();
+        assert_eq!(
+            add_slice, "[+Section S]",
+            "[+Section S] hitmap must align with zero drift"
+        );
+    }
+
+    #[test]
+    fn test_select_section_updates_active_notebook_key_and_survives_hierarchy_refresh() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        let nb2 = OnenoteNotebook {
+            notebook_key: "me|nb2".to_string(),
+            id: "nb2".to_string(),
+            scope: OnenoteScope::Me,
+            display_name: "Personal".to_string(),
+            color: None,
+            is_default: false,
+            is_shared: false,
+            user_role: None,
+            created_at: None,
+            last_modified_at: None,
+            created_by: None,
+            web_url: None,
+        };
+        let sec2 = OnenoteSection {
+            section_key: "me|sec2".to_string(),
+            id: "sec2".to_string(),
+            scope: OnenoteScope::Me,
+            notebook_id: Some("nb2".to_string()),
+            notebook_name: Some("Personal".to_string()),
+            parent_section_group_id: None,
+            parent_section_group_name: None,
+            display_name: "Journal".to_string(),
+            color: None,
+            is_default: false,
+            pages_url: None,
+            created_at: None,
+            last_modified_at: None,
+            web_url: None,
+        };
+        app.notebooks.push(nb2);
+        app.sections.push(sec2);
+        app.storage.upsert_onenote_notebooks(&app.notebooks).unwrap();
+        app.storage.upsert_onenote_sections(&app.sections).unwrap();
+
+        dispatch(Action::SelectSection("me|sec2".to_string()), &mut app, &mut ui);
+        assert_eq!(app.active_notebook_key.as_deref(), Some("me|nb2"));
+        assert_eq!(app.active_section_key.as_deref(), Some("me|sec2"));
+
+        // Subsequent hierarchy update must NOT clobber active_section_key back to nb1/sec1
+        let nbs = app.notebooks.clone();
+        let secs = app.sections.clone();
+        app.handle_core_event(
+            &mut ui,
+            crate::models::CoreEvent::OnenoteHierarchyUpdated {
+                notebooks: nbs,
+                section_groups: Vec::new(),
+                sections: secs,
+            },
+        );
+        assert_eq!(app.active_notebook_key.as_deref(), Some("me|nb2"));
+        assert_eq!(app.active_section_key.as_deref(), Some("me|sec2"));
+    }
+
+    #[test]
+    fn test_search_overlay_clears_stale_hits_allows_refresh_and_palette_slash_prefill() {
+        let (mut app, mut ui, mut nudge_rx) = make_ui_test_harness();
+        app.storage.upsert_onenote_notebooks(&app.notebooks).unwrap();
+        app.storage.upsert_onenote_sections(&app.sections).unwrap();
+        app.storage.upsert_onenote_pages(&app.pages).unwrap();
+
+        // Seed stale search result
+        app.search_results.push(crate::models::OnenoteSearchHit {
+            page_key: "me|p1".to_string(),
+            page_id: "p1".to_string(),
+            scope: OnenoteScope::Me,
+            notebook_name: Some("Eng".to_string()),
+            section_id: "sec1".to_string(),
+            section_name: Some("Notes".to_string()),
+            title: "Stale Hit".to_string(),
+            last_modified_at: None,
+            snippet: "stale".to_string(),
+            web_url: None,
+        });
+
+        // Opening fresh SearchOverlay clears stale results and Enter does NOT jump
+        dispatch(Action::OpenSearch, &mut app, &mut ui);
+        assert!(app.search_results.is_empty());
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(
+            matches!(ui.overlays.last(), Some(Overlay::Search(_))),
+            "Enter on empty search query must not jump to stale hit"
+        );
+
+        // Ctrl+R / RefreshAll works inside SearchOverlay
+        dispatch(Action::RefreshAll, &mut app, &mut ui);
+        assert_eq!(nudge_rx.try_recv().ok(), Some(SyncCommand::RefreshAll));
+        assert!(matches!(ui.overlays.last(), Some(Overlay::Search(_))));
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+
+        // CommandPalette `/Page` opens SearchOverlay prefilled with `Page` and runs search
+        dispatch(
+            Action::OpenOverlay(OverlayKind::CommandPalette),
+            &mut app,
+            &mut ui,
+        );
+        for ch in "/Page".chars() {
+            dispatch(Action::Input(ch), &mut app, &mut ui);
+        }
+        dispatch(Action::Activate, &mut app, &mut ui);
+        match ui.overlays.last() {
+            Some(Overlay::Search(s)) => assert_eq!(s.query, "Page"),
+            other => panic!("expected prefilled SearchOverlay, got {other:?}"),
+        }
+        assert_eq!(app.search_results.len(), 1);
+        assert_eq!(app.search_results[0].page_key, "me|p1");
+    }
+
+    #[test]
+    fn test_pane_hover_scroll_focus_keys_html_close_pill_and_mutation_hygiene() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        app.pages.push(OnenotePageSummary {
+            page_key: "me|p2".to_string(),
+            id: "p2".to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec1".to_string(),
+            section_name: Some("Notes".to_string()),
+            notebook_id: Some("nb1".to_string()),
+            notebook_name: Some("Eng".to_string()),
+            title: "Page 2".to_string(),
+            level: 0,
+            order: 1,
+            created_at: None,
+            last_modified_at: None,
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // Hover-scroll over empty space in Pages pane selects next page instead of scrolling canvas
+        let pages_pane = ui
+            .hitmap
+            .region_of(HitTarget::PanePages)
+            .expect("PanePages container must be registered");
+        let empty_y = pages_pane.bottom().saturating_sub(2);
+        assert_eq!(ui.hitmap.hit(empty_y, pages_pane.x + 1), Some(HitTarget::PanePages));
+        dispatch(
+            Action::MouseScroll {
+                delta: 3,
+                column: pages_pane.x + 1,
+                row: empty_y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(app.active_page_key.as_deref(), Some("me|p2"));
+        assert_eq!(ui.onenote_scroll, 0);
+
+        // ScrollTop / ScrollBottom respect Focus::Pages
+        ui.focus = Focus::Pages;
+        dispatch(Action::ScrollTop, &mut app, &mut ui);
+        assert_eq!(app.active_page_key.as_deref(), Some("me|p1"));
+        dispatch(Action::ScrollBottom, &mut app, &mut ui);
+        assert_eq!(app.active_page_key.as_deref(), Some("me|p2"));
+
+        // HtmlPreview `[✕ Esc]` closes immediately even while editing `<input>`
+        let mut html_ov = HtmlPreviewOverlay::new(
+            Some("Form".into()),
+            r#"<input type="text" name="q" value="abc" />"#.into(),
+        );
+        html_ov.handle(&Action::Tab, &ui);
+        html_ov.handle(&Action::Activate, &ui);
+        assert!(html_ov.accepts_text(), "should be editing input");
+        ui.overlays.push(Overlay::HtmlPreview(html_ov));
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::ConfirmCancel),
+                col: 1,
+                row: 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(
+            ui.overlays.is_empty(),
+            "[✕ Esc] must close HtmlPreview immediately even while editing <input>"
+        );
+
+        // PageMutated for ToggleTodo (cleared_draft_key: None) must NOT clear append draft
+        app.drafts.set_note(
+            "append:me|p2",
+            crate::config::NoteDraftEntry {
+                title: String::new(),
+                body: "Keep my append draft".to_string(),
+                base_content: None,
+            },
+        );
+        let detail_p2 = crate::parser::parse_onenote_page_xhtml(
+            app.pages[1].clone(),
+            "<html><body><p>Body</p></body></html>",
+        );
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::PageMutated {
+                task_id: 1,
+                detail: Box::new(detail_p2),
+                message: "Marked to-do completed".to_string(),
+                cleared_draft_key: None,
+            },
+        );
+        assert!(
+            app.drafts.get_note("append:me|p2").is_some(),
+            "ToggleTodo PageMutated must preserve append draft"
+        );
+
+        // PageDeleted resets scroll/selection, clears drafts, and evicts image_cache
+        ui.onenote_scroll = 15;
+        ui.onenote_selected_block = 4;
+        let png = composer::encode_rgba_to_png(2, 2, vec![255; 16]).unwrap();
+        let rendered =
+            crate::img_preview::decode_and_render_halfblocks(&png, 4, 2, (0, 0, 0)).unwrap();
+        app.image_cache.insert("thumb:me|p2:0:32:12".to_string(), rendered);
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::PageDeleted {
+                task_id: 2,
+                page_key: "me|p2".to_string(),
+            },
+        );
+        assert_eq!(ui.onenote_scroll, 0);
+        assert_eq!(ui.onenote_selected_block, 0);
+        assert!(!app.image_cache.contains_key("thumb:me|p2:0:32:12"));
+        assert!(app.drafts.get_note("append:me|p2").is_none());
     }
 }

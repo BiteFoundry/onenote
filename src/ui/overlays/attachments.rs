@@ -153,6 +153,7 @@ impl AttachmentsState {
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         let items = app
             .active_page_detail()
             .map(rows_from_onenote_page)
@@ -190,9 +191,12 @@ impl AttachmentsState {
             return;
         }
 
+        let height = inner.height as usize;
         let selected = self.selected.min(items.len() - 1);
-        for (idx, row) in items.iter().take(inner.height as usize).enumerate() {
-            let y = inner.y + idx as u16;
+        let offset = crate::ui::nav_pane::selection_offset(selected, height, items.len());
+        for (row_idx, row) in items.iter().skip(offset).take(height).enumerate() {
+            let idx = offset + row_idx;
+            let y = inner.y + row_idx as u16;
             let style = if idx == selected {
                 theme.selection()
             } else {

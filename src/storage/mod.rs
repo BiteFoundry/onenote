@@ -4,8 +4,12 @@ pub mod db;
 pub mod onenote;
 
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use anyhow::Result;
@@ -33,12 +37,42 @@ pub fn escape_like(input: &str) -> String {
     out
 }
 
+#[derive(Debug, Default)]
+struct MutationEpochs {
+    hierarchy_epoch: u64,
+    created_notebook_epochs: HashMap<String, u64>,
+    created_section_epochs: HashMap<String, u64>,
+    created_page_epochs: HashMap<String, u64>,
+    page_epochs: HashMap<String, u64>,
+    deleted_page_epochs: HashMap<String, u64>,
+}
+
+/// Shared monotonic mutation epoch tracker across cloned `Storage` handles.
+/// Prevents in-flight sync fetches started before a local create/edit/toggle/delete
+/// from pruning newly created items, resurrecting deleted pages, or reverting edits.
+#[derive(Debug, Default)]
+struct MutationTracker {
+    next_epoch: AtomicU64,
+    inner: Mutex<MutationEpochs>,
+}
+
+impl MutationTracker {
+    fn current_epoch(&self) -> u64 {
+        self.next_epoch.load(Ordering::Acquire)
+    }
+
+    fn bump_epoch(&self) -> u64 {
+        self.next_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+}
+
 #[derive(Clone)]
 pub struct Storage {
     path: PathBuf,
     writer: Arc<Mutex<rusqlite::Connection>>,
     readers: Option<Arc<Mutex<Vec<rusqlite::Connection>>>>,
     trigram_enabled: bool,
+    mutation_tracker: Arc<MutationTracker>,
 }
 
 enum ReadConnInner<'a> {
@@ -90,6 +124,7 @@ impl Storage {
                 MAX_READER_POOL_SIZE,
             )))),
             trigram_enabled,
+            mutation_tracker: Arc::new(MutationTracker::default()),
         })
     }
 
@@ -101,6 +136,7 @@ impl Storage {
             writer: Arc::new(Mutex::new(conn)),
             readers: None,
             trigram_enabled,
+            mutation_tracker: Arc::new(MutationTracker::default()),
         })
     }
 
@@ -123,7 +159,151 @@ impl Storage {
             writer: Arc::new(Mutex::new(conn)),
             readers: None,
             trigram_enabled,
+            mutation_tracker: Arc::new(MutationTracker::default()),
         })
+    }
+
+    pub fn current_mutation_epoch(&self) -> u64 {
+        self.mutation_tracker.current_epoch()
+    }
+
+    pub fn record_notebook_created(&self, notebook_key: &str) -> u64 {
+        let epoch = self.mutation_tracker.bump_epoch();
+        if let Ok(mut guard) = self.mutation_tracker.inner.lock() {
+            guard.hierarchy_epoch = epoch;
+            guard
+                .created_notebook_epochs
+                .insert(notebook_key.to_string(), epoch);
+        }
+        epoch
+    }
+
+    pub fn record_section_created(&self, section_key: &str) -> u64 {
+        let epoch = self.mutation_tracker.bump_epoch();
+        if let Ok(mut guard) = self.mutation_tracker.inner.lock() {
+            guard.hierarchy_epoch = epoch;
+            guard
+                .created_section_epochs
+                .insert(section_key.to_string(), epoch);
+        }
+        epoch
+    }
+
+    pub fn record_page_created(&self, page_key: &str) -> u64 {
+        let epoch = self.mutation_tracker.bump_epoch();
+        if let Ok(mut guard) = self.mutation_tracker.inner.lock() {
+            guard
+                .created_page_epochs
+                .insert(page_key.to_string(), epoch);
+            guard.page_epochs.insert(page_key.to_string(), epoch);
+            guard.deleted_page_epochs.remove(page_key);
+        }
+        epoch
+    }
+
+    pub fn record_page_mutated(&self, page_key: &str) -> u64 {
+        let epoch = self.mutation_tracker.bump_epoch();
+        if let Ok(mut guard) = self.mutation_tracker.inner.lock() {
+            guard.page_epochs.insert(page_key.to_string(), epoch);
+            guard.deleted_page_epochs.remove(page_key);
+        }
+        epoch
+    }
+
+    pub fn record_page_deleted(&self, page_key: &str) -> u64 {
+        let epoch = self.mutation_tracker.bump_epoch();
+        if let Ok(mut guard) = self.mutation_tracker.inner.lock() {
+            guard.page_epochs.insert(page_key.to_string(), epoch);
+            guard
+                .deleted_page_epochs
+                .insert(page_key.to_string(), epoch);
+            guard.created_page_epochs.remove(page_key);
+        }
+        epoch
+    }
+
+    pub fn hierarchy_mutated_since(&self, epoch: u64) -> bool {
+        self.mutation_tracker
+            .inner
+            .lock()
+            .map(|g| g.hierarchy_epoch > epoch)
+            .unwrap_or(false)
+    }
+
+    pub fn notebooks_created_since(&self, epoch: u64) -> HashSet<String> {
+        self.mutation_tracker
+            .inner
+            .lock()
+            .map(|g| {
+                g.created_notebook_epochs
+                    .iter()
+                    .filter(|&(_, &e)| e > epoch)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn sections_created_since(&self, epoch: u64) -> HashSet<String> {
+        self.mutation_tracker
+            .inner
+            .lock()
+            .map(|g| {
+                g.created_section_epochs
+                    .iter()
+                    .filter(|&(_, &e)| e > epoch)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn page_mutated_since(&self, page_key: &str, epoch: u64) -> bool {
+        self.mutation_tracker
+            .inner
+            .lock()
+            .map(|g| g.page_epochs.get(page_key).is_some_and(|&e| e > epoch))
+            .unwrap_or(false)
+    }
+
+    pub fn page_created_since(&self, page_key: &str, epoch: u64) -> bool {
+        self.mutation_tracker
+            .inner
+            .lock()
+            .map(|g| {
+                g.created_page_epochs
+                    .get(page_key)
+                    .is_some_and(|&e| e > epoch)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn page_deleted_since(&self, page_key: &str, epoch: u64) -> bool {
+        self.mutation_tracker
+            .inner
+            .lock()
+            .map(|g| {
+                g.deleted_page_epochs
+                    .get(page_key)
+                    .is_some_and(|&e| e > epoch)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn pages_protected_since(&self, epoch: u64) -> HashSet<String> {
+        self.mutation_tracker
+            .inner
+            .lock()
+            .map(|g| {
+                g.page_epochs
+                    .iter()
+                    .filter(|&(k, &e)| {
+                        e > epoch && !g.deleted_page_epochs.get(k).is_some_and(|&de| de >= e)
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn path(&self) -> &Path {
@@ -343,6 +523,25 @@ impl Storage {
         )
     }
 
+    pub fn reconcile_onenote_section_pages_preserving_set(
+        &self,
+        section_key: &str,
+        pages: &[OnenotePageSummary],
+        is_complete_section_list: bool,
+        preserve_page_keys: &HashSet<String>,
+        preserve_detail_key: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.lock_conn()?;
+        onenote::reconcile_onenote_section_pages_preserving_set(
+            &mut conn,
+            section_key,
+            pages,
+            is_complete_section_list,
+            preserve_page_keys,
+            preserve_detail_key,
+        )
+    }
+
     pub fn prune_onenote_section_pages(
         &self,
         section_key: &str,
@@ -350,6 +549,21 @@ impl Storage {
     ) -> Result<()> {
         let mut conn = self.lock_conn()?;
         onenote::prune_onenote_section_pages(&mut conn, section_key, pages)
+    }
+
+    pub fn prune_onenote_section_pages_preserving_set(
+        &self,
+        section_key: &str,
+        pages: &[OnenotePageSummary],
+        preserve_page_keys: &HashSet<String>,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::prune_onenote_section_pages_preserving_set(
+            &mut conn,
+            section_key,
+            pages,
+            preserve_page_keys,
+        )
     }
 
     pub fn list_onenote_page_keys(&self, section_key: &str) -> Result<Vec<String>> {

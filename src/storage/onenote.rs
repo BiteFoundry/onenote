@@ -1040,6 +1040,28 @@ pub fn reconcile_onenote_section_pages_preserving(
     preserve_page_key: Option<&str>,
     preserve_detail_key: Option<&str>,
 ) -> Result<Vec<String>> {
+    let mut preserve_set = HashSet::new();
+    if let Some(pk) = preserve_page_key {
+        preserve_set.insert(pk.to_string());
+    }
+    reconcile_onenote_section_pages_preserving_set(
+        conn,
+        section_key,
+        pages,
+        is_complete_section_list,
+        &preserve_set,
+        preserve_detail_key,
+    )
+}
+
+pub fn reconcile_onenote_section_pages_preserving_set(
+    conn: &mut Connection,
+    section_key: &str,
+    pages: &[OnenotePageSummary],
+    is_complete_section_list: bool,
+    preserve_page_keys: &HashSet<String>,
+    preserve_detail_key: Option<&str>,
+) -> Result<Vec<String>> {
     let trimmed = section_key.trim();
     if trimmed.is_empty() {
         let tx = conn.transaction()?;
@@ -1058,7 +1080,7 @@ pub fn reconcile_onenote_section_pages_preserving(
     let invalidated = upsert_onenote_pages_in_tx(&tx, pages, preserve_detail_key)?;
 
     if is_complete_section_list {
-        prune_onenote_section_pages_in_tx(&tx, &canonical_section_key, pages, preserve_page_key)?;
+        prune_onenote_section_pages_in_tx(&tx, &canonical_section_key, pages, preserve_page_keys)?;
     }
 
     tx.commit()?;
@@ -1069,12 +1091,12 @@ fn prune_onenote_section_pages_in_tx(
     tx: &Transaction<'_>,
     canonical_section_key: &str,
     pages: &[OnenotePageSummary],
-    preserve_page_key: Option<&str>,
+    preserve_page_keys: &HashSet<String>,
 ) -> Result<()> {
     let keep_page_keys: HashSet<String> = pages.iter().map(normalized_page_key).collect();
     let stale_pages: Vec<String> = list_onenote_page_keys(tx, canonical_section_key)?
         .into_iter()
-        .filter(|pk| !keep_page_keys.contains(pk) && preserve_page_key != Some(pk.as_str()))
+        .filter(|pk| !keep_page_keys.contains(pk) && !preserve_page_keys.contains(pk))
         .collect();
     if !stale_pages.is_empty() {
         let mut del_page = tx.prepare("DELETE FROM onenote_pages WHERE page_key = ?1")?;
@@ -1093,6 +1115,15 @@ pub fn prune_onenote_section_pages(
     section_key: &str,
     pages: &[OnenotePageSummary],
 ) -> Result<()> {
+    prune_onenote_section_pages_preserving_set(conn, section_key, pages, &HashSet::new())
+}
+
+pub fn prune_onenote_section_pages_preserving_set(
+    conn: &mut Connection,
+    section_key: &str,
+    pages: &[OnenotePageSummary],
+    preserve_page_keys: &HashSet<String>,
+) -> Result<()> {
     let trimmed = section_key.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -1103,7 +1134,7 @@ pub fn prune_onenote_section_pages(
         OnenoteScope::Me.make_entity_key(trimmed)
     };
     let tx = conn.transaction()?;
-    prune_onenote_section_pages_in_tx(&tx, &canonical_section_key, pages, None)?;
+    prune_onenote_section_pages_in_tx(&tx, &canonical_section_key, pages, preserve_page_keys)?;
     tx.commit()?;
     Ok(())
 }

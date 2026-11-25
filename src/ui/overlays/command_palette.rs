@@ -189,7 +189,7 @@ impl CommandPalette {
                 if let Some(search_q) = self.query.trim().strip_prefix('/') {
                     let q = search_q.trim().to_string();
                     if !q.is_empty() {
-                        return OverlayOutcome::CloseAndDispatch(Action::SearchLocalPages(q));
+                        return OverlayOutcome::CloseAndDispatch(Action::OpenSearchWithQuery(q));
                     }
                     return OverlayOutcome::CloseAndDispatch(Action::OpenSearch);
                 }
@@ -215,6 +215,7 @@ impl CommandPalette {
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         let rect = centered_rect(
             area,
             area.width.saturating_sub(8).min(84).max(40),

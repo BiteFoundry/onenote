@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButto
 use crate::ui::{
     action::Action,
     app::Focus,
-    hitmap::{HitMap, HitTarget},
+    hitmap::HitMap,
     keymap::{KeyCommand, KeyMap},
     overlays::OverlayKind,
 };
@@ -120,18 +120,7 @@ pub fn mouse_to_action(mouse: MouseEvent, hitmap: &HitMap) -> Option<Action> {
             })
         }
         MouseEventKind::Down(MouseButton::Right) => {
-            let target = hitmap.hit(mouse.row, mouse.column);
-            if matches!(
-                target,
-                Some(
-                    HitTarget::OverlayBackdrop
-                        | HitTarget::OverlayBody
-                        | HitTarget::OverlayItem { .. }
-                )
-            ) {
-                return None;
-            }
-            Some(Action::OpenContextMenu {
+            Some(Action::MouseRightClick {
                 col: mouse.column,
                 row: mouse.row,
             })

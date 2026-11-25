@@ -24,6 +24,10 @@ pub struct SearchOverlay {
 }
 
 impl SearchOverlay {
+    pub fn with_query(query: String) -> Self {
+        Self { query, selected: 0 }
+    }
+
     pub fn select(&mut self, index: usize) {
         self.selected = index;
     }
@@ -55,8 +59,9 @@ impl SearchOverlay {
                 }
                 OverlayOutcome::Handled
             }
+            Action::RefreshAll => OverlayOutcome::Dispatch(Action::RefreshAll),
             Action::Activate | Action::OverlaySubmit => {
-                if !app.search_results.is_empty() {
+                if !self.query.trim().is_empty() && !app.search_results.is_empty() {
                     let idx = self.selected.min(app.search_results.len() - 1);
                     OverlayOutcome::CloseAndDispatch(Action::JumpToSearchHit(idx))
                 } else {
@@ -78,6 +83,7 @@ impl SearchOverlay {
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         let rect = centered_rect(
             area,
             area.width.saturating_sub(8).min(92).max(40),

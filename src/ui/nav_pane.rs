@@ -84,6 +84,7 @@ pub fn draw(
         .borders(Borders::NONE)
         .style(Style::default().bg(theme.bg_sidebar).fg(theme.fg_primary));
     frame.render_widget(bg_block, area);
+    hitmap.add(area, HitTarget::PaneNav);
 
     if area.width < 4 || area.height < 2 {
         return;

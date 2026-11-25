@@ -152,6 +152,7 @@ impl ContextMenu {
             .min(area.y + area.height.saturating_sub(height));
         let rect = Rect::new(x, y, width, height);
 
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
 
@@ -167,9 +168,13 @@ impl ContextMenu {
             return;
         }
 
-        for (idx, item) in self.items.iter().take(inner.height as usize).enumerate() {
-            let row_y = inner.y + idx as u16;
-            let is_sel = idx == self.selected;
+        let height = inner.height as usize;
+        let selected = self.selected.min(self.items.len().saturating_sub(1));
+        let offset = crate::ui::nav_pane::selection_offset(selected, height, self.items.len());
+        for (row_idx, item) in self.items.iter().skip(offset).take(height).enumerate() {
+            let idx = offset + row_idx;
+            let row_y = inner.y + row_idx as u16;
+            let is_sel = idx == selected;
             let style = if is_sel {
                 theme.selection()
             } else {

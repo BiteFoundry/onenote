@@ -304,6 +304,7 @@ impl FilePickerOverlay {
 
     pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         let rect = centered_rect(
             area,
             area.width.saturating_sub(6).min(86),

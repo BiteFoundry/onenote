@@ -328,10 +328,46 @@ async fn sync_hierarchy_and_sections_inner(
     force_all_sections: bool,
     skip_recent_section_key: Option<&str>,
 ) -> Result<HierarchySyncOutcome> {
-    let nb_res = graph.list_all_accessible_notebooks_scoped(true).await?;
-    let sec_res = graph
+    let start_epoch = storage.current_mutation_epoch();
+    let mut nb_res = graph.list_all_accessible_notebooks_scoped(true).await?;
+    let mut sec_res = graph
         .list_all_accessible_sections_scoped(&nb_res.notebooks, Some(&nb_res.complete_scopes))
         .await?;
+
+    // Guard against in-flight local notebook/section creations that completed after `start_epoch`.
+    if storage.hierarchy_mutated_since(start_epoch) {
+        let created_nbs = storage.notebooks_created_since(start_epoch);
+        if !created_nbs.is_empty() {
+            if let Ok(local_nbs) = storage.list_onenote_notebooks() {
+                for nb in local_nbs {
+                    if created_nbs.contains(&nb.notebook_key)
+                        && !nb_res
+                            .notebooks
+                            .iter()
+                            .any(|existing| existing.notebook_key == nb.notebook_key)
+                    {
+                        nb_res.notebooks.push(nb);
+                    }
+                }
+            }
+        }
+        let created_secs = storage.sections_created_since(start_epoch);
+        if !created_secs.is_empty() {
+            if let Ok(local_secs) = storage.list_onenote_sections(None) {
+                for sec in local_secs {
+                    if created_secs.contains(&sec.section_key)
+                        && !sec_res
+                            .sections
+                            .iter()
+                            .any(|existing| existing.section_key == sec.section_key)
+                    {
+                        sec_res.sections.push(sec);
+                    }
+                }
+            }
+        }
+    }
+
     let reconciled_scopes: HashSet<String> = nb_res
         .complete_scopes
         .intersection(&sec_res.complete_scopes)
@@ -476,10 +512,20 @@ async fn sync_hierarchy_and_sections_inner(
 
     // Pass 1: Upsert all fetched pages across succeeded sections first so pages moved
     // between sections update their `section_key` in place without losing cached `detail_json`.
+    // Guard against in-flight local page deletions/mutations started after `start_epoch`.
+    let protected_pages = storage.pages_protected_since(start_epoch);
     for (sec, pages, _has_more) in &succeeded_sections {
+        let filtered_pages: Vec<OnenotePageSummary> = pages
+            .iter()
+            .filter(|p| {
+                !storage.page_deleted_since(&p.page_key, start_epoch)
+                    && !storage.page_mutated_since(&p.page_key, start_epoch)
+            })
+            .cloned()
+            .collect();
         let invalidated = storage.reconcile_onenote_section_pages_returning_invalidated(
             &sec.section_key,
-            pages,
+            &filtered_pages,
             false,
         )?;
         for pk in invalidated {
@@ -487,14 +533,24 @@ async fn sync_hierarchy_and_sections_inner(
                 invalidated_pages.push(pk);
             }
         }
-        pages_synced += pages.len();
+        pages_synced += filtered_pages.len();
         sections_succeeded += 1;
     }
 
-    // Pass 2: Prune deleted pages only for sections whose full page list was fetched.
+    // Pass 2: Prune deleted pages only for sections whose full page list was fetched,
+    // while preserving any pages created/mutated locally after `start_epoch`.
     for (sec, pages, has_more) in &succeeded_sections {
         if !has_more {
-            storage.prune_onenote_section_pages(&sec.section_key, pages)?;
+            let filtered_pages: Vec<OnenotePageSummary> = pages
+                .iter()
+                .filter(|p| !storage.page_deleted_since(&p.page_key, start_epoch))
+                .cloned()
+                .collect();
+            storage.prune_onenote_section_pages_preserving_set(
+                &sec.section_key,
+                &filtered_pages,
+                &protected_pages,
+            )?;
         }
         let _ = storage.upsert_sync_cursor(&SyncCursor {
             scope_key: section_pages_cursor_key(&sec.section_key),
@@ -518,7 +574,9 @@ async fn sync_hierarchy_and_sections_inner(
             .collect()
             .await;
         for detail in rehydrate_results.into_iter().flatten() {
-            let _ = storage.upsert_onenote_page_detail(&detail);
+            if !storage.page_mutated_since(&detail.summary.page_key, start_epoch) {
+                let _ = storage.upsert_onenote_page_detail(&detail);
+            }
         }
     }
 
@@ -1017,10 +1075,12 @@ async fn apply_focus_change(
     *last_focus = focus.clone();
 
     if let Some(page_key) = focus.page_key.as_deref().filter(|_| page_changed) {
-        if !schedule.should_coalesce_page_hydrate(page_key, now)
-            && run_hydrate_page(graph, storage, event_tx, page_key).await
-        {
-            schedule.mark_page_hydrated(page_key, Instant::now(), true);
+        if !schedule.should_coalesce_page_hydrate(page_key, now) {
+            if run_hydrate_page(graph, storage, event_tx, page_key).await {
+                schedule.mark_page_hydrated(page_key, Instant::now(), true);
+            }
+        } else if let Ok(Some(detail)) = storage.get_onenote_page_detail(page_key) {
+            let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
         }
         drain_matching_pending_commands(nudge_rx, pending, Some(page_key), None);
     }
@@ -1033,6 +1093,13 @@ async fn apply_focus_change(
             ).await;
             let cost = graph.http_request_count().saturating_sub(before);
             schedule.mark_section_fetched(sec_key, Instant::now(), true, Duration::ZERO, cost);
+        } else {
+            let persisted = storage.list_onenote_pages(sec_key).unwrap_or_default();
+            let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
+                section_key: sec_key.to_string(),
+                pages: persisted,
+                notify_candidate: None,
+            });
         }
         drain_matching_pending_commands(nudge_rx, pending, None, Some(sec_key));
     }
@@ -1064,13 +1131,23 @@ async fn handle_sync_command(
             let focus = focus_rx.borrow_and_update().clone();
             *last_focus = focus.clone();
             let automatic_graph;
-            let graph = if matches!(cmd, SyncCommand::Bootstrap) {
+            let bulk_graph = if matches!(cmd, SyncCommand::Bootstrap) {
                 automatic_graph = graph.with_automatic_budget(&schedule.automatic_budget, now, STARTUP_HTTP_BUDGET);
                 &automatic_graph
             } else {
                 graph
             };
-            run_full_refresh(graph, storage, event_tx, &focus, backoff, shared, schedule).await;
+            run_full_refresh(
+                graph,
+                bulk_graph,
+                storage,
+                event_tx,
+                &focus,
+                backoff,
+                shared,
+                schedule,
+            )
+            .await;
             drain_matching_pending_commands(
                 nudge_rx,
                 pending_cmds,
@@ -1122,6 +1199,13 @@ async fn handle_sync_command(
                     Duration::ZERO,
                     cost,
                 );
+            } else {
+                let persisted = storage.list_onenote_pages(&section_key).unwrap_or_default();
+                let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
+                    section_key: section_key.clone(),
+                    pages: persisted,
+                    notify_candidate: None,
+                });
             }
             drain_matching_pending_commands(nudge_rx, pending_cmds, None, Some(&section_key));
         }
@@ -1134,6 +1218,8 @@ async fn handle_sync_command(
                     let is_focused = focus.page_key.as_deref() == Some(page_key.as_str());
                     schedule.mark_page_hydrated(&page_key, Instant::now(), is_focused);
                 }
+            } else if let Ok(Some(detail)) = storage.get_onenote_page_detail(&page_key) {
+                let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
             }
             drain_matching_pending_commands(nudge_rx, pending_cmds, Some(&page_key), None);
         }
@@ -1141,8 +1227,10 @@ async fn handle_sync_command(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_full_refresh(
-    graph: &GraphClient,
+    focused_graph: &GraphClient,
+    bulk_graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
     focus: &FocusTarget,
@@ -1155,42 +1243,22 @@ async fn run_full_refresh(
         busy: true,
         summary: "Syncing OneNote...".to_string(),
     });
-    if let Ok(me) = graph.get_me().await {
+    if let Ok(me) = focused_graph.get_me().await {
         let _ = event_tx.send(CoreEvent::ProfileLoaded(me));
     }
-    let before_h = graph.http_request_count();
-    let (hierarchy_ok, synced_secs) = run_hierarchy_refresh(
-        graph, storage, event_tx, false, focus.section_key.as_deref(), backoff, shared, now,
-    ).await;
-    let cost_h = graph.http_request_count().saturating_sub(before_h);
-    schedule.mark_hierarchy_synced(&synced_secs, Instant::now(), focus, Duration::ZERO, cost_h);
 
-    let target_sec = focus.section_key.clone().or_else(|| {
-        storage
-            .list_onenote_sections(None)
-            .ok()
-            .and_then(|secs| secs.into_iter().next().map(|s| s.section_key))
-    });
-    let pages_ok = if let Some(sec_key) = target_sec {
-        if !hierarchy_ok && shared.is_auth_paused(Instant::now()) {
-            false
-        } else if synced_secs.contains(&sec_key) {
-            // Section was already fetched during `run_hierarchy_refresh` above; emit from SQLite
-            // without making a duplicate HTTP call.
-            let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
-            let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
-                section_key: sec_key,
-                pages: persisted,
-                notify_candidate: None,
-            });
-            true
-        } else {
-            let before_s = graph.http_request_count();
-            let ok = run_section_pages_refresh(
-                graph,
+    // Prioritize focused section & open page BEFORE bulk hierarchy so large accounts
+    // cannot exhaust `STARTUP_HTTP_BUDGET` before the user's active view loads.
+    let mut focused_pages_ok = true;
+    let mut synced_focused_sec: Option<String> = None;
+    if let Some(sec_key) = focus.section_key.as_deref() {
+        if !shared.is_auth_paused(Instant::now()) {
+            let before_s = focused_graph.http_request_count();
+            focused_pages_ok = run_section_pages_refresh(
+                focused_graph,
                 storage,
                 event_tx,
-                &sec_key,
+                sec_key,
                 focus.page_key.as_deref(),
                 false,
                 backoff,
@@ -1198,19 +1266,19 @@ async fn run_full_refresh(
                 Instant::now(),
             )
             .await;
-            let cost_s = graph.http_request_count().saturating_sub(before_s);
-            let is_focused = focus.section_key.as_deref() == Some(sec_key.as_str());
-            schedule.mark_section_fetched(&sec_key, Instant::now(), is_focused, Duration::ZERO, cost_s);
-            ok
+            let cost_s = focused_graph.http_request_count().saturating_sub(before_s);
+            schedule.mark_section_fetched(sec_key, Instant::now(), true, Duration::ZERO, cost_s);
+            synced_focused_sec = Some(sec_key.to_string());
+        } else {
+            focused_pages_ok = false;
         }
-    } else {
-        true
-    };
+    }
+
     let hydrate_ok = if let Some(page_key) = focus.page_key.as_deref() {
-        if !hierarchy_ok && shared.is_auth_paused(Instant::now()) {
+        if shared.is_auth_paused(Instant::now()) {
             false
         } else {
-            let ok = run_hydrate_page(graph, storage, event_tx, page_key).await;
+            let ok = run_hydrate_page(focused_graph, storage, event_tx, page_key).await;
             if ok {
                 schedule.mark_page_hydrated(page_key, Instant::now(), true);
             }
@@ -1218,6 +1286,74 @@ async fn run_full_refresh(
         }
     } else {
         true
+    };
+
+    let (hierarchy_ok, synced_secs) = if shared.is_auth_paused(Instant::now()) {
+        (false, HashSet::new())
+    } else {
+        let before_h = bulk_graph.http_request_count();
+        let res = run_hierarchy_refresh(
+            bulk_graph,
+            storage,
+            event_tx,
+            false,
+            synced_focused_sec.as_deref(),
+            backoff,
+            shared,
+            now,
+        )
+        .await;
+        let cost_h = bulk_graph.http_request_count().saturating_sub(before_h);
+        schedule.mark_hierarchy_synced(&res.1, Instant::now(), focus, Duration::ZERO, cost_h);
+        res
+    };
+
+    // If no section was focused at start (e.g. cold start with empty cache), sync the first discovered section.
+    let pages_ok = if synced_focused_sec.is_some() {
+        focused_pages_ok
+    } else {
+        let target_sec = storage
+            .list_onenote_sections(None)
+            .ok()
+            .and_then(|secs| secs.into_iter().next().map(|s| s.section_key));
+        if let Some(sec_key) = target_sec {
+            if !hierarchy_ok && shared.is_auth_paused(Instant::now()) {
+                false
+            } else if synced_secs.contains(&sec_key) {
+                let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
+                let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
+                    section_key: sec_key,
+                    pages: persisted,
+                    notify_candidate: None,
+                });
+                true
+            } else {
+                let before_s = focused_graph.http_request_count();
+                let ok = run_section_pages_refresh(
+                    focused_graph,
+                    storage,
+                    event_tx,
+                    &sec_key,
+                    focus.page_key.as_deref(),
+                    false,
+                    backoff,
+                    shared,
+                    Instant::now(),
+                )
+                .await;
+                let cost_s = focused_graph.http_request_count().saturating_sub(before_s);
+                schedule.mark_section_fetched(
+                    &sec_key,
+                    Instant::now(),
+                    false,
+                    Duration::ZERO,
+                    cost_s,
+                );
+                ok
+            }
+        } else {
+            true
+        }
     };
 
     if hierarchy_ok && pages_ok && hydrate_ok {
@@ -1229,6 +1365,16 @@ async fn run_full_refresh(
         let _ = event_tx.send(CoreEvent::SyncStateChanged {
             busy: false,
             summary: POLL_RETRY_SUMMARY.to_string(),
+        });
+    } else if bulk_graph.has_automatic_budget()
+        && pages_ok
+        && hydrate_ok
+        && !shared.is_auth_paused(Instant::now())
+    {
+        // Bulk hierarchy hit startup cap, while focused section & page succeeded cleanly.
+        let _ = event_tx.send(CoreEvent::SyncStateChanged {
+            busy: false,
+            summary: "Synced".to_string(),
         });
     } else {
         let _ = event_tx.send(CoreEvent::SyncStateChanged {
@@ -1288,6 +1434,7 @@ async fn run_open_page_content_poll(
     shared: &SyncSharedState,
     now: Instant,
 ) -> bool {
+    let start_epoch = storage.current_mutation_epoch();
     let cached_detail = storage.get_onenote_page_detail(page_key).ok().flatten();
     let cached_summary = cached_detail
         .as_ref()
@@ -1307,6 +1454,9 @@ async fn run_open_page_content_poll(
                     summary: "Synced".to_string(),
                 });
             }
+            if storage.page_mutated_since(page_key, start_epoch) {
+                return true;
+            }
             if let Some(ref existing) = cached_detail {
                 if existing.raw_xhtml == raw_xhtml {
                     return true;
@@ -1318,7 +1468,9 @@ async fn run_open_page_content_poll(
                 hint => match graph.get_onenote_page_summary(&scope, &raw_id, hint.clone()).await {
                     Ok(fresh) => fresh,
                     Err(err) if crate::graph::onenote::is_not_found_error(&err) => {
-                        let _ = storage.delete_onenote_page(page_key);
+                        if !storage.page_mutated_since(page_key, start_epoch) {
+                            let _ = storage.delete_onenote_page(page_key);
+                        }
                         return false;
                     }
                     Err(_) => hint.unwrap_or_else(|| OnenotePageSummary {
@@ -1342,6 +1494,9 @@ async fn run_open_page_content_poll(
                 },
             };
 
+            if storage.page_mutated_since(page_key, start_epoch) {
+                return true;
+            }
             let detail = crate::parser::onenote::parse_onenote_page_xhtml(summary, &raw_xhtml);
             if storage.upsert_onenote_page_detail(&detail).is_err() {
                 return false;
@@ -1351,14 +1506,16 @@ async fn run_open_page_content_poll(
         }
         Err(err) => {
             if crate::graph::onenote::is_not_found_error(&err) {
-                let _ = storage.delete_onenote_page(page_key);
-                if let Some(sec_key) = prev_section_key {
-                    let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
-                    let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
-                        section_key: sec_key,
-                        pages: persisted,
-                        notify_candidate: None,
-                    });
+                if !storage.page_mutated_since(page_key, start_epoch) {
+                    let _ = storage.delete_onenote_page(page_key);
+                    if let Some(sec_key) = prev_section_key {
+                        let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
+                        let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
+                            section_key: sec_key,
+                            pages: persisted,
+                            notify_candidate: None,
+                        });
+                    }
                 }
             } else {
                 // Transient failure: preserve last read result and back off normally.
@@ -1392,6 +1549,7 @@ async fn run_section_pages_refresh(
     shared: &SyncSharedState,
     now: Instant,
 ) -> bool {
+    let start_epoch = storage.current_mutation_epoch();
     let (scope, section_id) = split_onenote_entity_key(section_key);
     let prev_ids: HashSet<String> = storage
         .list_onenote_page_keys(section_key)
@@ -1415,7 +1573,9 @@ async fn run_section_pages_refresh(
                 if let Some(open_pk) = focused_page_key {
                     let was_in_section = prev_ids.contains(open_pk);
                     let still_in_list = pages.iter().any(|p| p.page_key == open_pk);
-                    if was_in_section && !still_in_list {
+                    let locally_touched = storage.page_created_since(open_pk, start_epoch)
+                        || storage.page_deleted_since(open_pk, start_epoch);
+                    if was_in_section && !still_in_list && !locally_touched {
                         let cached_summary = storage.get_onenote_page_summary(open_pk).ok().flatten();
                         let (page_scope, raw_page_id) =
                             resolve_effective_scope(open_pk, cached_summary.as_ref());
@@ -1457,7 +1617,9 @@ async fn run_section_pages_refresh(
                             }
                             Err(err) if crate::graph::onenote::is_not_found_error(&err) => {
                                 // Confirmed deleted (404/410): use existing cache + search cleanup.
-                                let _ = storage.delete_onenote_page(open_pk);
+                                if !storage.page_mutated_since(open_pk, start_epoch) {
+                                    let _ = storage.delete_onenote_page(open_pk);
+                                }
                             }
                             Err(err) => {
                                 // Transient failure: preserve last read result without pruning.
@@ -1469,11 +1631,25 @@ async fn run_section_pages_refresh(
                 }
             }
 
-            let _ = storage.reconcile_onenote_section_pages_preserving(
+            // Guard against in-flight local page creates/edits/deletes after `start_epoch`.
+            let mut preserve_keys = storage.pages_protected_since(start_epoch);
+            if let Some(ref pk) = preserve_page_key {
+                preserve_keys.insert(pk.clone());
+            }
+            let filtered_pages: Vec<OnenotePageSummary> = pages
+                .iter()
+                .filter(|p| {
+                    !storage.page_deleted_since(&p.page_key, start_epoch)
+                        && !storage.page_mutated_since(&p.page_key, start_epoch)
+                })
+                .cloned()
+                .collect();
+
+            let _ = storage.reconcile_onenote_section_pages_preserving_set(
                 section_key,
-                &pages,
+                &filtered_pages,
                 is_complete,
-                preserve_page_key.as_deref(),
+                &preserve_keys,
                 focused_page_key,
             );
             let prev_delta = storage
@@ -1494,11 +1670,13 @@ async fn run_section_pages_refresh(
                 });
             }
             let notify_candidate = if background && !prev_ids.is_empty() {
-                find_new_page_notification(&prev_ids, &pages)
+                find_new_page_notification(&prev_ids, &filtered_pages)
             } else {
                 None
             };
-            let persisted = storage.list_onenote_pages(section_key).unwrap_or(pages);
+            let persisted = storage
+                .list_onenote_pages(section_key)
+                .unwrap_or(filtered_pages);
             let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
                 section_key: section_key.to_string(),
                 pages: persisted,
@@ -1531,6 +1709,7 @@ async fn run_hydrate_page(
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
     page_key: &str,
 ) -> bool {
+    let start_epoch = storage.current_mutation_epoch();
     let summary_hint = storage.get_onenote_page_summary(page_key).ok().flatten();
     let prev_section_key = summary_hint
         .as_ref()
@@ -1542,20 +1721,28 @@ async fn run_hydrate_page(
         .await
     {
         Ok(detail) => {
+            if storage.page_mutated_since(page_key, start_epoch) {
+                return true;
+            }
             let _ = storage.upsert_onenote_page_detail(&detail);
             let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
             true
         }
         Err(err) => {
+            if err.is::<AutomaticRequestBudgetExhausted>() {
+                return false;
+            }
             if crate::graph::onenote::is_not_found_error(&err) {
-                let _ = storage.delete_onenote_page(page_key);
-                if let Some(sec_key) = prev_section_key {
-                    let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
-                    let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
-                        section_key: sec_key,
-                        pages: persisted,
-                        notify_candidate: None,
-                    });
+                if !storage.page_mutated_since(page_key, start_epoch) {
+                    let _ = storage.delete_onenote_page(page_key);
+                    if let Some(sec_key) = prev_section_key {
+                        let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
+                        let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
+                            section_key: sec_key,
+                            pages: persisted,
+                            notify_candidate: None,
+                        });
+                    }
                 }
             }
             let _ = event_tx.send(CoreEvent::SyncError(format!(
@@ -3535,5 +3722,349 @@ mod tests {
         assert_eq!(storage.list_onenote_pages("me|sec-1").unwrap().len(), 501);
 
         srv.abort();
+    }
+
+    #[tokio::test]
+    async fn test_mutation_epoch_blocks_stale_poll_overwrite_resurrection_and_prune() {
+        use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+        use serde_json::json;
+
+        use crate::auth::{AuthManager, StoredTokens};
+
+        #[derive(Clone)]
+        struct RaceMock {
+            content_started: Arc<tokio::sync::Notify>,
+            content_release: Arc<tokio::sync::Notify>,
+            section_started: Arc<tokio::sync::Notify>,
+            section_release: Arc<tokio::sync::Notify>,
+        }
+
+        let state = RaceMock {
+            content_started: Arc::new(tokio::sync::Notify::new()),
+            content_release: Arc::new(tokio::sync::Notify::new()),
+            section_started: Arc::new(tokio::sync::Notify::new()),
+            section_release: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/pages/p-1/content",
+                get(|State(st): State<RaceMock>| async move {
+                    st.content_started.notify_one();
+                    st.content_release.notified().await;
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/html")],
+                        r#"<html><head><title>Spec</title></head><body><div id="div:1"><p id="p:1">STALE REMOTE BODY</p></div></body></html>"#,
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sections/sec-1/pages",
+                get(|State(st): State<RaceMock>| async move {
+                    st.section_started.notify_one();
+                    st.section_release.notified().await;
+                    Json(json!({
+                        "value": [
+                            {
+                                "id": "p-1",
+                                "title": "Spec",
+                                "level": 0,
+                                "order": 0,
+                                "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                                "parentSection": { "id": "sec-1", "displayName": "Sec 1" }
+                            },
+                            {
+                                "id": "p-deleted",
+                                "title": "Deleted Locally",
+                                "level": 0,
+                                "order": 1,
+                                "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                                "parentSection": { "id": "sec-1", "displayName": "Sec 1" }
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("u1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        let mk_summary = |id: &str, title: &str| OnenotePageSummary {
+            page_key: format!("me|{id}"),
+            id: id.to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec-1".to_string(),
+            section_name: Some("Sec 1".to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("NB".to_string()),
+            title: title.to_string(),
+            level: 0,
+            order: 0,
+            created_at: None,
+            last_modified_at: Some("2026-11-20T09:00:00Z".to_string()),
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        };
+        let initial_p1 = crate::parser::onenote::parse_onenote_page_xhtml(
+            mk_summary("p-1", "Spec"),
+            r#"<html><head><title>Spec</title></head><body><div id="div:1"><p id="p:1">Initial</p></div></body></html>"#,
+        );
+        storage.upsert_onenote_page_detail(&initial_p1).unwrap();
+        storage
+            .upsert_onenote_pages(&[mk_summary("p-deleted", "Deleted Locally")])
+            .unwrap();
+
+        // 1. Start in-flight open-page poll, perform a local edit while paused, then release poll.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let g1 = graph.clone();
+        let s1 = storage.clone();
+        let tx1 = tx.clone();
+        let poll_task = tokio::spawn(async move {
+            let mut backoff = ErrorBackoffState::new(15_000);
+            let shared = SyncSharedState::new();
+            run_open_page_content_poll(&g1, &s1, &tx1, "me|p-1", &mut backoff, &shared, Instant::now()).await
+        });
+        state.content_started.notified().await;
+
+        let local_edit = crate::parser::onenote::parse_onenote_page_xhtml(
+            mk_summary("p-1", "Spec"),
+            r#"<html><head><title>Spec</title></head><body><div id="div:1"><p id="p:1">LOCAL EDIT WINS</p></div></body></html>"#,
+        );
+        storage.upsert_onenote_page_detail(&local_edit).unwrap();
+        storage.record_page_mutated("me|p-1");
+        state.content_release.notify_one();
+        assert!(poll_task.await.unwrap());
+
+        assert!(
+            storage
+                .get_onenote_page_detail("me|p-1")
+                .unwrap()
+                .unwrap()
+                .body_plain
+                .contains("LOCAL EDIT WINS"),
+            "stale poll must not overwrite newer local edit"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "stale poll must not emit OnenotePageDetailUpdated"
+        );
+
+        // 2. Start in-flight section refresh, locally create `p-new` and delete `p-deleted`, then release.
+        let g2 = graph.clone();
+        let s2 = storage.clone();
+        let tx2 = tx.clone();
+        let sec_task = tokio::spawn(async move {
+            let mut backoff = ErrorBackoffState::new(15_000);
+            let shared = SyncSharedState::new();
+            run_section_pages_refresh(
+                &g2,
+                &s2,
+                &tx2,
+                "me|sec-1",
+                Some("me|p-1"),
+                false,
+                &mut backoff,
+                &shared,
+                Instant::now(),
+            )
+            .await
+        });
+        state.section_started.notified().await;
+
+        storage
+            .upsert_onenote_pages(&[mk_summary("p-new", "Brand New Local Page")])
+            .unwrap();
+        storage.record_page_created("me|p-new");
+        storage.delete_onenote_page("me|p-deleted").unwrap();
+        storage.record_page_deleted("me|p-deleted");
+        state.section_release.notify_one();
+        assert!(sec_task.await.unwrap());
+
+        assert!(
+            storage.get_onenote_page_summary("me|p-new").unwrap().is_some(),
+            "stale section refresh must not prune locally created page"
+        );
+        assert!(
+            storage.get_onenote_page_summary("me|p-deleted").unwrap().is_none(),
+            "stale section refresh must not resurrect locally deleted page"
+        );
+
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_prioritizes_focused_section_and_page_before_startup_budget_cap() {
+        use axum::{extract::Path as AxumPath, http::StatusCode, routing::get, Json, Router};
+        use serde_json::json;
+
+        use crate::auth::{AuthManager, StoredTokens};
+
+        let app = Router::new()
+            .route("/v1.0/me", get(|| async { Json(json!({ "id": "u1", "displayName": "T" })) }))
+            .route("/v1.0/me/joinedTeams", get(|| async { Json(json!({ "value": [] })) }))
+            .route(
+                "/v1.0/me/onenote/notebooks",
+                get(|| async {
+                    Json(json!({ "value": [{ "id": "nb-1", "displayName": "Big NB", "isDefault": true }] }))
+                }),
+            )
+            .route("/v1.0/me/onenote/sectionGroups", get(|| async { Json(json!({ "value": [] })) }))
+            .route(
+                "/v1.0/me/onenote/sections",
+                get(|| async {
+                    let secs: Vec<serde_json::Value> = (1..=50)
+                        .map(|i| {
+                            json!({
+                                "id": format!("sec-{i}"),
+                                "displayName": format!("Section {i}"),
+                                "isDefault": i == 1,
+                                "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                                "parentNotebook": { "id": "nb-1", "displayName": "Big NB" }
+                            })
+                        })
+                        .collect();
+                    Json(json!({ "value": secs }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sections/{sec_id}/pages",
+                get(|AxumPath(sec_id): AxumPath<String>| async move {
+                    Json(json!({
+                        "value": [{
+                            "id": format!("p-{sec_id}"),
+                            "title": format!("Page in {sec_id}"),
+                            "level": 0,
+                            "order": 0,
+                            "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                            "parentSection": { "id": sec_id, "displayName": "Sec" }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/pages/{pid}",
+                get(|AxumPath(pid): AxumPath<String>| async move {
+                    Json(json!({
+                        "id": pid,
+                        "title": "Focused Page 50",
+                        "level": 0,
+                        "order": 0,
+                        "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                        "parentSection": { "id": "sec-50", "displayName": "Section 50" }
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/pages/{pid}/content",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/html")],
+                        r#"<html><head><title>Focused Page 50</title></head><body><p>Focused Body 50</p></body></html>"#,
+                    )
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("u1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ctrl = spawn_sync_engine(cfg, graph, storage.clone(), tx);
+
+        ctrl.set_focus(FocusTarget {
+            notebook_key: Some("me|nb-1".to_string()),
+            section_key: Some("me|sec-50".to_string()),
+            page_key: Some("me|p-sec-50".to_string()),
+        });
+        ctrl.request(SyncCommand::Bootstrap);
+
+        let mut saw_focused_detail = false;
+        let mut saw_sync_error = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+                Ok(Some(CoreEvent::OnenotePageDetailUpdated(d)))
+                    if d.summary.page_key == "me|p-sec-50" =>
+                {
+                    saw_focused_detail = true;
+                }
+                Ok(Some(CoreEvent::SyncError(_))) => {
+                    saw_sync_error = true;
+                }
+                Ok(Some(CoreEvent::SyncStateChanged { busy: false, .. }))
+                    if saw_focused_detail =>
+                {
+                    break;
+                }
+                Ok(Some(_)) => {}
+                _ => {
+                    if saw_focused_detail {
+                        break;
+                    }
+                }
+            }
+        }
+        ctrl.request(SyncCommand::Shutdown);
+        srv.abort();
+
+        assert!(
+            saw_focused_detail,
+            "bootstrap must hydrate focused sec-50 page even with 50 sections > STARTUP_HTTP_BUDGET"
+        );
+        assert!(
+            !saw_sync_error,
+            "startup budget cap must not emit SyncError for focused page"
+        );
+        assert!(storage
+            .get_onenote_page_detail("me|p-sec-50")
+            .unwrap()
+            .is_some());
     }
 }

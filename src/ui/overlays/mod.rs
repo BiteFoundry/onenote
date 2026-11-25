@@ -124,6 +124,10 @@ impl Overlay {
         Overlay::Search(SearchOverlay::default())
     }
 
+    pub fn search_with_query(query: String) -> Self {
+        Overlay::Search(SearchOverlay::with_query(query))
+    }
+
     pub fn attachments() -> Self {
         Overlay::Attachments(AttachmentsState::default())
     }
@@ -281,6 +285,7 @@ pub struct HelpOverlay {
 impl HelpOverlay {
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         let rect = centered_rect(area, 78, 24);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);

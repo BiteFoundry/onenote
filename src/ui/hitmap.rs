@@ -33,14 +33,20 @@ pub enum ButtonId {
     NarrowNotebooks,
     NarrowPages,
     NarrowCanvas,
-    // Confirm dialog
+    // Confirm dialog & modal forms
     ConfirmOk,
     ConfirmCancel,
+    FormSubmit,
+    FormCancel,
 }
 
 /// Clickable targets on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
+    /// Pane-level background / header containers (lowest z-order within each pane).
+    PaneNav,
+    PanePages,
+    PaneCanvas,
     /// A notebook row in the left sidebar (`nav_pane`).
     NavRow(usize),
     /// A section tab in the OneNote top section ribbon.
@@ -104,6 +110,24 @@ impl HitMap {
         self.regions
             .iter()
             .rev()
+            .find(|(area, _)| area.contains(position))
+            .map(|(_, target)| *target)
+    }
+
+    /// Resolves `(row, col)` to the top-most non-overlay target (ignoring overlay backdrop/body/items).
+    pub fn hit_under_overlay(&self, row: u16, col: u16) -> Option<HitTarget> {
+        let position = Position::new(col, row);
+        self.regions
+            .iter()
+            .rev()
+            .filter(|(_, target)| {
+                !matches!(
+                    target,
+                    HitTarget::OverlayBackdrop
+                        | HitTarget::OverlayBody
+                        | HitTarget::OverlayItem { .. }
+                )
+            })
             .find(|(area, _)| area.contains(position))
             .map(|(_, target)| *target)
     }

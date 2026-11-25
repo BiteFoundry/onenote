@@ -114,6 +114,7 @@ impl LinkExtractorOverlay {
 
     pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         let max_w = area.width.saturating_sub(6).min(96).max(36);
         let max_h = area.height.saturating_sub(4).min(22).max(9);
         let rect = centered_rect(area, max_w, max_h);

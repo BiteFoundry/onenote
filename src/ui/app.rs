@@ -154,6 +154,8 @@ pub enum UiMsg {
     },
     HtmlResourceLoaded {
         task_id: u64,
+        seq: u64,
+        page_key: String,
         title: String,
         html: String,
     },
@@ -306,6 +308,14 @@ pub struct AppState {
     pub image_cache: HashMap<String, RenderedTerminalImage>,
     pub inflight_images: HashSet<String>,
     pub html_server: bitefoundry_html::NativeHtmlServer,
+
+    html_resource_seq: u64,
+    active_html_resource_req: Option<(u64, String)>,
+    locally_mutated_pages: HashMap<String, u64>,
+    locally_deleted_pages: HashMap<String, u64>,
+    locally_created_pages: HashMap<String, (String, u64)>,
+    locally_created_notebooks: HashMap<String, u64>,
+    locally_created_sections: HashMap<String, u64>,
 }
 
 /// Returns `true` when MIME type or file name identifies an HTML resource (`.html`/`.htm`/`.xhtml` or `text/html`).
@@ -370,7 +380,56 @@ impl AppState {
             image_cache: HashMap::new(),
             inflight_images: HashSet::new(),
             html_server: bitefoundry_html::NativeHtmlServer::new(),
+            html_resource_seq: 0,
+            active_html_resource_req: None,
+            locally_mutated_pages: HashMap::new(),
+            locally_deleted_pages: HashMap::new(),
+            locally_created_pages: HashMap::new(),
+            locally_created_notebooks: HashMap::new(),
+            locally_created_sections: HashMap::new(),
         }
+    }
+
+    pub fn evict_image_cache_for_page(&mut self, page_key: &str) {
+        let thumb_prefix = format!("thumb:{page_key}:");
+        let hd_prefix = format!("hd:{page_key}:");
+        self.image_cache
+            .retain(|k, _| !k.starts_with(&thumb_prefix) && !k.starts_with(&hd_prefix));
+        self.inflight_images
+            .retain(|k| !k.starts_with(&thumb_prefix) && !k.starts_with(&hd_prefix));
+    }
+
+    pub fn clear_drafts_for_page(&mut self, page_key: &str) {
+        let append_key = format!("append:{page_key}");
+        let edit_prefix = format!("edit:{page_key}:");
+        let before = self.drafts.notes.len();
+        self.drafts
+            .notes
+            .retain(|k, _| k != &append_key && !k.starts_with(&edit_prefix));
+        if self.drafts.notes.len() != before {
+            let _ = self.drafts.save();
+        }
+    }
+
+    pub fn refresh_active_search(&mut self, ui: &UiState) {
+        let active_query = ui.overlays.iter().rev().find_map(|ov| match ov {
+            Overlay::Search(s) => Some(s.query.clone()),
+            _ => None,
+        });
+        if let Some(q) = active_query {
+            self.search_query = q.clone();
+            self.search_results = if q.trim().is_empty() {
+                Vec::new()
+            } else {
+                self.storage
+                    .search_onenote_pages(&q, None, 40)
+                    .unwrap_or_default()
+            };
+        }
+    }
+
+    pub fn cancel_pending_html_resource_load(&mut self) {
+        self.active_html_resource_req = None;
     }
 
     pub fn load_cached_initial(&mut self) {
@@ -512,6 +571,7 @@ impl AppState {
     }
 
     pub fn select_notebook(&mut self, notebook_key: String, ui: &mut UiState) {
+        self.active_html_resource_req = None;
         self.active_notebook_key = Some(notebook_key);
         self.active_section_key = None;
         ui.onenote_scroll = 0;
@@ -527,6 +587,16 @@ impl AppState {
     }
 
     pub fn select_section(&mut self, section_key: String, ui: &mut UiState) {
+        self.active_html_resource_req = None;
+        if let Some(sec) = self
+            .sections
+            .iter()
+            .find(|s| s.section_key == section_key)
+        {
+            if let Some(nb_id) = sec.notebook_id.as_deref() {
+                self.active_notebook_key = Some(sec.scope.make_entity_key(nb_id));
+            }
+        }
         self.active_section_key = Some(section_key.clone());
         ui.onenote_scroll = 0;
         ui.onenote_selected_block = 0;
@@ -543,6 +613,7 @@ impl AppState {
     }
 
     pub fn select_page(&mut self, page_key: String, ui: &mut UiState) {
+        self.active_html_resource_req = None;
         self.set_active_page(Some(page_key.clone()));
         ui.onenote_scroll = 0;
         ui.onenote_selected_block = 0;
@@ -702,6 +773,7 @@ impl AppState {
             ui.warn("No page loaded");
             return;
         };
+        let page_key = detail.summary.page_key.clone();
         let Some(res) = detail.resources.get(resource_idx).cloned() else {
             ui.warn("Resource not found");
             return;
@@ -720,6 +792,9 @@ impl AppState {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| format!("resource-{}.html", resource_idx + 1));
+        self.html_resource_seq = self.html_resource_seq.wrapping_add(1);
+        let seq = self.html_resource_seq;
+        self.active_html_resource_req = Some((seq, page_key.clone()));
         let task_id = ui.tasks.start(format!("Loading HTML '{title}'"));
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
@@ -729,6 +804,8 @@ impl AppState {
                     let html = String::from_utf8_lossy(&bytes).into_owned();
                     let _ = tx.send(UiMsg::HtmlResourceLoaded {
                         task_id,
+                        seq,
+                        page_key,
                         title,
                         html,
                     });
@@ -798,6 +875,7 @@ impl AppState {
             match graph.create_onenote_notebook(&OnenoteScope::Me, &name).await {
                 Ok(nb) => {
                     let _ = storage.upsert_onenote_notebooks(std::slice::from_ref(&nb));
+                    storage.record_notebook_created(&nb.notebook_key);
                     let _ = tx.send(UiMsg::NotebookCreated {
                         task_id,
                         notebook: nb,
@@ -823,6 +901,7 @@ impl AppState {
             match graph.create_onenote_section(&scope, &nb_id, &name).await {
                 Ok(sec) => {
                     let _ = storage.upsert_onenote_sections(std::slice::from_ref(&sec));
+                    storage.record_section_created(&sec.section_key);
                     let _ = tx.send(UiMsg::SectionCreated {
                         task_id,
                         section: sec,
@@ -862,6 +941,7 @@ impl AppState {
             match graph.create_onenote_page(&scope, &sec_id, &outgoing).await {
                 Ok(page) => {
                     let _ = storage.upsert_onenote_pages(std::slice::from_ref(&page));
+                    storage.record_page_created(&page.page_key);
                     let _ = tx.send(UiMsg::PageCreated {
                         task_id,
                         section_key,
@@ -901,6 +981,7 @@ impl AppState {
             {
                 Ok(detail) => {
                     let pk = detail.summary.page_key.clone();
+                    storage.record_page_mutated(&pk);
                     let _ = tx.send(UiMsg::PageMutated {
                         task_id,
                         detail: Box::new(detail),
@@ -945,6 +1026,7 @@ impl AppState {
             .await
             {
                 Ok(crate::cli::GuardedUpdateResult::Updated(detail)) => {
+                    storage.record_page_mutated(&detail.summary.page_key);
                     let _ = tx.send(UiMsg::PageMutated {
                         task_id,
                         detail: Box::new(detail),
@@ -1017,6 +1099,7 @@ impl AppState {
                     completed,
                     ..
                 }) => {
+                    storage.record_page_mutated(&updated.summary.page_key);
                     let state = if completed { "completed" } else { "reopened" };
                     let _ = tx.send(UiMsg::PageMutated {
                         task_id,
@@ -1054,6 +1137,7 @@ impl AppState {
         tokio::spawn(async move {
             match crate::cli::delete_onenote_page_helper(&storage, &graph, &page_key).await {
                 Ok(deleted_key) => {
+                    storage.record_page_deleted(&deleted_key);
                     let _ = tx.send(UiMsg::PageDeleted {
                         task_id,
                         page_key: deleted_key,
@@ -1134,6 +1218,7 @@ impl AppState {
                     || cached.summary.section_id != p.section_id
             });
             if is_stale {
+                self.evict_image_cache_for_page(&p.page_key);
                 let retained = (self.active_page_key.as_deref() == Some(p.page_key.as_str()))
                     .then(|| self.storage.get_onenote_page_detail(&p.page_key).ok().flatten())
                     .flatten()
@@ -1185,6 +1270,7 @@ impl AppState {
                 }
                 Ok(None) => {
                     self.page_details.remove(&pk);
+                    self.evict_image_cache_for_page(&pk);
                 }
                 Err(_) => {}
             }
@@ -1232,6 +1318,7 @@ impl AppState {
             };
             if should_evict {
                 self.page_details.remove(&pk);
+                self.evict_image_cache_for_page(&pk);
             }
         }
     }
@@ -1261,10 +1348,37 @@ impl AppState {
                 self.profile = Some(profile);
             }
             CoreEvent::OnenoteHierarchyUpdated {
-                notebooks,
+                mut notebooks,
                 section_groups,
-                sections,
+                mut sections,
             } => {
+                // Guard against stale hierarchy events dropping locally created notebooks/sections.
+                if !self.locally_created_notebooks.is_empty() {
+                    if let Ok(local_nbs) = self.storage.list_onenote_notebooks() {
+                        for nb in local_nbs {
+                            if self.locally_created_notebooks.contains_key(&nb.notebook_key)
+                                && !notebooks
+                                    .iter()
+                                    .any(|existing| existing.notebook_key == nb.notebook_key)
+                            {
+                                notebooks.push(nb);
+                            }
+                        }
+                    }
+                }
+                if !self.locally_created_sections.is_empty() {
+                    if let Ok(local_secs) = self.storage.list_onenote_sections(None) {
+                        for sec in local_secs {
+                            if self.locally_created_sections.contains_key(&sec.section_key)
+                                && !sections
+                                    .iter()
+                                    .any(|existing| existing.section_key == sec.section_key)
+                            {
+                                sections.push(sec);
+                            }
+                        }
+                    }
+                }
                 self.notebooks = notebooks;
                 self.section_groups = section_groups;
                 self.sections = sections;
@@ -1298,12 +1412,41 @@ impl AppState {
                         self.request_page_detail(pk);
                     }
                 }
+                self.refresh_active_search(ui);
             }
             CoreEvent::OnenotePagesUpdated {
                 section_key,
-                pages,
+                mut pages,
                 notify_candidate,
             } => {
+                // Guard against stale queued page-list events resurrecting deleted pages or
+                // pruning freshly created local pages.
+                if !self.locally_deleted_pages.is_empty() {
+                    pages.retain(|p| {
+                        !self.locally_deleted_pages.contains_key(&p.page_key)
+                            || self
+                                .storage
+                                .get_onenote_page_summary(&p.page_key)
+                                .ok()
+                                .flatten()
+                                .is_some()
+                    });
+                }
+                if !self.locally_created_pages.is_empty() {
+                    let missing_local: Vec<String> = self
+                        .locally_created_pages
+                        .iter()
+                        .filter(|(pk, (sk, _))| {
+                            sk == &section_key && !pages.iter().any(|p| &p.page_key == *pk)
+                        })
+                        .map(|(pk, _)| pk.clone())
+                        .collect();
+                    for pk in missing_local {
+                        if let Ok(Some(summary)) = self.storage.get_onenote_page_summary(&pk) {
+                            pages.insert(0, summary);
+                        }
+                    }
+                }
                 self.evict_stale_page_details(&pages);
                 self.evict_removed_section_page_details(&section_key, &pages);
                 if self.active_section_key.as_deref() == Some(section_key.as_str()) {
@@ -1343,6 +1486,7 @@ impl AppState {
                         self.push_focus_to_sync();
                     }
                 }
+                self.refresh_active_search(ui);
                 if let Some(cand) = notify_candidate {
                     if ui.notify {
                         notification::show(
@@ -1354,9 +1498,36 @@ impl AppState {
             }
             CoreEvent::OnenotePageDetailUpdated(detail) => {
                 let key = detail.summary.page_key.clone();
+                // Guard against stale queued detail events resurrecting a deleted page or
+                // reverting a newer local edit/todo-toggle already persisted in SQLite.
+                if self.locally_deleted_pages.contains_key(&key)
+                    && self
+                        .storage
+                        .get_onenote_page_summary(&key)
+                        .ok()
+                        .flatten()
+                        .is_none()
+                {
+                    return;
+                }
+                if self.locally_mutated_pages.contains_key(&key) {
+                    if let Ok(Some(stored)) = self.storage.get_onenote_page_detail(&key) {
+                        if stored.raw_xhtml != detail.raw_xhtml {
+                            return;
+                        }
+                    }
+                }
+                if self
+                    .page_details
+                    .get(&key)
+                    .is_some_and(|cached| cached.raw_xhtml != detail.raw_xhtml)
+                {
+                    self.evict_image_cache_for_page(&key);
+                }
                 if self.active_page_key.as_ref() != Some(&key) {
                     self.sync_detail_summary_into_pages(&detail.summary);
                     self.cache_page_detail(*detail);
+                    self.refresh_active_search(ui);
                     return;
                 }
                 if !detail.summary.section_id.trim().is_empty() {
@@ -1392,6 +1563,7 @@ impl AppState {
                 }
                 self.sync_detail_summary_into_pages(&detail.summary);
                 self.cache_page_detail(*detail);
+                self.refresh_active_search(ui);
             }
             CoreEvent::SyncStateChanged { busy, summary } => {
                 self.syncing = busy;
@@ -1441,6 +1613,9 @@ impl AppState {
                 ui.tasks.finish(task_id);
                 let name = notebook.display_name.clone();
                 let key = notebook.notebook_key.clone();
+                let epoch = self.storage.record_notebook_created(&key);
+                self.locally_created_notebooks.insert(key.clone(), epoch);
+                self.notebooks.retain(|n| n.notebook_key != key);
                 self.notebooks.push(notebook);
                 self.select_notebook(key, ui);
                 ui.success(format!("Created notebook '{name}'"));
@@ -1449,6 +1624,9 @@ impl AppState {
                 ui.tasks.finish(task_id);
                 let name = section.display_name.clone();
                 let key = section.section_key.clone();
+                let epoch = self.storage.record_section_created(&key);
+                self.locally_created_sections.insert(key.clone(), epoch);
+                self.sections.retain(|s| s.section_key != key);
                 self.sections.push(section);
                 self.select_section(key, ui);
                 ui.success(format!("Created section '{name}'"));
@@ -1461,12 +1639,18 @@ impl AppState {
                 ui.tasks.finish(task_id);
                 let title = page.title.clone();
                 let pk = page.page_key.clone();
+                let epoch = self.storage.record_page_created(&pk);
+                self.locally_created_pages
+                    .insert(pk.clone(), (section_key.clone(), epoch));
+                self.locally_deleted_pages.remove(&pk);
                 self.clear_draft(&format!("create:{section_key}"));
                 self.clear_draft(&format!("new_page:{section_key}"));
                 if self.active_section_key.as_deref() == Some(section_key.as_str()) {
+                    self.pages.retain(|p| p.page_key != pk);
                     self.pages.insert(0, page);
                     self.select_page(pk, ui);
                 }
+                self.refresh_active_search(ui);
                 ui.success(format!("Created page '{title}'"));
             }
             UiMsg::PageMutated {
@@ -1477,12 +1661,16 @@ impl AppState {
             } => {
                 ui.tasks.finish(task_id);
                 let pk = detail.summary.page_key.clone();
+                let epoch = self.storage.record_page_mutated(&pk);
+                self.locally_mutated_pages.insert(pk.clone(), epoch);
+                self.locally_deleted_pages.remove(&pk);
                 if let Some(key) = cleared_draft_key {
                     self.clear_draft(&key);
                 }
-                self.clear_draft(&format!("append:{pk}"));
+                self.evict_image_cache_for_page(&pk);
                 self.sync_detail_summary_into_pages(&detail.summary);
                 self.cache_page_detail(*detail);
+                self.refresh_active_search(ui);
                 ui.success(message);
             }
             UiMsg::EditConflict {
@@ -1495,21 +1683,43 @@ impl AppState {
                 if let Some((draft_key, entry)) = draft_to_preserve {
                     self.save_draft_entry(draft_key, entry);
                 }
+                self.evict_image_cache_for_page(&detail.summary.page_key);
                 self.sync_detail_summary_into_pages(&detail.summary);
                 self.cache_page_detail(*detail);
                 ui.warn(message);
             }
             UiMsg::PageDeleted { task_id, page_key } => {
                 ui.tasks.finish(task_id);
+                let epoch = self.storage.record_page_deleted(&page_key);
+                self.locally_deleted_pages.insert(page_key.clone(), epoch);
+                self.locally_created_pages.remove(&page_key);
+                self.locally_mutated_pages.remove(&page_key);
                 self.pages.retain(|p| p.page_key != page_key);
                 self.page_details.remove(&page_key);
+                self.evict_image_cache_for_page(&page_key);
+                self.clear_drafts_for_page(&page_key);
+                if self.previous_page_key.as_deref() == Some(page_key.as_str()) {
+                    self.previous_page_key = None;
+                }
+                if self
+                    .active_html_resource_req
+                    .as_ref()
+                    .is_some_and(|(_, pk)| pk == &page_key)
+                {
+                    self.active_html_resource_req = None;
+                }
                 if self.active_page_key.as_deref() == Some(page_key.as_str()) {
+                    self.active_page_key = None;
+                    ui.onenote_scroll = 0;
+                    ui.onenote_selected_block = 0;
+                    ui.onenote_follow_selection = false;
                     self.set_active_page(self.pages.first().map(|p| p.page_key.clone()));
                     if let Some(pk) = self.active_page_key.clone() {
                         self.request_page_detail(pk);
                     }
                 }
                 self.push_focus_to_sync();
+                self.refresh_active_search(ui);
                 ui.success("Deleted OneNote page");
             }
             UiMsg::ResourceDownloaded {
@@ -1531,7 +1741,14 @@ impl AppState {
             UiMsg::ImageLoadFailed { cache_key, error } => {
                 self.inflight_images.remove(&cache_key);
                 if let Some(Overlay::ImagePreview(ref mut preview)) = ui.overlays.last_mut() {
-                    preview.error = Some(error);
+                    let expected = preview.current_cache_key(
+                        ui.term_width,
+                        ui.term_height,
+                        ui.graphics_caps.protocol,
+                    );
+                    if expected.as_deref() == Some(cache_key.as_str()) {
+                        preview.error = Some(error);
+                    }
                 }
             }
             UiMsg::ImageRoutedToHtml {
@@ -1540,23 +1757,51 @@ impl AppState {
                 html,
             } => {
                 self.inflight_images.remove(&cache_key);
-                if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                let matches_active_preview = matches!(
+                    ui.overlays.last(),
+                    Some(Overlay::ImagePreview(preview))
+                        if preview
+                            .current_cache_key(
+                                ui.term_width,
+                                ui.term_height,
+                                ui.graphics_caps.protocol,
+                            )
+                            .as_deref()
+                            == Some(cache_key.as_str())
+                );
+                if matches_active_preview {
                     ui.overlays.pop();
+                    ui.overlays.push(Overlay::HtmlPreview(
+                        crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
+                            Some(title),
+                            html,
+                        ),
+                    ));
+                    ui.info("Resource returned HTML — opened in interactive HTML viewer");
                 }
-                ui.overlays.push(Overlay::HtmlPreview(
-                    crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(Some(title), html),
-                ));
-                ui.info("Resource returned HTML — opened in interactive HTML viewer");
             }
             UiMsg::HtmlResourceLoaded {
                 task_id,
+                seq,
+                page_key,
                 title,
                 html,
             } => {
                 ui.tasks.finish(task_id);
-                ui.overlays.push(Overlay::HtmlPreview(
-                    crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(Some(title), html),
-                ));
+                let is_current = self
+                    .active_html_resource_req
+                    .as_ref()
+                    .is_some_and(|(req_seq, req_pk)| *req_seq == seq && req_pk == &page_key)
+                    && self.active_page_key.as_deref() == Some(page_key.as_str());
+                if is_current {
+                    self.active_html_resource_req = None;
+                    ui.overlays.push(Overlay::HtmlPreview(
+                        crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
+                            Some(title),
+                            html,
+                        ),
+                    ));
+                }
             }
             UiMsg::HtmlServed { url } => match open::that(&url) {
                 Ok(()) => ui.success(format!("Opened local HTML preview: {url}")),

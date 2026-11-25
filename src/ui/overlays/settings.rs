@@ -98,6 +98,7 @@ impl SettingsState {
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         let rect = centered_rect(area, 76, (ITEMS as u16 + 4).min(area.height));
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
@@ -118,12 +119,13 @@ impl SettingsState {
         }
 
         let rows = SettingsState::rows(app, ui);
-        for (index, (label, value)) in rows.iter().enumerate() {
-            if index as u16 >= inner.height {
-                break;
-            }
-            let row_y = inner.y + index as u16;
-            let is_sel = index == self.selected;
+        let height = inner.height as usize;
+        let selected = self.selected.min(rows.len().saturating_sub(1));
+        let offset = crate::ui::nav_pane::selection_offset(selected, height, rows.len());
+        for (row_idx, (label, value)) in rows.iter().skip(offset).take(height).enumerate() {
+            let index = offset + row_idx;
+            let row_y = inner.y + row_idx as u16;
+            let is_sel = index == selected;
             let style = if is_sel {
                 theme.selection()
             } else {
