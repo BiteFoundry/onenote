@@ -127,6 +127,10 @@ paths:
         - name: limit
           in: query
           schema: { type: integer, default: 50 }
+        - name: cursor
+          in: query
+          description: `next_cursor` from the previous response
+          schema: { type: string }
         - name: refresh
           in: query
           schema: { type: boolean, default: false }
@@ -135,7 +139,9 @@ paths:
           schema: { type: boolean, default: false }
       responses:
         '200':
-          description: Page summaries
+          description: Page summaries with `returned`, `has_more` and `next_cursor` (null on the last page)
+        '400':
+          description: Invalid cursor
     post:
       summary: Create a top-level OneNote page from Markdown
       security:

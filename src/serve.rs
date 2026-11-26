@@ -163,6 +163,9 @@ pub struct PagesQuery {
     pub section: String,
     #[serde(default = "default_page_limit")]
     pub limit: usize,
+    /// `next_cursor` from the previous response (an offset into the section).
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub refresh: bool,
     #[serde(default)]
@@ -836,13 +839,23 @@ async fn list_pages(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let (section, pages) = cli::list_onenote_pages_helper(
+    let offset = match query.cursor.as_deref().map(str::trim) {
+        None | Some("") => 0,
+        Some(raw) => raw.parse::<usize>().map_err(|_| {
+            ApiError::bad_request(
+                "Invalid cursor: pass the next_cursor value from the previous response.",
+            )
+        })?,
+    };
+    let (section, pages, has_more) = cli::list_onenote_pages_with_cache(
         &state.storage,
         &state.graph,
         &query.section,
         query.limit,
+        offset,
         query.refresh,
         query.offline,
+        false,
     )
     .await
     .map_err(onenote_api_error)?;
@@ -850,6 +863,9 @@ async fn list_pages(
         "ok": true,
         "section": section,
         "pages": pages,
+        "returned": pages.len(),
+        "has_more": has_more,
+        "next_cursor": cli::next_cursor(offset, query.limit, has_more),
     })))
 }
 

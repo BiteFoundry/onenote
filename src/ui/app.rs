@@ -617,6 +617,12 @@ impl AppState {
         let Some(nb) = self.active_onenote_notebook() else {
             return self.sections.iter().collect();
         };
+        self.sections_for_notebook(nb)
+    }
+
+    /// Sections shown for `nb`; a single notebook whose sections carry no
+    /// notebook ID falls back to every section (same rule as the ribbon).
+    pub fn sections_for_notebook(&self, nb: &OnenoteNotebook) -> Vec<&OnenoteSection> {
         let nb_scope = nb.scope.scope_key();
         let matched: Vec<&OnenoteSection> = self
             .sections
@@ -1893,6 +1899,8 @@ impl AppState {
             .find(|p| p.page_key == summary.page_key)
         {
             existing.title = summary.title.clone();
+            existing.level = summary.level;
+            existing.order = summary.order;
             existing.last_modified_at = summary.last_modified_at.clone();
             existing.preview_text = summary.preview_text.clone();
             existing.has_todo = summary.has_todo;

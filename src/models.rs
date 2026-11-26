@@ -201,6 +201,25 @@ pub struct OnenoteSection {
     pub web_url: Option<String>,
 }
 
+impl OnenoteSection {
+    /// The section's parent section group name, when it sits in one.
+    pub fn section_group_name(&self) -> Option<&str> {
+        self.parent_section_group_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// `Group / Section` for a section inside a section group, else the plain
+    /// section name, so same-named sections in different groups stay distinct.
+    pub fn group_qualified_name(&self) -> String {
+        match self.section_group_name() {
+            Some(group) => format!("{group} / {}", self.display_name),
+            None => self.display_name.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnenotePageSummary {
     /// Composite key `"{scope_key}|{id}"`.

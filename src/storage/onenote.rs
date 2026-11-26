@@ -1194,6 +1194,57 @@ pub fn list_onenote_pages(conn: &Connection, section_key: &str) -> Result<Vec<On
     }
 }
 
+/// Keeps the cached `level` / `page_order` of `pages` already stored in
+/// `section_key`, for page lists fetched without `pagelevel=true` (Graph then
+/// returns no hierarchy, only placeholder `0` levels and list positions).
+/// Pages not cached in the section yet become root pages placed after the
+/// cached ones, so they never split a cached parent from its subpages.
+pub fn preserve_cached_page_hierarchy(
+    conn: &Connection,
+    section_key: &str,
+    pages: &mut [OnenotePageSummary],
+) -> Result<()> {
+    let trimmed = section_key.trim();
+    if trimmed.is_empty() || pages.is_empty() {
+        return Ok(());
+    }
+    let canonical = if trimmed.contains('|') {
+        trimmed.to_string()
+    } else {
+        OnenoteScope::Me.make_entity_key(trimmed)
+    };
+    let mut stmt = conn
+        .prepare("SELECT page_key, level, page_order FROM onenote_pages WHERE section_key = ?1")?;
+    let cached: std::collections::HashMap<String, (i32, i32)> = stmt
+        .query_map(params![canonical], |r| {
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if cached.is_empty() {
+        return Ok(());
+    }
+    let mut next_order = cached
+        .values()
+        .map(|&(_, order)| order)
+        .max()
+        .unwrap_or(-1)
+        .saturating_add(1);
+    for page in pages.iter_mut() {
+        match cached.get(&page.page_key) {
+            Some(&(level, order)) => {
+                page.level = level;
+                page.order = order;
+            }
+            None => {
+                page.level = 0;
+                page.order = next_order;
+                next_order = next_order.saturating_add(1);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn upsert_onenote_page_detail(conn: &mut Connection, detail: &OnenotePageDetail) -> Result<()> {
     let mut normalized = detail.clone();
     if normalized.summary.page_key.trim().is_empty() {

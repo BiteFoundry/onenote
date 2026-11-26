@@ -6,10 +6,10 @@ pub mod media;
 pub mod onenote;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -83,7 +83,10 @@ pub struct GraphClient {
     http_requests_total: Arc<AtomicU64>,
     in_flight_requests: Arc<AtomicUsize>,
     max_in_flight_requests: Arc<AtomicUsize>,
-    pagelevel_unsupported: Arc<AtomicBool>,
+    /// Section keys (`"{scope_key}|{section_id}"`) whose page requests
+    /// rejected `pagelevel=true` with a 400. Tracked per section so one
+    /// section's rejection never flattens subpages in the others.
+    pagelevel_unsupported_sections: Arc<RwLock<HashSet<String>>>,
     request_allowance: Option<RequestAllowance>,
 }
 
@@ -115,17 +118,25 @@ impl GraphClient {
             http_requests_total: Arc::new(AtomicU64::new(0)),
             in_flight_requests: Arc::new(AtomicUsize::new(0)),
             max_in_flight_requests: Arc::new(AtomicUsize::new(0)),
-            pagelevel_unsupported: Arc::new(AtomicBool::new(false)),
+            pagelevel_unsupported_sections: Arc::new(RwLock::new(HashSet::new())),
             request_allowance: None,
         })
     }
 
-    pub(crate) fn is_pagelevel_unsupported(&self) -> bool {
-        self.pagelevel_unsupported.load(Ordering::Relaxed)
+    /// True once `section_key` answered `pagelevel=true` with a 400 in this
+    /// client; other sections keep requesting page levels.
+    pub(crate) fn is_pagelevel_unsupported(&self, section_key: &str) -> bool {
+        self.pagelevel_unsupported_sections
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .contains(section_key)
     }
 
-    pub(crate) fn mark_pagelevel_unsupported(&self) {
-        self.pagelevel_unsupported.store(true, Ordering::Relaxed);
+    pub(crate) fn mark_pagelevel_unsupported(&self, section_key: &str) {
+        self.pagelevel_unsupported_sections
+            .write()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(section_key.to_string());
     }
 
     pub(crate) fn with_automatic_budget(

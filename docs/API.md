@@ -49,7 +49,7 @@ All OneNote endpoints are served under both `/v1/onenote/...` and the shorter `/
 | `POST` | `/v1/onenote/notebooks` | Create notebook (`{ name, group_id?, site_id? }`) |
 | `GET` | `/v1/onenote/sections` | List sections (`?notebook=...&refresh=false&offline=false`) |
 | `POST` | `/v1/onenote/sections` | Create section (`{ notebook, name }`) |
-| `GET` | `/v1/onenote/pages` | List pages in a section (`?section=...&limit=50&refresh=false&offline=false`) |
+| `GET` | `/v1/onenote/pages` | List pages in a section (`?section=...&limit=50&cursor=...&refresh=false&offline=false`); the response carries `has_more` and `next_cursor` for the next request's `cursor` |
 | `POST` | `/v1/onenote/pages` | Create a top-level page (`{ section, title, markdown?, level?, image_paths? }`). `level` defaults to 0. |
 | `GET` | `/v1/onenote/pages/{page}` | Get structured page detail (`?section=...&offline=false`) |
 | `PATCH` | `/v1/onenote/pages/{page}` | Update block or page (`{ block_id?, title?, markdown?, expected_content?, force?, section? }`) |

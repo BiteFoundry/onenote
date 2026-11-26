@@ -322,7 +322,10 @@ async fn sync_hierarchy_and_sections(
 }
 
 /// One section and the result of listing its pages (pages, whether more exist).
-type SectionPagesFetch = (OnenoteSection, Result<(Vec<OnenotePageSummary>, bool)>);
+type SectionPagesFetch = (
+    OnenoteSection,
+    Result<crate::graph::onenote::OnenotePageListing>,
+);
 
 async fn sync_hierarchy_and_sections_inner(
     graph: &GraphClient,
@@ -471,7 +474,7 @@ async fn sync_hierarchy_and_sections_inner(
     let results: Vec<SectionPagesFetch> =
         stream::iter(sections_to_sync.into_iter().map(|sec| async move {
             let res = graph
-                .list_onenote_pages_with_more(&sec.scope, &sec.id, page_limit)
+                .list_onenote_page_listing(&sec.scope, &sec.id, page_limit)
                 .await;
             (sec, res)
         }))
@@ -494,9 +497,14 @@ async fn sync_hierarchy_and_sections_inner(
 
     for (sec, pages_res) in results {
         match pages_res {
-            Ok((pages, has_more)) => {
+            Ok(mut listing) => {
+                // Without page levels, keep the cached subpage hierarchy.
+                if !listing.levels_known {
+                    let _ = storage
+                        .preserve_cached_page_hierarchy(&sec.section_key, &mut listing.pages);
+                }
                 synced_section_keys.insert(sec.section_key.clone());
-                succeeded_sections.push((sec, pages, has_more));
+                succeeded_sections.push((sec, listing.pages, listing.has_more));
             }
             Err(err) => {
                 if classify_sync_error(&err) == SyncErrorKind::Unauthorized401 && auth_err.is_none()
@@ -1610,10 +1618,15 @@ async fn run_section_pages_refresh(
         .collect();
 
     match graph
-        .list_onenote_pages_with_more(&scope, &section_id, section_pages_limit(graph))
+        .list_onenote_page_listing(&scope, &section_id, section_pages_limit(graph))
         .await
     {
-        Ok((pages, has_more)) => {
+        Ok(listing) => {
+            let (mut pages, has_more) = (listing.pages, listing.has_more);
+            // Without page levels, keep the cached subpage hierarchy.
+            if !listing.levels_known {
+                let _ = storage.preserve_cached_page_hierarchy(section_key, &mut pages);
+            }
             // Prune only when Graph confirmed there is nothing past the limit.
             let is_complete = !has_more;
             let mut preserve_page_key: Option<String> = None;
@@ -3829,6 +3842,183 @@ mod tests {
         assert!(storage.get_onenote_page_summary("me|p-0500").unwrap().is_some());
         assert!(storage.get_onenote_page_summary("me|p-stale").unwrap().is_none());
         assert_eq!(storage.list_onenote_pages("me|sec-1").unwrap().len(), 501);
+
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pagelevel_rejection_keeps_cached_subpage_levels_per_section() {
+        use axum::{extract::Query, http::StatusCode, routing::get, Json, Router};
+        use serde_json::json;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        use crate::auth::{AuthManager, StoredTokens};
+
+        let b_pagelevel = Arc::new(AtomicUsize::new(0));
+        let b_plain = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1.0/me/onenote/sections/sec-a/pages",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    if q.contains_key("pagelevel") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": { "code": "20152", "message": "pagelevel is not supported here" }
+                            })),
+                        );
+                    }
+                    // Without `pagelevel`: no level/order, newest first.
+                    let page = |id: &str| {
+                        json!({
+                            "id": id,
+                            "title": id,
+                            "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                            "parentSection": { "id": "sec-a", "displayName": "A" }
+                        })
+                    };
+                    (
+                        StatusCode::OK,
+                        Json(json!({ "value": [page("pa-new"), page("pa-child"), page("pa-parent")] })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/onenote/sections/sec-b/pages",
+                get({
+                    let (pl, plain) = (b_pagelevel.clone(), b_plain.clone());
+                    move |Query(q): Query<HashMap<String, String>>| async move {
+                        let leveled = q.contains_key("pagelevel");
+                        if leveled {
+                            pl.fetch_add(1, AtomicOrdering::SeqCst);
+                        } else {
+                            plain.fetch_add(1, AtomicOrdering::SeqCst);
+                        }
+                        let page = |id: &str, level: i32, order: i32| {
+                            let mut p = json!({
+                                "id": id,
+                                "title": id,
+                                "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                                "parentSection": { "id": "sec-b", "displayName": "B" }
+                            });
+                            if leveled {
+                                p["level"] = json!(level);
+                                p["order"] = json!(order);
+                            }
+                            p
+                        };
+                        Json(json!({ "value": [page("pb-parent", 0, 0), page("pb-child", 1, 1)] }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "sync-test-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("user-1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let cached = |id: &str, level: i32, order: i32| OnenotePageSummary {
+            page_key: format!("me|{id}"),
+            id: id.to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec-a".to_string(),
+            section_name: Some("A".to_string()),
+            notebook_id: None,
+            notebook_name: None,
+            title: id.to_string(),
+            level,
+            order,
+            created_at: None,
+            last_modified_at: Some("2026-11-20T09:00:00Z".to_string()),
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        };
+        storage
+            .upsert_onenote_pages(&[cached("pa-parent", 0, 0), cached("pa-child", 1, 1)])
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut backoff = ErrorBackoffState::new(15_000);
+        let shared = SyncSharedState::new();
+
+        // Section A rejects `pagelevel`: the cached subpage keeps its level and
+        // position under its parent; the new page goes after them as a root page.
+        assert!(
+            run_section_pages_refresh(
+                &graph,
+                &storage,
+                &tx,
+                "me|sec-a",
+                None,
+                false,
+                &mut backoff,
+                &shared,
+                Instant::now(),
+            )
+            .await
+        );
+        let a_pages: Vec<(String, i32, i32)> = storage
+            .list_onenote_pages("me|sec-a")
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.level, p.order))
+            .collect();
+        assert_eq!(
+            a_pages,
+            vec![
+                ("pa-parent".to_string(), 0, 0),
+                ("pa-child".to_string(), 1, 1),
+                ("pa-new".to_string(), 0, 2),
+            ]
+        );
+
+        // Section B still requests and stores page levels.
+        assert!(
+            run_section_pages_refresh(
+                &graph,
+                &storage,
+                &tx,
+                "me|sec-b",
+                None,
+                false,
+                &mut backoff,
+                &shared,
+                Instant::now(),
+            )
+            .await
+        );
+        assert_eq!(b_pagelevel.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(b_plain.load(AtomicOrdering::SeqCst), 0);
+        let b_levels: Vec<(String, i32)> = storage
+            .list_onenote_pages("me|sec-b")
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.level))
+            .collect();
+        assert_eq!(
+            b_levels,
+            vec![("pb-parent".to_string(), 0), ("pb-child".to_string(), 1)]
+        );
 
         srv.abort();
     }

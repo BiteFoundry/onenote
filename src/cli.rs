@@ -1893,19 +1893,33 @@ pub async fn list_onenote_pages_with_cache(
     }
 
     let mut cursor_key = format!("onenote:pages:{}", sec.section_key);
+    let end = offset.saturating_add(limit);
     if !refresh {
         let cached_pages = storage.list_onenote_pages(&sec.section_key)?;
-        let ttl = graph.config().cli_cache_ttl_secs;
-        if !cached_pages.is_empty() && (cached || is_cursor_fresh(storage, &cursor_key, ttl)) {
-            let (sliced, has_more) = page_slice(cached_pages, offset, limit);
-            return Ok((sec, sliced, Some(has_more)));
+        if !cached_pages.is_empty() {
+            // The page cursor is recorded only after a complete listing, so it
+            // vouches for the end of the cached list. Without one, `--cached`
+            // still serves a window that ends before the cached rows do (its
+            // pages and `has_more` are exact) but fetches any window reaching
+            // past them instead of truncating it.
+            let use_cache = if cached {
+                cached_pages.len() > end || storage.get_sync_cursor(&cursor_key)?.is_some()
+            } else {
+                is_cursor_fresh(storage, &cursor_key, graph.config().cli_cache_ttl_secs)
+            };
+            if use_cache {
+                let (sliced, has_more) = page_slice(cached_pages, offset, limit);
+                return Ok((sec, sliced, Some(has_more)));
+            }
         }
     }
 
-    let end = offset.saturating_add(limit);
     let want = end.saturating_add(1);
-    let fetched = match graph.list_onenote_pages(&sec.scope, &sec.id, want).await {
-        Ok(pages) => pages,
+    let mut listing = match graph
+        .list_onenote_page_listing(&sec.scope, &sec.id, want)
+        .await
+    {
+        Ok(listing) => listing,
         Err(err) if !refresh && crate::graph::onenote::is_not_found_error(&err) => {
             let refreshed_sec = resolve_onenote_section_query_with_refresh(
                 storage,
@@ -1920,13 +1934,24 @@ pub async fn list_onenote_pages_with_cache(
             }
             sec = refreshed_sec;
             cursor_key = format!("onenote:pages:{}", sec.section_key);
-            graph.list_onenote_pages(&sec.scope, &sec.id, want).await?
+            graph
+                .list_onenote_page_listing(&sec.scope, &sec.id, want)
+                .await?
         }
         Err(err) => return Err(err),
     };
+    if !listing.levels_known {
+        storage.preserve_cached_page_hierarchy(&sec.section_key, &mut listing.pages)?;
+    }
+    let fetched = listing.pages;
     let has_more = fetched.len() > end;
-    storage.reconcile_onenote_section_pages(&sec.section_key, &fetched, !has_more)?;
-    record_sync_cursor(storage, cursor_key, sec.last_modified_at.clone());
+    let complete = !listing.has_more;
+    storage.reconcile_onenote_section_pages(&sec.section_key, &fetched, complete)?;
+    // A partial listing must not mark the cache fresh: a later page beyond the
+    // fetched rows would then be served (truncated) from the cache.
+    if complete {
+        record_sync_cursor(storage, cursor_key, sec.last_modified_at.clone());
+    }
     let sliced = fetched.into_iter().skip(offset).take(limit).collect();
     Ok((sec, sliced, Some(has_more)))
 }
@@ -3381,7 +3406,11 @@ async fn cmd_sections(
     } else {
         for sec in &sections {
             let nb_label = sec.notebook_name.as_deref().unwrap_or("Notebook");
-            println!("{nb_label} › {}  [{}]", sec.display_name, sec.section_key);
+            println!(
+                "{nb_label} › {}  [{}]",
+                sec.group_qualified_name(),
+                sec.section_key
+            );
         }
         if let Some(next) = next {
             eprintln!("More results: rerun with --cursor {next}");

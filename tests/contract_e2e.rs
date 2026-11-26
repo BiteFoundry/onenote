@@ -1838,6 +1838,85 @@ async fn pages_paging_offline_matches() {
     server.abort();
 }
 
+/// A first page read with `has_more = true` caches only part of the section.
+/// It must not mark the cache complete: page 2 read with `--cached` (or a CLI
+/// cache TTL) used to be cut short to the cached rows.
+#[tokio::test]
+async fn cached_page_cursor_after_partial_first_page() {
+    let (base_url, _mock, server) = spawn_contract_mock(2, 5).await;
+
+    let page_keys = |v: &Value| -> Vec<String> {
+        v["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["page_key"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    for (label, extra_args, ttl) in [
+        ("--cached", &["--cached"][..], None),
+        ("cli_cache_ttl_secs", &[][..], Some("3600")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg_dir, data_dir) = (tmp.path().join("cfg"), tmp.path().join("data"));
+        let run = |cursor: &'static str, cached_read: bool| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_onenote"));
+            cmd.args([
+                "pages",
+                "Engineering/Specs",
+                "--limit",
+                "2",
+                "--cursor",
+                cursor,
+                "--json",
+            ]);
+            if cached_read {
+                cmd.args(extra_args);
+            }
+            configure_cmd(&mut cmd, &base_url, &cfg_dir, &data_dir, Some("opaque-a"));
+            if let Some(ttl) = ttl {
+                cmd.env("ONENOTE_CLI_CACHE_SECS", ttl);
+            }
+            cmd.output()
+        };
+        let parse = |out: std::process::Output| -> Value {
+            assert!(
+                out.status.success(),
+                "{label}: stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+
+        let p1 = parse(run("0", false).await.unwrap());
+        assert_eq!(p1["returned"], 2, "{label}");
+        assert_eq!(p1["has_more"], true, "{label}");
+        assert_eq!(p1["next_cursor"], "2", "{label}");
+
+        let p2 = parse(run("2", true).await.unwrap());
+        assert_eq!(
+            p2["returned"], 2,
+            "{label}: page 2 must not be truncated: {p2}"
+        );
+        assert_eq!(p2["has_more"], true, "{label}");
+        assert_eq!(p2["next_cursor"], "4", "{label}");
+
+        let p3 = parse(run("4", true).await.unwrap());
+        assert_eq!(p3["returned"], 1, "{label}");
+        assert_eq!(p3["has_more"], false, "{label}");
+        assert_eq!(p3["next_cursor"], Value::Null, "{label}");
+
+        let mut all = page_keys(&p1);
+        all.extend(page_keys(&p2));
+        all.extend(page_keys(&p3));
+        let uniq: BTreeSet<String> = all.iter().cloned().collect();
+        assert_eq!((all.len(), uniq.len()), (5, 5), "{label}: {all:?}");
+    }
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn sections_default_50_and_follow() {
     let (base_url, _mock, server) = spawn_contract_mock(120, 3).await;
@@ -2342,6 +2421,67 @@ async fn http_get_page_honours_section() {
         .await
         .unwrap();
     assert_eq!(r_patch_miss.status(), StatusCode::NOT_FOUND);
+
+    api_server.abort();
+    graph_server.abort();
+}
+
+#[tokio::test]
+async fn http_list_pages_follows_cursor() {
+    let (base_url, _mock, graph_server) = spawn_contract_mock(2, 5).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (api_addr, _storage, _graph, api_server) = make_inprocess_serve(base_url, tmp.path()).await;
+    let http = reqwest::Client::new();
+    let get_pages = |query: String| {
+        let http = http.clone();
+        async move {
+            http.get(format!("http://{api_addr}/v1/onenote/pages?{query}"))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let mut keys = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_pages = Vec::new();
+    loop {
+        let query = match &cursor {
+            Some(c) => format!("section=Specs&limit=2&cursor={c}"),
+            None => "section=Specs&limit=2".to_string(),
+        };
+        let resp = get_pages(query).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["ok"], true);
+        let returned = v["returned"].as_u64().unwrap();
+        assert_eq!(v["pages"].as_array().unwrap().len() as u64, returned);
+        seen_pages.push(returned);
+        for p in v["pages"].as_array().unwrap() {
+            keys.push(p["page_key"].as_str().unwrap().to_string());
+        }
+        match v["next_cursor"].as_str() {
+            Some(next) => {
+                assert_eq!(v["has_more"], true);
+                cursor = Some(next.to_string());
+            }
+            None => {
+                assert_eq!(v["has_more"], false);
+                break;
+            }
+        }
+    }
+    assert_eq!(seen_pages, vec![2, 2, 1]);
+    let uniq: BTreeSet<String> = keys.iter().cloned().collect();
+    assert_eq!((keys.len(), uniq.len()), (5, 5), "{keys:?}");
+
+    let bad = get_pages("section=Specs&cursor=abc".to_string()).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let bv: Value = bad.json().await.unwrap();
+    assert!(
+        bv["error"].as_str().unwrap().contains("Invalid cursor"),
+        "{bv}"
+    );
 
     api_server.abort();
     graph_server.abort();

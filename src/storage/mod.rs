@@ -406,6 +406,16 @@ impl Storage {
         onenote::upsert_onenote_pages(&mut conn, items)
     }
 
+    /// See [`onenote::preserve_cached_page_hierarchy`].
+    pub fn preserve_cached_page_hierarchy(
+        &self,
+        section_key: &str,
+        pages: &mut [OnenotePageSummary],
+    ) -> Result<()> {
+        let conn = self.read_conn()?;
+        onenote::preserve_cached_page_hierarchy(&conn, section_key, pages)
+    }
+
     pub fn reconcile_onenote_hierarchy(
         &self,
         notebooks: &[OnenoteNotebook],

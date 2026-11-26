@@ -1195,6 +1195,9 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                 Some(HitTarget::OnenotePageItem(_) | HitTarget::PanePages) => {
                     move_page_selection(app, ui, if delta < 0 { -1 } else { 1 });
                 }
+                Some(HitTarget::OnenoteSectionTab(_)) => {
+                    move_section_selection(app, ui, if delta < 0 { -1 } else { 1 });
+                }
                 _ => {
                     if delta < 0 {
                         ui.onenote_scroll =
@@ -1277,6 +1280,33 @@ fn move_notebook_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
         if app.active_notebook_key.as_deref() != Some(key.as_str()) {
             app.select_notebook(key, ui);
         }
+    }
+}
+
+/// Wheel over the section ribbon: steps the active section (clamped at both
+/// ends), which also scrolls the ribbon so the new tab is shown.
+fn move_section_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
+    let secs: Vec<String> = app
+        .sections_for_active_notebook()
+        .into_iter()
+        .map(|s| s.section_key.clone())
+        .collect();
+    if secs.is_empty() {
+        return;
+    }
+    let cur = app
+        .active_section_key
+        .as_deref()
+        .and_then(|k| secs.iter().position(|s| s == k))
+        .unwrap_or(0);
+    let step = delta.unsigned_abs() as usize;
+    let next = if delta < 0 {
+        cur.saturating_sub(step)
+    } else {
+        cur.saturating_add(step).min(secs.len() - 1)
+    };
+    if app.active_section_key.as_deref() != Some(secs[next].as_str()) {
+        app.select_section(secs[next].clone(), ui);
     }
 }
 
@@ -2469,6 +2499,138 @@ mod tests {
             }
             other => panic!("expected Global ContextMenu replacement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_section_ribbon_overflow_cues_group_prefix_and_wheel_scroll() {
+        let (mut app, mut ui, _nudge_rx) = make_ui_test_harness();
+        app.sections.clear();
+        for i in 0..12 {
+            app.sections.push(OnenoteSection {
+                section_key: format!("me|sec{i}"),
+                id: format!("sec{i}"),
+                scope: OnenoteScope::Me,
+                notebook_id: Some("nb1".to_string()),
+                notebook_name: Some("Eng".to_string()),
+                parent_section_group_id: (i == 1).then(|| "sg1".to_string()),
+                parent_section_group_name: (i == 1).then(|| "Archive".to_string()),
+                display_name: format!("Section {i:02}"),
+                color: None,
+                is_default: i == 0,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: None,
+                web_url: None,
+            });
+        }
+        assert_eq!(
+            app.sections[1].group_qualified_name(),
+            "Archive / Section 01"
+        );
+        assert_eq!(app.sections[2].group_qualified_name(), "Section 02");
+        app.active_section_key = Some("me|sec0".to_string());
+
+        // Renders the frame and returns the ribbon row text.
+        let draw = |app: &mut AppState, ui: &mut UiState| -> (String, u16) {
+            let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, app, ui);
+                })
+                .unwrap();
+            let row = ui
+                .hitmap
+                .regions()
+                .find(|(_, t)| matches!(t, HitTarget::OnenoteSectionTab(_)))
+                .map(|(r, _)| r.y)
+                .expect("ribbon tabs must be registered");
+            let buf = terminal.backend().buffer();
+            (
+                (0..120)
+                    .map(|x| buf[(x, row)].symbol().to_string())
+                    .collect(),
+                row,
+            )
+        };
+
+        // First tab active: tabs overflow to the right only.
+        let (row_text, row) = draw(&mut app, &mut ui);
+        assert!(
+            row_text.contains("[ ▌Archive / Section 01 ]"),
+            "group prefix missing: {row_text:?}"
+        );
+        assert!(
+            row_text.contains('›'),
+            "right overflow cue missing: {row_text:?}"
+        );
+        assert!(
+            !row_text.contains('‹'),
+            "no tab is hidden on the left: {row_text:?}"
+        );
+        let right_cue_col = (0..120u16)
+            .find(|&x| {
+                ui.hitmap.hit(row, x).is_some() && row_text.chars().nth(x as usize) == Some('›')
+            })
+            .expect("right cue must be clickable");
+        let Some(HitTarget::OnenoteSectionTab(first_hidden)) = ui.hitmap.hit(row, right_cue_col)
+        else {
+            panic!("right cue must act as the first hidden tab");
+        };
+        assert!(
+            !row_text.contains(&format!("Section {first_hidden:02}")),
+            "the cue's tab must be hidden: {row_text:?}"
+        );
+
+        // Wheel over a ribbon tab steps the active section, not the canvas.
+        let tab0 = ui
+            .hitmap
+            .region_of(HitTarget::OnenoteSectionTab(0))
+            .unwrap();
+        ui.onenote_scroll = 0;
+        dispatch(
+            Action::MouseScroll {
+                delta: 3,
+                column: tab0.x + 1,
+                row: tab0.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(app.active_section_key.as_deref(), Some("me|sec1"));
+        assert_eq!(
+            ui.onenote_scroll, 0,
+            "ribbon wheel must not scroll the Note Canvas"
+        );
+
+        // Last tab active: the ribbon scrolls so it shows, with a left cue only.
+        app.active_section_key = Some("me|sec11".to_string());
+        let (row_text, _) = draw(&mut app, &mut ui);
+        assert!(
+            row_text.contains("[ ▌Section 11 ]"),
+            "active tab must stay visible: {row_text:?}"
+        );
+        assert!(
+            row_text.contains('‹'),
+            "left overflow cue missing: {row_text:?}"
+        );
+        assert!(
+            !row_text.contains('›'),
+            "no tab is hidden on the right: {row_text:?}"
+        );
+        let last = ui
+            .hitmap
+            .region_of(HitTarget::OnenoteSectionTab(11))
+            .unwrap();
+        dispatch(
+            Action::MouseScroll {
+                delta: -1,
+                column: last.x + 1,
+                row: last.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(app.active_section_key.as_deref(), Some("me|sec10"));
     }
 
     #[test]

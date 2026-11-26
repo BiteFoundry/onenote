@@ -175,14 +175,7 @@ fn draw_notebook_row(
 ) {
     let theme = &ui.theme;
     let badge_color = onenote_badge_color(nb.color.as_deref(), idx);
-    let sec_count = app
-        .sections
-        .iter()
-        .filter(|s| {
-            s.scope.scope_key() == nb.scope.scope_key()
-                && s.notebook_id.as_deref() == Some(nb.id.as_str())
-        })
-        .count();
+    let sec_count = app.sections_for_notebook(nb).len();
 
     let row_bg = if is_active {
         if theme.no_color {

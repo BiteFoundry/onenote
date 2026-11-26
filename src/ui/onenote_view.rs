@@ -253,37 +253,36 @@ pub fn draw_section_ribbon(
         .and_then(|k| sections.iter().position(|s| s.section_key == k))
         .unwrap_or(0);
 
-    // Ensure the active section tab stays visible even when there are many sections
-    let budget_for_tabs = area.width.saturating_sub(add_w + 2) as usize;
-    let mut start_idx = 0usize;
-    if active_idx > 0 {
-        let mut needed = 0usize;
-        for s in sections.iter().take(active_idx + 1).rev() {
-            let short_w = UnicodeWidthStr::width(truncate_clean(&s.display_name, 16).as_str());
-            // `[ ▌name ]` = short_w + 5, plus 1-col trailing space gap = short_w + 6
-            let w = short_w + 6;
-            if needed + w > budget_for_tabs && needed > 0 {
-                break;
-            }
-            needed += w;
-            start_idx = sections
-                .iter()
-                .position(|cand| cand.section_key == s.section_key)
-                .unwrap_or(0);
-        }
-    }
+    let labels: Vec<String> = sections.iter().map(|s| ribbon_tab_label(s)).collect();
+    // Rendered tab: "[ " (2) + "▌" (1) + label (W) + " ]" (2) = W + 5; stride with " " = W + 6
+    let strides: Vec<usize> = labels
+        .iter()
+        .map(|l| UnicodeWidthStr::width(l.as_str()) + 6)
+        .collect();
+    let (start_idx, end_idx) =
+        ribbon_window(&strides, active_idx, area.width as usize, add_w as usize);
+    let hidden_after = sections.len() - end_idx;
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut x = area.x;
 
-    for (idx, sec) in sections.iter().enumerate().skip(start_idx) {
+    // Overflow cues: `‹` / `›` act as the nearest hidden tab, so a click or
+    // wheel on them moves to it and scrolls the ribbon.
+    if start_idx > 0 {
+        spans.push(Span::styled(
+            format!("{RIBBON_CUE_LEFT} "),
+            Style::default()
+                .fg(ONENOTE_PURPLE)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hitmap.add_line(x, area.y, 1, HitTarget::OnenoteSectionTab(start_idx - 1));
+        x = x.saturating_add(RIBBON_CUE_W);
+    }
+
+    for (idx, sec) in sections.iter().enumerate().take(end_idx).skip(start_idx) {
         let is_active = active_section_key == Some(sec.section_key.as_str());
-        let short_name = truncate_clean(&sec.display_name, 16);
-        // Rendered width: "[ " (2) + "▌" (1) + short_name (W) + " ]" (2) = W + 5; stride with " " = W + 6
-        let tab_w = (UnicodeWidthStr::width(short_name.as_str()) + 5) as u16;
-        if x.saturating_sub(area.x) + tab_w + add_w + 1 > area.width && idx > start_idx {
-            break;
-        }
+        let short_name = labels[idx].clone();
+        let tab_w = (strides[idx] - 1) as u16;
         if x.saturating_sub(area.x) + tab_w > area.width {
             break;
         }
@@ -326,6 +325,17 @@ pub fn draw_section_ribbon(
         x = x.saturating_add(tab_w + 1);
     }
 
+    if hidden_after > 0 && x.saturating_sub(area.x) + RIBBON_CUE_W <= area.width {
+        spans.push(Span::styled(
+            format!("{RIBBON_CUE_RIGHT} "),
+            Style::default()
+                .fg(ONENOTE_PURPLE)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hitmap.add_line(x, area.y, 1, HitTarget::OnenoteSectionTab(end_idx));
+        x = x.saturating_add(RIBBON_CUE_W);
+    }
+
     if x.saturating_sub(area.x) + add_w <= area.width {
         spans.push(Span::styled(
             add_label,
@@ -342,6 +352,51 @@ pub fn draw_section_ribbon(
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+const RIBBON_CUE_LEFT: char = '‹';
+const RIBBON_CUE_RIGHT: char = '›';
+/// Columns an overflow cue takes: the glyph and a 1-col gap.
+const RIBBON_CUE_W: u16 = 2;
+
+/// Ribbon tab text: `Group / Section` for a section inside a section group,
+/// each part shortened so one tab stays compact.
+fn ribbon_tab_label(sec: &OnenoteSection) -> String {
+    let name = truncate_clean(&sec.display_name, 16);
+    match sec.section_group_name() {
+        Some(group) => format!("{} / {name}", truncate_clean(group, 10)),
+        None => name,
+    }
+}
+
+/// The `[start, end)` range of tabs (given their strides) the ribbon shows in
+/// `width` columns next to the `add_w`-wide add button. All tabs when they
+/// fit; otherwise room for both overflow cues is reserved and the window ends
+/// at the active tab when it lies past the first screenful, then extends right.
+fn ribbon_window(
+    strides: &[usize],
+    active_idx: usize,
+    width: usize,
+    add_w: usize,
+) -> (usize, usize) {
+    let total: usize = strides.iter().sum();
+    if total + add_w <= width || strides.is_empty() {
+        return (0, strides.len());
+    }
+    let budget = width.saturating_sub(add_w + 2 * RIBBON_CUE_W as usize);
+    let active_idx = active_idx.min(strides.len() - 1);
+    let mut start = active_idx;
+    let mut used = strides[active_idx];
+    while start > 0 && used + strides[start - 1] <= budget {
+        start -= 1;
+        used += strides[start];
+    }
+    let mut end = active_idx + 1;
+    while end < strides.len() && used + strides[end] <= budget {
+        used += strides[end];
+        end += 1;
+    }
+    (start, end)
 }
 
 /// Renders Row 1: Action Toolbar.
