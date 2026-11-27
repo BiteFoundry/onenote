@@ -1523,10 +1523,8 @@ fn apply_css_style(base: &TextStyleFlags, style_attr: Option<&str>) -> TextStyle
                     }
                 }
             }
-            "font-family" => {
-                if is_monospace_font_value(&val) {
-                    next.code = true;
-                }
+            "font-family" if is_monospace_font_value(&val) => {
+                next.code = true;
             }
             _ => {}
         }
@@ -1772,7 +1770,7 @@ fn spans_to_plain(spans: &[RichSpan]) -> String {
     spans.iter().map(|s| s.text.as_str()).collect()
 }
 
-fn spans_to_markdown(spans: &[RichSpan]) -> String {
+pub fn spans_to_markdown(spans: &[RichSpan]) -> String {
     let mut out = String::new();
     for span in spans {
         if span.text.is_empty() {
@@ -3138,8 +3136,9 @@ fn replace_element(target: &str, content: String) -> OnenotePatchCommand {
 }
 
 fn page_body(doc: &Html) -> Option<ElementRef<'_>> {
-    doc.select(&Selector::parse("body").expect("valid body selector"))
-        .next()
+    static BODY_SELECTOR: std::sync::LazyLock<Selector> =
+        std::sync::LazyLock::new(|| Selector::parse("body").expect("valid body selector"));
+    doc.select(&BODY_SELECTOR).next()
 }
 
 fn can_replace_element(el: ElementRef<'_>) -> bool {

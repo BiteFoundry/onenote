@@ -11,6 +11,7 @@
 //! - `POST /v1/onenote/pages/{page_key}/todo` (alias: `/toggle-todo`)
 //! - `POST /v1/onenote/resources/download` (alias: `/pages/{page_key}/resources/download`)
 //! - `GET /v1/onenote/search`
+//!
 //! (Also mounted under `/onenote/*` for ergonomic unversioned access.)
 //!
 //! Access control (every route, including `/health`, passes the request guard):

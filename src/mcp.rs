@@ -60,47 +60,49 @@ pub async fn run(config: AppConfig) -> Result<()> {
             }
             continue;
         }
-        if runtime.is_none() {
-            let params = req.get("params");
-            let tool_name = params
-                .and_then(|p| p.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            let args = params.and_then(|p| p.get("arguments"));
-            let is_search_local = matches!(tool_name, "search_pages" | "onenote_search_pages")
-                && args
-                    .and_then(|a| a.get("refresh"))
+        let (graph, storage) = match runtime.as_ref() {
+            Some(rt) => rt,
+            None => {
+                let params = req.get("params");
+                let tool_name = params
+                    .and_then(|p| p.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let args = params.and_then(|p| p.get("arguments"));
+                let is_search_local = matches!(tool_name, "search_pages" | "onenote_search_pages")
+                    && args
+                        .and_then(|a| a.get("refresh"))
+                        .and_then(Value::as_bool)
+                        != Some(true);
+                let is_offline = args
+                    .and_then(|a| a.get("offline"))
                     .and_then(Value::as_bool)
-                    != Some(true);
-            let is_offline = args
-                .and_then(|a| a.get("offline"))
-                .and_then(Value::as_bool)
-                == Some(true);
-            let mode = if is_search_local || is_offline {
-                cli::IdentityMode::LocalOnly
-            } else {
-                cli::IdentityMode::AllowNetwork
-            };
-            match cli::open_mcp_runtime(&config, mode).await {
-                Ok(rt) => runtime = Some(rt),
-                Err(err) => {
-                    let id = req.get("id").cloned().unwrap_or(Value::Null);
-                    let resp = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": format!("Error: {err:#}") }],
-                            "isError": true,
-                        }
-                    });
-                    writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
-                    stdout.flush()?;
-                    continue;
+                    == Some(true);
+                let mode = if is_search_local || is_offline {
+                    cli::IdentityMode::LocalOnly
+                } else {
+                    cli::IdentityMode::AllowNetwork
+                };
+                match cli::open_mcp_runtime(&config, mode).await {
+                    Ok(rt) => runtime.insert(rt),
+                    Err(err) => {
+                        let id = req.get("id").cloned().unwrap_or(Value::Null);
+                        let resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": format!("Error: {err:#}") }],
+                                "isError": true,
+                            }
+                        });
+                        writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
+                        stdout.flush()?;
+                        continue;
+                    }
                 }
             }
-        }
-        let (graph, storage) = runtime.as_ref().unwrap();
+        };
         if let Some(resp) = handle_request_value(&config, graph, storage, req).await {
             writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
             stdout.flush()?;

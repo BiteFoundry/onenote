@@ -2807,11 +2807,11 @@ fn section_keys_matching_name(storage: &Storage, sec_q: &str) -> Result<Vec<Stri
     Ok(keys.into_iter().collect())
 }
 
-pub fn select_onenote_resource<'a>(
-    detail: &'a OnenotePageDetail,
+pub fn select_onenote_resource(
+    detail: &OnenotePageDetail,
     index: Option<usize>,
     prefer_image: bool,
-) -> Result<(usize, &'a OnenoteResource)> {
+) -> Result<(usize, &OnenoteResource)> {
     if detail.resources.is_empty() {
         bail!("Page '{}' has no embedded images or file resources.", detail.summary.title);
     }

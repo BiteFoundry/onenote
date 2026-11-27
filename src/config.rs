@@ -543,7 +543,7 @@ pub fn identity_map_dir() -> PathBuf {
 
 fn token_fingerprint(access_token: &str) -> String {
     use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(access_token.trim().as_bytes()))
+    crate::hex_encode(Sha256::digest(access_token.trim().as_bytes()))
 }
 
 pub fn lookup_identity(access_token: &str) -> Option<String> {
@@ -640,7 +640,9 @@ fn record_identity_in(dir: &Path, access_token: &str, user_id: &str) -> Result<(
         prune_identity_map(dir, &path);
         return Ok(());
     }
-    Err(last_err.unwrap())
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!("Failed to record token identity map at {}", path.display())
+    }))
 }
 
 pub fn default_download_dir() -> PathBuf {

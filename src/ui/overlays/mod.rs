@@ -70,9 +70,9 @@ pub enum Overlay {
     PathInput(PathInputState),
     FilePicker(FilePickerOverlay),
     Links(LinkExtractorOverlay),
-    OnenoteForm(OnenoteFormOverlay),
+    OnenoteForm(Box<OnenoteFormOverlay>),
     ImagePreview(ImagePreviewOverlay),
-    HtmlPreview(HtmlPreviewOverlay),
+    HtmlPreview(Box<HtmlPreviewOverlay>),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -145,7 +145,7 @@ impl Overlay {
     }
 
     pub fn onenote_form(form: OnenoteFormOverlay) -> Self {
-        Overlay::OnenoteForm(form)
+        Overlay::OnenoteForm(Box::new(form))
     }
 
     pub fn help() -> Self {

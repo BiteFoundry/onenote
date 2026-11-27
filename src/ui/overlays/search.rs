@@ -86,8 +86,8 @@ impl SearchOverlay {
         hitmap.add(area, HitTarget::OverlayBackdrop);
         let rect = centered_rect(
             area,
-            area.width.saturating_sub(8).min(92).max(40),
-            area.height.saturating_sub(4).min(22).max(9),
+            area.width.saturating_sub(8).clamp(40, 92),
+            area.height.saturating_sub(4).clamp(9, 22),
         );
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);

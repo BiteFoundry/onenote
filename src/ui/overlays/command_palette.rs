@@ -218,8 +218,8 @@ impl CommandPalette {
         hitmap.add(area, HitTarget::OverlayBackdrop);
         let rect = centered_rect(
             area,
-            area.width.saturating_sub(8).min(84).max(40),
-            area.height.saturating_sub(4).min(22).max(10),
+            area.width.saturating_sub(8).clamp(40, 84),
+            area.height.saturating_sub(4).clamp(10, 22),
         );
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);

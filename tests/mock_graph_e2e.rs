@@ -629,9 +629,11 @@ async fn spawn_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<
 }
 
 fn make_test_runtime(base_url: String, dl_dir: &std::path::Path) -> (AppConfig, GraphClient, Storage) {
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = base_url;
-    cfg.download_dir = dl_dir.to_string_lossy().into_owned();
+    let cfg = AppConfig {
+        graph_base_url: base_url,
+        download_dir: dl_dir.to_string_lossy().into_owned(),
+        ..AppConfig::default()
+    };
     let tokens = StoredTokens {
         access_token: "e2e-test-token".to_string(),
         refresh_token: None,
@@ -3392,8 +3394,9 @@ mod confirmed_bug_regressions {
             r#"<!DOCTYPE html><html><head><title>Control Title</title></head><body><div id="div:ctrl" style="position:absolute;left:48px"><p id="p:status" data-id="st-1" style="color:green">Status READY</p></div></body></html>"#.to_string(),
         );
 
+        type PatchLog = Arc<Mutex<Vec<(String, Vec<Value>)>>>;
         let page_xhtml = Arc::new(Mutex::new(initial_xhtml));
-        let patches: Arc<Mutex<Vec<(String, Vec<Value>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches: PatchLog = Arc::new(Mutex::new(Vec::new()));
         let xhtml_clone = page_xhtml.clone();
         let patches_clone = patches.clone();
 

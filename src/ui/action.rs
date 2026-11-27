@@ -660,15 +660,16 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
         Action::OpenHtmlPreview => {
             if let Some(detail) = app.active_page_detail() {
                 let ov = HtmlPreviewOverlay::from_onenote_page(detail);
-                ui.overlays.push(Overlay::HtmlPreview(ov));
+                ui.overlays.push(Overlay::HtmlPreview(Box::new(ov)));
             } else {
                 ui.warn("Open a OneNote page first to inspect HTML");
             }
             false
         }
         Action::OpenHtmlContent { title, html } => {
-            ui.overlays
-                .push(Overlay::HtmlPreview(HtmlPreviewOverlay::new(Some(title), html)));
+            ui.overlays.push(Overlay::HtmlPreview(Box::new(
+                HtmlPreviewOverlay::new(Some(title), html),
+            )));
             false
         }
         Action::OpenHtmlResource(res_idx) => {
@@ -2872,7 +2873,7 @@ mod tests {
         html_ov.handle(&Action::Tab, &ui);
         html_ov.handle(&Action::Activate, &ui);
         assert!(html_ov.accepts_text(), "should be editing input");
-        ui.overlays.push(Overlay::HtmlPreview(html_ov));
+        ui.overlays.push(Overlay::HtmlPreview(Box::new(html_ov)));
         dispatch(
             Action::MouseClick {
                 target: HitTarget::Button(ButtonId::ConfirmCancel),

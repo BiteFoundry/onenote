@@ -247,14 +247,16 @@ fn build_demo_state() -> Result<(AppState, UiState)> {
     // Ensure Settings overlay shows a clean fictional config path rather than a host user directory.
     std::env::set_var("ONENOTE_CONFIG_DIR", r"~\.config\onenote-cli");
 
-    let mut cfg = AppConfig::default();
-    cfg.theme = ThemePreset::Dark;
-    cfg.density = DensityMode::Cozy;
-    cfg.show_nav_rail = true;
-    cfg.inline_images = true;
-    cfg.show_inline_hrefs = false;
-    cfg.notify = true;
-    cfg.download_dir = r"~\Downloads\onenote".to_string();
+    let cfg = AppConfig {
+        theme: ThemePreset::Dark,
+        density: DensityMode::Cozy,
+        show_nav_rail: true,
+        inline_images: true,
+        show_inline_hrefs: false,
+        notify: true,
+        download_dir: r"~\Downloads\onenote".to_string(),
+        ..AppConfig::default()
+    };
 
     let dummy_tokens = StoredTokens {
         access_token: "demo-token".to_string(),

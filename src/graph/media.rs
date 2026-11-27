@@ -10,7 +10,6 @@ use uuid::Uuid;
 use super::GraphClient;
 use crate::models::{DownloadedResource, OnenoteResource};
 
-#[allow(dead_code)]
 pub(crate) const MAX_IN_MEMORY_RESOURCE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 impl GraphClient {
@@ -266,23 +265,6 @@ pub fn should_send_bearer(graph_base_url: &str, target_url: &str) -> bool {
         }
     }
     false
-}
-
-#[allow(dead_code)]
-pub(crate) fn is_auth_or_forbidden_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    let detail = msg
-        .strip_prefix(crate::graph::GRAPH_API_ERROR_PREFIX)
-        .and_then(|rest| rest.split_once("): ").map(|(_, d)| d))
-        .unwrap_or(&msg);
-    let lower = detail.to_ascii_lowercase();
-    detail.starts_with("401 ")
-        || detail.starts_with("403 ")
-        || lower.contains("unauthorized")
-        || lower.contains("forbidden")
-        || lower.contains("authorization_requestdenied")
-        || lower.contains("erroraccessdenied")
-        || lower.contains("insufficient privileges")
 }
 
 pub fn sanitize_filename(raw: &str) -> String {
@@ -566,8 +548,10 @@ mod tests {
     async fn test_fetch_data_image_uri_decodes_locally_without_http() {
         use base64::Engine as _;
 
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = "http://127.0.0.1:1/v1.0".to_string();
+        let cfg = crate::config::AppConfig {
+            graph_base_url: "http://127.0.0.1:1/v1.0".to_string(),
+            ..crate::config::AppConfig::default()
+        };
         let auth = crate::auth::AuthManager::empty_for_test(cfg.clone());
         let graph = GraphClient::new(cfg, auth).unwrap();
 

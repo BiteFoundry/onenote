@@ -28,6 +28,11 @@ pub const TEAMS_SKIPPED_MISSING_ORG_SCOPES_WARNING: &str = "Teams notebooks were
 const ONENOTE_SCOPE_CONCURRENCY: usize = 4;
 const MAX_SECTION_GROUP_TRAVERSAL: usize = 256;
 
+type PrefetchedMeSections = (
+    Result<Vec<OnenoteSectionGroup>>,
+    Result<Vec<OnenoteSection>>,
+);
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct GraphOnenoteLink {
     #[serde(default)]
@@ -553,8 +558,8 @@ fn backfill_section_hierarchy(
             .or_insert_with(|| nb.display_name.clone());
     }
 
-    let mut sg_info: HashMap<(String, String), (Option<String>, Option<String>, String)> =
-        HashMap::new();
+    type SectionGroupInfoMap = HashMap<(String, String), (Option<String>, Option<String>, String)>;
+    let mut sg_info: SectionGroupInfoMap = HashMap::new();
     for sg in all_groups.iter() {
         sg_info.insert(
             (sg.scope.scope_key(), sg.id.clone()),
@@ -566,13 +571,8 @@ fn backfill_section_hierarchy(
         );
     }
 
-    let resolve_sg_notebook_id = |scope_key: &str,
-                                  start_sg_id: &str,
-                                  info: &HashMap<
-        (String, String),
-        (Option<String>, Option<String>, String),
-    >|
-     -> Option<String> {
+    let resolve_sg_notebook_id =
+        |scope_key: &str, start_sg_id: &str, info: &SectionGroupInfoMap| -> Option<String> {
         let mut current = start_sg_id.to_string();
         let mut visited = HashSet::new();
         for _ in 0..32 {
@@ -1335,10 +1335,7 @@ impl GraphClient {
         &self,
         notebooks: &[OnenoteNotebook],
         extra_complete_scopes: Option<&HashSet<String>>,
-        mut prefetched_me: Option<(
-            Result<Vec<OnenoteSectionGroup>>,
-            Result<Vec<OnenoteSection>>,
-        )>,
+        mut prefetched_me: Option<PrefetchedMeSections>,
     ) -> Result<ScopedSectionsResult> {
         let mut unique_scopes: Vec<OnenoteScope> = Vec::new();
         let mut scope_pos_by_key: HashMap<String, usize> = HashMap::new();

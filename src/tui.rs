@@ -315,14 +315,12 @@ struct TerminalGuard {
     orig_conin_mode: Option<u32>,
 }
 
+type TuiTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
 impl TerminalGuard {
     fn enter(
         image_protocol: ImageProtocolPreference,
-    ) -> Result<(
-        Self,
-        Terminal<CrosstermBackend<BufWriter<Stdout>>>,
-        TerminalGraphicsCaps,
-    )> {
+    ) -> Result<(Self, TuiTerminal, TerminalGraphicsCaps)> {
         #[cfg(windows)]
         let orig_conin_mode = win_console::snapshot_console_mode();
 
@@ -1156,16 +1154,28 @@ fn handle_terminal_event(
     LoopStep::Continue
 }
 
-fn spawn_sync_supervisor(
+struct SyncSupervisorArgs {
     config: AppConfig,
     auth: AuthManager,
     graph: GraphClient,
     storage: Storage,
     core_tx: mpsc::UnboundedSender<CoreEvent>,
     ui_tx: mpsc::UnboundedSender<UiMsg>,
-    mut proxy_focus_rx: watch::Receiver<FocusTarget>,
-    mut proxy_nudge_rx: mpsc::UnboundedReceiver<SyncCommand>,
-) {
+    proxy_focus_rx: watch::Receiver<FocusTarget>,
+    proxy_nudge_rx: mpsc::UnboundedReceiver<SyncCommand>,
+}
+
+fn spawn_sync_supervisor(args: SyncSupervisorArgs) {
+    let SyncSupervisorArgs {
+        config,
+        auth,
+        graph,
+        storage,
+        core_tx,
+        ui_tx,
+        mut proxy_focus_rx,
+        mut proxy_nudge_rx,
+    } = args;
     tokio::spawn(async move {
         let expected_user_id = auth
             .current_tokens()
@@ -1319,7 +1329,7 @@ pub async fn run_with_persona(
     app.load_cached_initial();
     draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
 
-    spawn_sync_supervisor(
+    spawn_sync_supervisor(SyncSupervisorArgs {
         config,
         auth,
         graph,
@@ -1328,7 +1338,7 @@ pub async fn run_with_persona(
         ui_tx,
         proxy_focus_rx,
         proxy_nudge_rx,
-    );
+    });
 
     let mut events = TerminalEventReader::start();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
@@ -1576,7 +1586,7 @@ pub async fn run_with_persona(
         }
     }
     app.html_server.shutdown();
-    let _ = sync_ctrl.request(SyncCommand::Shutdown);
+    sync_ctrl.request(SyncCommand::Shutdown);
     events.pause();
     drop(guard);
     Ok(())
@@ -1750,9 +1760,9 @@ mod tests {
             &[Overlay::command_palette()],
             "hd:me|p1:0:80:100:Sixel"
         ));
-        let html_overlay = vec![Overlay::HtmlPreview(
+        let html_overlay = vec![Overlay::HtmlPreview(Box::new(
             crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(None, "<p>x</p>".into()),
-        )];
+        ))];
         assert!(pixel_graphics_allowed_for_overlays(&html_overlay, "html:node1:w80"));
         assert!(!pixel_graphics_allowed_for_overlays(&html_overlay, "hd:me|p1:0:80:100:Sixel"));
         let confirm_over_preview = vec![

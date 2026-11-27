@@ -283,7 +283,7 @@ pub async fn resolve_section_with_refresh(
 /// Outcome of resolving a OneNote page query against cached summaries.
 #[derive(Debug, Clone)]
 pub enum PageResolution {
-    Found(OnenotePageSummary),
+    Found(Box<OnenotePageSummary>),
     NotFound,
     Ambiguous {
         message: String,
@@ -297,7 +297,7 @@ impl PageResolution {
     /// an ambiguous title/prefix as a raw remote page ID.
     pub fn into_option(self) -> Result<Option<OnenotePageSummary>> {
         match self {
-            Self::Found(page) => Ok(Some(page)),
+            Self::Found(page) => Ok(Some(*page)),
             Self::NotFound => Ok(None),
             Self::Ambiguous { message, .. } => bail!("{message}"),
         }
@@ -315,14 +315,14 @@ pub fn resolve_page_in_slice(
         bail!("OneNote page ID or title is empty.");
     }
     if let Some(exact) = pages.iter().find(|p| p.page_key == q || p.id == q) {
-        return Ok(PageResolution::Found(exact.clone()));
+        return Ok(PageResolution::Found(Box::new(exact.clone())));
     }
     let id_prefix: Vec<&OnenotePageSummary> = pages
         .iter()
         .filter(|p| p.id.starts_with(q) || p.page_key.starts_with(q))
         .collect();
     if id_prefix.len() == 1 {
-        return Ok(PageResolution::Found(id_prefix[0].clone()));
+        return Ok(PageResolution::Found(Box::new(id_prefix[0].clone())));
     } else if id_prefix.len() > 1 {
         let message = format!(
             "Ambiguous page ID prefix '{q}' matches {} pages:\n{}",
@@ -341,7 +341,7 @@ pub fn resolve_page_in_slice(
         .filter(|p| p.title.trim().to_lowercase() == q_lower)
         .collect();
     if title_exact.len() == 1 {
-        return Ok(PageResolution::Found(title_exact[0].clone()));
+        return Ok(PageResolution::Found(Box::new(title_exact[0].clone())));
     } else if title_exact.len() > 1 {
         let message = format!(
             "Ambiguous page title '{q}' matches {} pages:\n{}",
@@ -359,7 +359,7 @@ pub fn resolve_page_in_slice(
         .filter(|p| p.title.trim().to_lowercase().starts_with(&q_lower))
         .collect();
     if title_prefix.len() == 1 {
-        return Ok(PageResolution::Found(title_prefix[0].clone()));
+        return Ok(PageResolution::Found(Box::new(title_prefix[0].clone())));
     } else if title_prefix.len() > 1 {
         let message = format!(
             "Ambiguous page prefix '{q}' matches {} pages:\n{}",
@@ -377,7 +377,7 @@ pub fn resolve_page_in_slice(
         .filter(|p| p.title.to_lowercase().contains(&q_lower))
         .collect();
     if title_sub.len() == 1 {
-        return Ok(PageResolution::Found(title_sub[0].clone()));
+        return Ok(PageResolution::Found(Box::new(title_sub[0].clone())));
     } else if title_sub.len() > 1 {
         let message = format!(
             "Ambiguous page '{q}' matches {} pages:\n{}",
@@ -400,7 +400,7 @@ pub fn resolve_page_from_slice(
 ) -> Result<OnenotePageSummary> {
     let q = query.trim();
     match resolve_page_in_slice(pages, q)? {
-        PageResolution::Found(page) => Ok(page),
+        PageResolution::Found(page) => Ok(*page),
         PageResolution::Ambiguous { message, .. } => bail!("{message}"),
         PageResolution::NotFound => bail!("OneNote page not found: {q}"),
     }
@@ -420,7 +420,7 @@ pub fn resolve_page_cached(
     let section_filter = section_key.map(str::trim).filter(|s| !s.is_empty());
     if section_filter.is_none() {
         if let Some(exact) = storage.get_onenote_page_summary(q)? {
-            return Ok(PageResolution::Found(exact));
+            return Ok(PageResolution::Found(Box::new(exact)));
         }
     }
     let candidates = match section_filter {

@@ -239,6 +239,12 @@ pub struct UiState {
     pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
 }
 
+impl Default for UiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UiState {
     pub fn new() -> Self {
         Self::from_config(&AppConfig::default())
@@ -2352,12 +2358,12 @@ impl AppState {
                 );
                 if matches_active_preview {
                     ui.overlays.pop();
-                    ui.overlays.push(Overlay::HtmlPreview(
+                    ui.overlays.push(Overlay::HtmlPreview(Box::new(
                         crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
                             Some(title),
                             html,
                         ),
-                    ));
+                    )));
                     ui.info("Resource returned HTML — opened in interactive HTML viewer");
                 }
             }
@@ -2393,7 +2399,7 @@ impl AppState {
                             html,
                         )
                     };
-                    ui.overlays.push(Overlay::HtmlPreview(overlay));
+                    ui.overlays.push(Overlay::HtmlPreview(Box::new(overlay)));
                 }
             }
             UiMsg::HtmlServed { url } => match open::that(&url) {
@@ -2650,7 +2656,7 @@ mod tests {
             b.body_plain.clone(),
         );
         form.body = "Unsaved draft".into();
-        ui.overlays.push(Overlay::OnenoteForm(form));
+        ui.overlays.push(Overlay::OnenoteForm(Box::new(form)));
 
         app.select_page("me|page-3".into(), &mut ui);
         assert!(!app.page_details.contains_key(&a.summary.page_key));
@@ -3045,8 +3051,10 @@ mod tests {
             let _ = axum::serve(listener, app_router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = crate::auth::StoredTokens {
             access_token: "tui-test-token".to_string(),
             refresh_token: None,
@@ -3347,8 +3355,10 @@ mod tests {
             let _ = axum::serve(listener, app_router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "raw-cache-token".to_string(),
             refresh_token: None,

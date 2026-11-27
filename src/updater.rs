@@ -490,7 +490,7 @@ pub(crate) fn verify_sha256_sums(
         bail!("Checksum entry for '{asset_name}' not found in SHA256SUMS.txt");
     };
 
-    let actual = hex::encode(Sha256::digest(asset_bytes));
+    let actual = crate::hex_encode(Sha256::digest(asset_bytes));
     if !actual.eq_ignore_ascii_case(&expected) {
         bail!(
             "SHA-256 verification failed ({asset_name}): expected {expected}, actual {actual}"
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn test_sha256_verification_success_and_mismatch() {
         let payload = b"onenote-binary-content-v0.2.0";
-        let digest = hex::encode(Sha256::digest(payload));
+        let digest = crate::hex_encode(Sha256::digest(payload));
         let sums = format!("{digest}  onenote.exe\n0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n");
         verify_sha256_sums(&sums, "onenote.exe", payload).unwrap();
 
@@ -809,7 +809,7 @@ mod tests {
             "onenote"
         }
         .to_string();
-        let digest = hex::encode(Sha256::digest(&new_binary));
+        let digest = crate::hex_encode(Sha256::digest(&new_binary));
         let sums_text = format!("{digest}  {asset_name}\n");
 
         let state = MockReleaseState {

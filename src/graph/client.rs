@@ -118,23 +118,8 @@ pub(crate) struct GraphListPage<T> {
     pub next_link: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(bound(deserialize = "T: Deserialize<'de>"))]
-#[allow(dead_code)]
-pub(crate) struct GraphDeltaPage<T> {
-    #[serde(default = "Vec::new")]
-    pub value: Vec<T>,
-    #[serde(rename = "@odata.nextLink", default)]
-    pub next_link: Option<String>,
-    #[serde(rename = "@odata.deltaLink", default)]
-    pub delta_link: Option<String>,
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct GraphIdentity {
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub id: Option<String>,
     #[serde(rename = "displayName", default)]
     pub display_name: Option<String>,
 }
@@ -543,46 +528,6 @@ impl GraphClient {
             .context("Failed to read Graph PUT response body")?;
         serde_json::from_slice(&resp_bytes)
             .with_context(|| format!("Failed to deserialize Graph PUT JSON ({url})"))
-    }
-
-    /// Uploads a chunk to a pre-authenticated `createUploadSession` URL without Bearer header.
-    #[allow(dead_code)]
-    pub(crate) async fn put_upload_chunk(
-        &self,
-        upload_url: &str,
-        chunk: &[u8],
-        start: u64,
-        end_inclusive: u64,
-        total: u64,
-    ) -> Result<(StatusCode, serde_json::Value)> {
-        let headers = vec![
-            (
-                "Content-Range",
-                format!("bytes {start}-{end_inclusive}/{total}"),
-            ),
-            ("Content-Length", chunk.len().to_string()),
-        ];
-        let (resp, _request) = self
-            .execute_with_retry(
-                Method::PUT,
-                upload_url,
-                RequestBody::Bytes {
-                    data: Arc::from(chunk),
-                    content_type: Some("application/octet-stream".to_string()),
-                },
-                &headers,
-                false,
-                MEDIA_REQUEST_TIMEOUT,
-            )
-            .await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let val = if text.trim().is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
-        };
-        Ok((status, val))
     }
 
     pub async fn get_bytes(&self, path_or_url: &str) -> Result<Vec<u8>> {
@@ -998,8 +943,10 @@ mod tests {
 
     #[test]
     fn test_resolve_url_relative_and_absolute() {
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = "https://graph.microsoft.com/v1.0/".to_string();
+        let cfg = AppConfig {
+            graph_base_url: "https://graph.microsoft.com/v1.0/".to_string(),
+            ..AppConfig::default()
+        };
         let auth = AuthManager::from_tokens(
             cfg.clone(),
             crate::auth::StoredTokens {
@@ -1153,10 +1100,12 @@ mod tests {
         });
 
         let dir = tempdir().unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
-        cfg.tenant_id = "tid".into();
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            graph_base_url: format!("http://{addr}/v1.0"),
+            tenant_id: "tid".into(),
+            ..AppConfig::default()
+        };
 
         let tok = crate::auth::StoredTokens {
             access_token: "stale-token".into(),
@@ -1270,8 +1219,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -1314,8 +1265,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,

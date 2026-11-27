@@ -115,8 +115,8 @@ impl LinkExtractorOverlay {
     pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
         hitmap.add(area, HitTarget::OverlayBackdrop);
-        let max_w = area.width.saturating_sub(6).min(96).max(36);
-        let max_h = area.height.saturating_sub(4).min(22).max(9);
+        let max_w = area.width.saturating_sub(6).clamp(36, 96);
+        let max_h = area.height.saturating_sub(4).clamp(9, 22);
         let rect = centered_rect(area, max_w, max_h);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
@@ -288,7 +288,7 @@ fn push_link(
 
 fn clean_url(raw: &str) -> String {
     raw.trim()
-        .trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ')' | ']' | '>' | '"' | '\''))
+        .trim_end_matches(['.', ',', ';', ')', ']', '>', '"', '\''])
         .to_string()
 }
 

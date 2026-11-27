@@ -50,7 +50,7 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const LOCK_STALE_AGE: Duration = Duration::from_secs(5);
 const BROADCAST_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub running: bool,
     pub pid: Option<u32>,
@@ -64,25 +64,6 @@ pub struct DaemonStatus {
     pub sync_summary: String,
     pub last_sync_at: Option<String>,
     pub last_error: Option<String>,
-}
-
-impl Default for DaemonStatus {
-    fn default() -> Self {
-        Self {
-            running: false,
-            pid: None,
-            version: None,
-            transport: None,
-            endpoint: None,
-            user_id: None,
-            uptime_secs: None,
-            attached_clients: 0,
-            sync_busy: false,
-            sync_summary: String::new(),
-            last_sync_at: None,
-            last_error: None,
-        }
-    }
 }
 
 /// Handle returned when a TUI client attaches to a live background sync daemon.
@@ -451,7 +432,7 @@ impl AsyncWrite for IpcStream {
 fn generate_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    crate::hex_encode(bytes)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -587,7 +568,7 @@ fn config_dir_short_hash(config_dir: &Path) -> String {
     {
         hasher.update(canonical.to_string_lossy().as_bytes());
     }
-    let digest = hex::encode(hasher.finalize());
+    let digest = crate::hex_encode(hasher.finalize());
     digest[..12].to_string()
 }
 
@@ -1991,8 +1972,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let paths = DaemonPaths::from_config_dir(dir.path());
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "daemon-403-test-token".to_string(),
             refresh_token: None,

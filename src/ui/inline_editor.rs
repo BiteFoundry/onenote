@@ -470,19 +470,8 @@ impl OnenoteInlineEditor {
                 let content_glyphs = rendered_line_content_glyphs(ctx);
                 let prev_glyph = content_glyphs.iter().rev().find(|g| g.src_byte < cursor);
 
-                if prev_glyph.is_none() {
-                    if let Some((del_start_rel, content_rel)) = prefix {
-                        (
-                            Some((ctx.line_start + del_start_rel)..(ctx.line_start + content_rel)),
-                            false,
-                        )
-                    } else if ctx.line_start > 0 {
-                        (Some((ctx.line_start - 1)..ctx.line_start), false)
-                    } else {
-                        (None, false)
-                    }
-                } else {
-                    let prev_byte = prev_glyph.unwrap().src_byte;
+                if let Some(prev_glyph) = prev_glyph {
+                    let prev_byte = prev_glyph.src_byte;
                     let ch_len = text[prev_byte..].chars().next().map_or(1, char::len_utf8);
                     let mut del_start = prev_byte;
                     let mut del_end = prev_byte + ch_len;
@@ -504,6 +493,15 @@ impl OnenoteInlineEditor {
                     del_start = exp_start;
                     del_end = exp_end;
                     (Some(del_start..del_end), false)
+                } else if let Some((del_start_rel, content_rel)) = prefix {
+                    (
+                        Some((ctx.line_start + del_start_rel)..(ctx.line_start + content_rel)),
+                        false,
+                    )
+                } else if ctx.line_start > 0 {
+                    (Some((ctx.line_start - 1)..ctx.line_start), false)
+                } else {
+                    (None, false)
                 }
             }
         };
@@ -1347,7 +1345,7 @@ fn build_logical_line_glyphs(
         }
         FenceLineKind::Close => {
             if hide_delimiters {
-                let rule = "─".repeat(width.min(12).max(1));
+                let rule = "─".repeat(width.clamp(1, 12));
                 push_synthetic_str(&rule, theme.muted_style(), line_start, out);
             } else {
                 push_raw_slice(
@@ -1380,7 +1378,7 @@ fn build_logical_line_glyphs(
     // 2. Horizontal rule (`---`, `***`, `___`)
     if is_horizontal_rule(raw) {
         if hide_delimiters {
-            let rule = "─".repeat(width.min(48).max(1));
+            let rule = "─".repeat(width.clamp(1, 48));
             push_synthetic_str(&rule, theme.muted_style(), line_start, out);
         } else {
             push_raw_slice(raw, line_start, theme.muted_style(), out);
@@ -1943,7 +1941,9 @@ fn parse_inline_markdown(
         }
 
         // 10. Literal character
-        let ch = s[i..].chars().next().unwrap();
+        let Some(ch) = s[i..].chars().next() else {
+            break;
+        };
         out.push(Glyph::from_source_char(ch, base_style, base_offset + i));
         i += ch.len_utf8();
     }

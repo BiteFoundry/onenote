@@ -1565,17 +1565,17 @@ async fn run_open_page_content_poll(
             true
         }
         Err(err) => {
-            if crate::graph::onenote::is_not_found_error(&err) {
-                if !storage.page_mutated_since(page_key, start_epoch) {
-                    let _ = storage.delete_onenote_page(page_key);
-                    if let Some(sec_key) = prev_section_key {
-                        let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
-                        let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
-                            section_key: sec_key,
-                            pages: persisted,
-                            notify_candidate: None,
-                        });
-                    }
+            if crate::graph::onenote::is_not_found_error(&err)
+                && !storage.page_mutated_since(page_key, start_epoch)
+            {
+                let _ = storage.delete_onenote_page(page_key);
+                if let Some(sec_key) = prev_section_key {
+                    let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
+                    let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
+                        section_key: sec_key,
+                        pages: persisted,
+                        notify_candidate: None,
+                    });
                 }
             } else {
                 // Transient failure: preserve last read result and back off normally.
@@ -1797,17 +1797,17 @@ async fn run_hydrate_page(
             if err.is::<AutomaticRequestBudgetExhausted>() {
                 return false;
             }
-            if crate::graph::onenote::is_not_found_error(&err) {
-                if !storage.page_mutated_since(page_key, start_epoch) {
-                    let _ = storage.delete_onenote_page(page_key);
-                    if let Some(sec_key) = prev_section_key {
-                        let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
-                        let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
-                            section_key: sec_key,
-                            pages: persisted,
-                            notify_candidate: None,
-                        });
-                    }
+            if crate::graph::onenote::is_not_found_error(&err)
+                && !storage.page_mutated_since(page_key, start_epoch)
+            {
+                let _ = storage.delete_onenote_page(page_key);
+                if let Some(sec_key) = prev_section_key {
+                    let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
+                    let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
+                        section_key: sec_key,
+                        pages: persisted,
+                        notify_candidate: None,
+                    });
                 }
             }
             let _ = event_tx.send(CoreEvent::SyncError(format!(
@@ -2197,8 +2197,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "sync-test-token".to_string(),
             refresh_token: None,
@@ -2435,8 +2437,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "sync-test-token".to_string(),
             refresh_token: None,
@@ -2552,8 +2556,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "sync-test-token".to_string(),
             refresh_token: None,
@@ -3002,8 +3008,10 @@ mod tests {
                 let _ = axum::serve(listener, app).await;
             });
 
-            let mut cfg = AppConfig::default();
-            cfg.graph_base_url = base_url;
+            let cfg = AppConfig {
+                graph_base_url: base_url,
+                ..AppConfig::default()
+            };
             let tokens = StoredTokens {
                 access_token: "sync-test-token".to_string(),
                 refresh_token: None,
@@ -3131,8 +3139,10 @@ mod tests {
         let srv = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "sync-test-token".to_string(),
             refresh_token: None,
@@ -3241,8 +3251,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "sync-test-token".to_string(),
             refresh_token: None,
@@ -3406,8 +3418,10 @@ mod tests {
         assert_eq!(crate::graph::client::parse_retry_after_secs(&empty_headers, 1), 2);
         assert_eq!(crate::graph::client::parse_retry_after_secs(&empty_headers, 2), 4);
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "sync-test-token".to_string(),
             refresh_token: None,
@@ -3585,8 +3599,11 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            active_poll_ms: 2_000,
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "sync-test-token".to_string(),
             refresh_token: None,
@@ -3598,7 +3615,6 @@ mod tests {
             user_email: None,
             auth_mode: "access_token".to_string(),
         };
-        cfg.active_poll_ms = 2_000;
         let auth = AuthManager::from_tokens(cfg.clone(), tokens);
         let graph = GraphClient::new(cfg.clone(), auth).unwrap();
         let storage = Storage::open_in_memory().unwrap();
@@ -4470,8 +4486,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "sync-test-token".to_string(),
             refresh_token: None,

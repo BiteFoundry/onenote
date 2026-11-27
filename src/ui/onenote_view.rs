@@ -231,7 +231,7 @@ pub fn draw_section_ribbon(
         let hint = " No sections yet ";
         let hint_w = UnicodeWidthStr::width(hint) as u16;
         let mut spans = vec![Span::styled(hint, theme.muted_style())];
-        if area.width >= hint_w + add_w + 1 {
+        if area.width > hint_w + add_w {
             spans.push(Span::styled(
                 add_label,
                 Style::default()
@@ -1737,32 +1737,7 @@ fn spans_plain_text(spans: &[RichSpan]) -> String {
 }
 
 fn spans_to_markdown(spans: &[RichSpan]) -> String {
-    let mut out = String::new();
-    for sp in spans {
-        let t = &sp.text;
-        if t.is_empty() {
-            continue;
-        }
-        let mut formatted = if sp.style.code {
-            format!("`{t}`")
-        } else {
-            t.clone()
-        };
-        if sp.style.bold {
-            formatted = format!("**{formatted}**");
-        }
-        if sp.style.italic {
-            formatted = format!("*{formatted}*");
-        }
-        if sp.style.strike {
-            formatted = format!("~~{formatted}~~");
-        }
-        if let Some(url) = &sp.style.link_url {
-            formatted = format!("[{formatted}]({url})");
-        }
-        out.push_str(&formatted);
-    }
-    out
+    crate::parser::onenote::spans_to_markdown(spans)
 }
 
 fn truncate_clean(text: &str, max_width: usize) -> String {

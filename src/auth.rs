@@ -2814,9 +2814,11 @@ mod tests {
     async fn test_direct_access_token_login_and_valid_token() {
         let _env_lock = ENV_LOCK.lock().await;
         let _env_guard = EnvVarGuard::clear_auth_env();
-        let mut cfg = AppConfig::default();
-        cfg.client_id = "cid".into();
-        cfg.tenant_id = "tid".into();
+        let cfg = AppConfig {
+            client_id: "cid".into(),
+            tenant_id: "tid".into(),
+            ..AppConfig::default()
+        };
 
         let tok = StoredTokens {
             access_token: "direct-tok".into(),
@@ -2876,10 +2878,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let cred_path = dir.path().join("creds.json");
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.client_id = "cid".into();
-        cfg.tenant_id = "tenant-1".into();
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            client_id: "cid".into(),
+            tenant_id: "tenant-1".into(),
+            ..AppConfig::default()
+        };
 
         let dummy = StoredTokens {
             access_token: "old".into(),
@@ -3170,9 +3174,11 @@ mod tests {
         );
         std::fs::write(&token_path, &soon_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
+        let mut cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            token_refresh_mins: 5,
+            ..AppConfig::default()
+        };
         #[cfg(windows)]
         {
             cfg.token_refresh_cmd = format!("echo {fresh_jwt}> \"{}\"", token_path.display());
@@ -3199,10 +3205,12 @@ mod tests {
 
         let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 120 }), false);
         std::fs::write(&token_path, &soon_jwt).unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
-        cfg.token_refresh_cmd = "exit 1".to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            token_refresh_mins: 5,
+            token_refresh_cmd: "exit 1".to_string(),
+            ..AppConfig::default()
+        };
 
         let mgr = AuthManager::new(cfg.clone()).unwrap();
         assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
@@ -3225,8 +3233,10 @@ mod tests {
             make_test_jwt_with_encoder(&serde_json::json!({ "exp": now - 120 }), false);
         std::fs::write(&token_path, &expired_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            ..AppConfig::default()
+        };
         let mgr_file = AuthManager::new(cfg.clone()).unwrap();
         assert!(!mgr_file.is_refreshable().await);
         let msg_file = mgr_file.valid_access_token().await.unwrap_err().to_string();
@@ -3251,8 +3261,10 @@ mod tests {
             make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 3600 }), false);
         std::fs::write(&token_path, &fresh_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            ..AppConfig::default()
+        };
         assert!(should_skip_keyring_on_init(&cfg));
 
         let ext_tok = read_external_token_file(&token_path, &cfg).unwrap();
@@ -3374,8 +3386,10 @@ mod tests {
         std::fs::write(&teams_tok_path, &teams_only_jwt).unwrap();
 
         let onenote_cred_path = dir.path().join("onenote_creds.json");
-        let mut cfg = AppConfig::default();
-        cfg.share_m365_auth = true;
+        let cfg = AppConfig {
+            share_m365_auth: true,
+            ..AppConfig::default()
+        };
 
         // 1. Teams-only token in teams-cli token_file must NOT be reused
         let mgr_skip = AuthManager::empty_for_test(cfg.clone())
@@ -3479,9 +3493,11 @@ mod tests {
         std::fs::create_dir_all(&teams_dir).unwrap();
         let onenote_cred_path = dir.path().join("onenote-cli").join("credentials.json");
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.share_m365_auth = true;
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            share_m365_auth: true,
+            ..AppConfig::default()
+        };
 
         // 1. Teams session already has Notes.ReadWrite -> reused directly without hitting token endpoint
         let teams_with_notes = StoredTokens {
@@ -3644,10 +3660,12 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.client_id = "cid-eph".into();
-        cfg.tenant_id = "tenant-ephemeral".into();
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            client_id: "cid-eph".into(),
+            tenant_id: "tenant-ephemeral".into(),
+            ..AppConfig::default()
+        };
 
         let expired = StoredTokens {
             access_token: "ephemeral-old-tok".into(),
@@ -3794,9 +3812,11 @@ mod tests {
         };
         save_tokens_to_path(&teams_tok, &teams_dir.join("credentials.json")).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.share_m365_auth = true;
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            share_m365_auth: true,
+            ..AppConfig::default()
+        };
 
         // 2a. Expired non-refreshable stored token upgrades via valid_access_token()
         let cred_path_1 = dir.path().join("onenote-1").join("credentials.json");
@@ -3874,9 +3894,11 @@ mod tests {
         };
         save_tokens_to_path(&teams_msa_tok, &teams_dir.join("credentials.json")).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.share_m365_auth = true;
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            share_m365_auth: true,
+            ..AppConfig::default()
+        };
 
         let onenote_cred_path = dir.path().join("onenote-cli").join("credentials.json");
         let mgr = AuthManager::empty_for_test(cfg)
@@ -3962,8 +3984,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            ..AppConfig::default()
+        };
         let expired_org = StoredTokens {
             access_token: "old-org-token".into(),
             refresh_token: Some("rt-org".into()),
