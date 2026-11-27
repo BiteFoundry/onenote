@@ -5,7 +5,7 @@
 # seconds and match the published release artifact.
 FROM debian:bookworm-slim
 
-ARG ONENOTE_VERSION=0.4.9
+ARG ONENOTE_VERSION=0.4.10
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="onenote" \
