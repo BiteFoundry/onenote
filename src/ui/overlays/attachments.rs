@@ -12,7 +12,7 @@ use crate::{
     models::OnenotePageDetail,
     ui::{
         action::Action,
-        app::{AppState, UiState},
+        app::UiState,
         hitmap::{HitMap, HitTarget},
         overlays::{centered_rect, OverlayOutcome},
     },
@@ -92,11 +92,8 @@ impl AttachmentsState {
         self.selected = index;
     }
 
-    pub fn handle(&mut self, action: &Action, app: &AppState) -> OverlayOutcome {
-        let items = app
-            .active_page_detail()
-            .map(rows_from_onenote_page)
-            .unwrap_or_default();
+    pub fn handle(&mut self, action: &Action, detail: Option<&OnenotePageDetail>) -> OverlayOutcome {
+        let items = detail.map(rows_from_onenote_page).unwrap_or_default();
         match action {
             Action::MoveUp => {
                 self.selected = self.selected.saturating_sub(1);
@@ -154,16 +151,13 @@ impl AttachmentsState {
         &self,
         frame: &mut Frame,
         area: Rect,
-        app: &AppState,
+        detail: Option<&OnenotePageDetail>,
         ui: &UiState,
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
         hitmap.add(area, HitTarget::OverlayBackdrop);
-        let items = app
-            .active_page_detail()
-            .map(rows_from_onenote_page)
-            .unwrap_or_default();
+        let items = detail.map(rows_from_onenote_page).unwrap_or_default();
         let rect = centered_rect(area, 72, (items.len() as u16 + 5).clamp(7, 20));
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);

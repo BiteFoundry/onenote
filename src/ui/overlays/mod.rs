@@ -183,7 +183,13 @@ impl Overlay {
                 other => settings.handle(other, app),
             },
             Overlay::Search(search) => search.handle(action, app),
-            Overlay::Attachments(tray) => tray.handle(action, app),
+            Overlay::Attachments(tray) => {
+                let detail = app
+                    .active_page_key
+                    .as_ref()
+                    .and_then(|k| app.page_details.get(k));
+                tray.handle(action, detail)
+            }
             Overlay::PathInput(input) => input.handle(action),
             Overlay::FilePicker(picker) => picker.handle(action),
             Overlay::Links(links) => links.handle(action),
@@ -264,7 +270,13 @@ impl Overlay {
             Overlay::CommandPalette(palette) => palette.draw(frame, area, app, ui, hitmap),
             Overlay::Settings(settings) => settings.draw(frame, area, app, ui, hitmap),
             Overlay::Search(search) => search.draw(frame, area, app, ui, hitmap),
-            Overlay::Attachments(tray) => tray.draw(frame, area, app, ui, hitmap),
+            Overlay::Attachments(tray) => {
+                let detail = app
+                    .active_page_key
+                    .as_ref()
+                    .and_then(|k| app.page_details.get(k));
+                tray.draw(frame, area, detail, ui, hitmap)
+            }
             Overlay::PathInput(input) => input.draw(frame, area, ui, hitmap),
             Overlay::FilePicker(picker) => picker.draw(frame, area, ui, hitmap),
             Overlay::Links(links) => links.draw(frame, area, ui, hitmap),

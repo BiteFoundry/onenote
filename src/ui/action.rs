@@ -13,7 +13,7 @@ use crate::{
         composer,
         hitmap::{ButtonId, HitTarget},
         overlays::{
-            context_menu::{ContextMenu, ContextTarget},
+            context_menu::ContextTarget,
             html_preview::HtmlPreviewOverlay,
             image_preview::ImagePreviewOverlay,
             links::LinkExtractorOverlay,
@@ -696,7 +696,7 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                 Focus::Canvas => ContextTarget::CanvasBlock,
                 _ => ContextTarget::Global,
             };
-            let menu = ContextMenu::build(target, (col, row), app, ui);
+            let menu = app.build_context_menu(target, (col, row));
             ui.overlays.push(Overlay::context_menu(menu));
             false
         }
@@ -767,7 +767,7 @@ fn dispatch_inner(action: Action, app: &mut AppState, ui: &mut UiState) -> bool 
                     _ => ContextTarget::Global,
                 },
             };
-            let menu = ContextMenu::build(target, (col, row), app, ui);
+            let menu = app.build_context_menu(target, (col, row));
             ui.overlays.push(Overlay::context_menu(menu));
             false
         }
@@ -1993,22 +1993,23 @@ mod tests {
 
         // 1. Attachments overlay detects .html and .htm resources and routes Enter/v to OpenHtmlResource (NOT ImagePreview)
         let mut tray = crate::ui::overlays::attachments::AttachmentsState::default();
+        let active_detail = app.active_page_detail();
         assert_eq!(
-            tray.handle(&Action::Input('v'), &app),
+            tray.handle(&Action::Input('v'), active_detail),
             OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
         );
         assert_eq!(
-            tray.handle(&Action::Activate, &app),
+            tray.handle(&Action::Activate, active_detail),
             OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
         );
         tray.select(1);
         assert_eq!(
-            tray.handle(&Action::Input('v'), &app),
+            tray.handle(&Action::Input('v'), active_detail),
             OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(1))
         );
         tray.select(2);
         assert_eq!(
-            tray.handle(&Action::Input('v'), &app),
+            tray.handle(&Action::Input('v'), active_detail),
             OverlayOutcome::CloseAndDispatch(Action::OpenImagePreviewAt(2))
         );
 
@@ -2121,21 +2122,22 @@ mod tests {
 
         // 2. Enter / v / H in attachments tray dispatch OpenHtmlResource (NOT DownloadResource)
         let mut tray = crate::ui::overlays::attachments::AttachmentsState::default();
+        let active_detail = app.active_page_detail();
         assert_eq!(
-            tray.handle(&Action::Activate, &app),
+            tray.handle(&Action::Activate, active_detail),
             OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
         );
         assert_eq!(
-            tray.handle(&Action::Input('v'), &app),
+            tray.handle(&Action::Input('v'), active_detail),
             OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
         );
         assert_eq!(
-            tray.handle(&Action::Input('H'), &app),
+            tray.handle(&Action::Input('H'), active_detail),
             OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(0))
         );
         tray.select(1);
         assert_eq!(
-            tray.handle(&Action::Activate, &app),
+            tray.handle(&Action::Activate, active_detail),
             OverlayOutcome::CloseAndDispatch(Action::OpenHtmlResource(1))
         );
 

@@ -10,7 +10,7 @@ use ratatui::{
 
 use crate::ui::{
     action::Action,
-    app::{AppState, UiState},
+    app::UiState,
     hitmap::{HitMap, HitTarget},
     overlays::{OverlayKind, OverlayOutcome},
 };
@@ -48,7 +48,7 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
-    pub fn build(target: ContextTarget, anchor: (u16, u16), app: &AppState, _ui: &UiState) -> Self {
+    pub fn build(target: ContextTarget, anchor: (u16, u16), has_resources: bool) -> Self {
         let mut items = match target {
             ContextTarget::PageItem => vec![
                 MenuItem::new("New Page", Some("n"), Action::OpenOnenoteCreatePage { level: 0 }),
@@ -88,11 +88,7 @@ impl ContextMenu {
             ],
         };
 
-        if matches!(target, ContextTarget::PageItem)
-            && app
-                .active_page_detail()
-                .is_some_and(|d| !d.resources.is_empty())
-        {
+        if matches!(target, ContextTarget::PageItem) && has_resources {
             items.push(MenuItem::new(
                 "Resources & Attachments",
                 Some("A"),
