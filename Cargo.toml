@@ -21,9 +21,9 @@ base64 = "0.22"
 bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "4d9f94b14c8a8b9a8775b630af4510483e0efe45" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = "0.28"
 dirs = "5"
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 notify-rust = "4"
 open = "5"
@@ -36,13 +36,11 @@ scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
 unicode-width = "0.2"
 url = "2"
 urlencoding = "2"
-uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
@@ -54,9 +52,12 @@ keyring = { version = "3", features = ["apple-native"] }
 keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 [profile.release]
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+panic = "abort"
 
 [dev-dependencies]
 rcgen = "0.13"
+tempfile = "3"

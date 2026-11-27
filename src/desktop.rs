@@ -21,6 +21,18 @@ pub async fn rename_section(section_id: &str, name: &str) -> Result<Value> {
     run_edit(section_id, json!({ "operation": "rename", "name": name })).await
 }
 
+fn is_valid_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    match b.len() {
+        36 => b.iter().enumerate().all(|(i, &c)| match i {
+            8 | 13 | 18 | 23 => c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        }),
+        32 => b.iter().all(|c| c.is_ascii_hexdigit()),
+        _ => false,
+    }
+}
+
 async fn run_edit(id: &str, mut request: Value) -> Result<Value> {
     use std::os::windows::process::CommandExt;
 
@@ -28,7 +40,7 @@ async fn run_edit(id: &str, mut request: Value) -> Result<Value> {
     let Some((guid, suffix)) = id.strip_prefix('{').and_then(|s| s.split_once('}')) else {
         bail!("Provide the complete OneNote desktop ID from GetHierarchy.");
     };
-    if uuid::Uuid::parse_str(guid).is_err() || !suffix.starts_with('{') || !suffix.ends_with('}') {
+    if !is_valid_uuid(guid) || !suffix.starts_with('{') || !suffix.ends_with('}') {
         bail!("Provide the complete OneNote desktop ID from GetHierarchy.");
     }
     request["id"] = json!(id);
@@ -79,5 +91,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("complete OneNote desktop ID"));
+    }
+
+    #[test]
+    fn validates_uuid_strings() {
+        assert!(is_valid_uuid("12345678-1234-4abc-8def-0123456789AB"));
+        assert!(is_valid_uuid("1234567812344abc8def0123456789ab"));
+        assert!(!is_valid_uuid("12345678-1234-4abc-8def-0123456789AG"));
+        assert!(!is_valid_uuid("not-a-uuid"));
     }
 }

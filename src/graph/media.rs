@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::AsyncReadExt;
-use uuid::Uuid;
 
 use super::GraphClient;
 use crate::models::{DownloadedResource, OnenoteResource};
@@ -312,7 +311,7 @@ pub fn deduplicate_dest_path(dest_dir: &Path, safe_name: &str) -> PathBuf {
             return next_path;
         }
     }
-    dest_dir.join(format!("{stem}_{}", Uuid::new_v4()))
+    dest_dir.join(format!("{stem}_{}", crate::uuid_v4_hyphenated()))
 }
 
 pub fn guess_mime_type(path: &Path) -> &'static str {

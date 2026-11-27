@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::Result;
-use futures::stream::{self, StreamExt};
+use futures_util::stream::{self, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -3164,7 +3164,7 @@ mod tests {
                     .unwrap()
             }
         });
-        let _ = futures::future::join_all(futs).await;
+        let _ = futures_util::future::join_all(futs).await;
         assert!(
             graph.max_in_flight_requests() <= 5,
             "peak concurrent Graph requests must never exceed 5, got {}",

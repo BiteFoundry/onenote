@@ -9,7 +9,6 @@ use bitefoundry_html::pulldown_cmark::{
 };
 use chrono::Utc;
 use scraper::{ElementRef, Html, Node, Selector};
-use uuid::Uuid;
 
 use crate::models::{
     InlineImageUpload, OnenoteBlock, OnenoteBlockKind, OnenotePageDetail, OnenotePageSummary,
@@ -3765,7 +3764,7 @@ fn build_multipart_payload(
     first_part_bytes: &[u8],
     inline_images: &[InlineImageUpload],
 ) -> (Vec<u8>, String) {
-    let boundary = format!("onenote-part-{}", Uuid::new_v4().simple());
+    let boundary = format!("onenote-part-{}", crate::uuid_v4_simple());
     let mut body = Vec::with_capacity(first_part_bytes.len() + inline_images.len() * 512 + 256);
 
     // Part 1: Presentation (XHTML) or Commands (JSON)

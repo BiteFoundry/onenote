@@ -499,13 +499,59 @@ pub(crate) fn verify_sha256_sums(
     Ok(())
 }
 
+struct TempExtractDir {
+    path: PathBuf,
+}
+
+impl TempExtractDir {
+    fn new() -> Result<Self> {
+        use rand::RngCore;
+        let base = std::env::temp_dir();
+        for _ in 0..16 {
+            let mut nonce = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            let candidate = base.join(format!("onenote-update-{}", crate::hex_encode(nonce)));
+            #[cfg(unix)]
+            let create_res = {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new().mode(0o700).create(&candidate)
+            };
+            #[cfg(not(unix))]
+            let create_res = std::fs::create_dir(&candidate);
+            match create_res {
+                Ok(()) => return Ok(Self { path: candidate }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Failed to create temporary directory for update extraction: {}",
+                            candidate.display()
+                        )
+                    });
+                }
+            }
+        }
+        bail!("Failed to allocate unique temporary directory for update extraction")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempExtractDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec<u8>> {
     let lower = asset_name.to_ascii_lowercase();
     if !lower.ends_with(".tar.gz") && !lower.ends_with(".tgz") && !lower.ends_with(".zip") {
         return Ok(asset_bytes.to_vec());
     }
 
-    let tmp = tempfile::tempdir().context("Failed to create temporary directory for update extraction")?;
+    let tmp = TempExtractDir::new()?;
     let archive_path = tmp.path().join(asset_name);
     std::fs::write(&archive_path, asset_bytes)
         .with_context(|| format!("Failed to save temporary archive: {}", archive_path.display()))?;
@@ -659,6 +705,18 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn test_temp_extract_dir_creates_and_cleans_up_on_drop() {
+        let dir_path = {
+            let tmp = TempExtractDir::new().unwrap();
+            let p = tmp.path().to_path_buf();
+            assert!(p.is_dir());
+            std::fs::write(p.join("probe.txt"), b"ok").unwrap();
+            p
+        };
+        assert!(!dir_path.exists());
+    }
 
     #[test]
     fn test_semver_parsing_and_comparison() {
