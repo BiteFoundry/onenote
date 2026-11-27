@@ -22,19 +22,28 @@ impl GraphClient {
             bail!("OneNote resource URL is empty.");
         }
         if trimmed.len() >= 11 && trimmed[..11].eq_ignore_ascii_case("data:image/") {
-            let decoded = bitefoundry_html::graphics::decode_data_image_uri(trimmed)
-                .context("Failed to decode inline data:image URI")?;
-            if decoded.is_svg {
-                let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
-                    &decoded.bytes,
-                    1024,
-                    1024,
-                    None,
-                )
-                .context("Failed to rasterize inline data:image/svg+xml URI")?;
-                return Ok(("image/png".to_string(), raster.png_bytes.to_vec()));
+            #[cfg(feature = "svg-graphics")]
+            {
+                let decoded = bitefoundry_html::graphics::decode_data_image_uri(trimmed)
+                    .context("Failed to decode inline data:image URI")?;
+                if decoded.is_svg {
+                    let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
+                        &decoded.bytes,
+                        1024,
+                        1024,
+                        None,
+                    )
+                    .context("Failed to rasterize inline data:image/svg+xml URI")?;
+                    return Ok(("image/png".to_string(), raster.png_bytes.to_vec()));
+                }
+                return Ok((decoded.mime, decoded.bytes));
             }
-            return Ok((decoded.mime, decoded.bytes));
+            #[cfg(not(feature = "svg-graphics"))]
+            {
+                bail!(
+                    "Inline data:image URI decoding requires the `svg-graphics` feature (rebuild with `--features svg-graphics`)"
+                );
+            }
         }
         let use_bearer = should_send_bearer(&self.config.graph_base_url, trimmed);
         let bytes = self
@@ -543,6 +552,7 @@ mod tests {
         assert!(is_raster_image_resource("image/png", "real.png", &real_hdr));
     }
 
+    #[cfg(feature = "svg-graphics")]
     #[tokio::test]
     async fn test_fetch_data_image_uri_decodes_locally_without_http() {
         use base64::Engine as _;

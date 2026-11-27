@@ -1340,17 +1340,33 @@ fn validate_raster_image_bytes(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "svg-graphics")]
+const MAX_SVG_RASTER_DIM_PX: u32 = bitefoundry_html::graphics::MAX_RASTER_DIM_PX;
+#[cfg(not(feature = "svg-graphics"))]
+const MAX_SVG_RASTER_DIM_PX: u32 = 2048;
+
 fn maybe_rasterize_svg(
     bytes: &[u8],
     max_px_w: u32,
     max_px_h: u32,
 ) -> Result<(std::borrow::Cow<'_, [u8]>, bool)> {
     if looks_like_svg_bytes(bytes) {
-        let cap_w = max_px_w.clamp(1, bitefoundry_html::graphics::MAX_RASTER_DIM_PX);
-        let cap_h = max_px_h.clamp(1, bitefoundry_html::graphics::MAX_RASTER_DIM_PX);
-        let raster = bitefoundry_html::graphics::rasterize_svg_to_png(bytes, cap_w, cap_h, None)
-            .context("Failed to rasterize SVG image")?;
-        Ok((std::borrow::Cow::Owned(raster.png_bytes.to_vec()), true))
+        #[cfg(feature = "svg-graphics")]
+        {
+            let cap_w = max_px_w.clamp(1, MAX_SVG_RASTER_DIM_PX);
+            let cap_h = max_px_h.clamp(1, MAX_SVG_RASTER_DIM_PX);
+            let raster =
+                bitefoundry_html::graphics::rasterize_svg_to_png(bytes, cap_w, cap_h, None)
+                    .context("Failed to rasterize SVG image")?;
+            Ok((std::borrow::Cow::Owned(raster.png_bytes.to_vec()), true))
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            let _ = (max_px_w, max_px_h);
+            bail!(
+                "SVG image rendering requires the `svg-graphics` feature (rebuild with `--features svg-graphics`)"
+            );
+        }
     } else {
         Ok((std::borrow::Cow::Borrowed(bytes), false))
     }
@@ -1427,12 +1443,12 @@ pub fn decode_and_render_halfblocks_with_cell_px(
         .saturating_mul(cell_px.0.max(1) as u32)
         .saturating_mul(zoom_scale)
         / 100)
-        .clamp(64, bitefoundry_html::graphics::MAX_RASTER_DIM_PX);
+        .clamp(64, MAX_SVG_RASTER_DIM_PX);
     let max_px_h = ((fit.view_rows.max(1) as u32)
         .saturating_mul(cell_px.1.max(1) as u32)
         .saturating_mul(zoom_scale)
         / 100)
-        .clamp(64, bitefoundry_html::graphics::MAX_RASTER_DIM_PX);
+        .clamp(64, MAX_SVG_RASTER_DIM_PX);
     let (raster_bytes, is_svg) = maybe_rasterize_svg(bytes, max_px_w, max_px_h)?;
     let guessed = image::guess_format(&raster_bytes).ok();
     let format_label = if is_svg {
@@ -1517,18 +1533,15 @@ pub fn decode_and_render_for_protocol(
 
     validate_raster_image_bytes(bytes)?;
     let (max_px_w, max_px_h) = if fit.scrollable {
-        (
-            bitefoundry_html::graphics::MAX_RASTER_DIM_PX,
-            bitefoundry_html::graphics::MAX_RASTER_DIM_PX,
-        )
+        (MAX_SVG_RASTER_DIM_PX, MAX_SVG_RASTER_DIM_PX)
     } else {
         (
             (fit.view_cols.max(1) as u32)
                 .saturating_mul(caps.cell_px.0.max(1) as u32)
-                .clamp(64, bitefoundry_html::graphics::MAX_RASTER_DIM_PX),
+                .clamp(64, MAX_SVG_RASTER_DIM_PX),
             (fit.view_rows.max(1) as u32)
                 .saturating_mul(caps.cell_px.1.max(1) as u32)
-                .clamp(64, bitefoundry_html::graphics::MAX_RASTER_DIM_PX),
+                .clamp(64, MAX_SVG_RASTER_DIM_PX),
         )
     };
     let (raster_bytes, is_svg) = maybe_rasterize_svg(bytes, max_px_w, max_px_h)?;
@@ -2325,10 +2338,10 @@ fn render_ansi_stdout_with_caps(
     validate_raster_image_bytes(bytes)?;
     let max_px_w = (max_cols.max(1) as u32)
         .saturating_mul(caps.cell_px.0.max(1) as u32)
-        .clamp(64, bitefoundry_html::graphics::MAX_RASTER_DIM_PX);
+        .clamp(64, MAX_SVG_RASTER_DIM_PX);
     let max_px_h = (max_rows.max(1) as u32)
         .saturating_mul(caps.cell_px.1.max(1) as u32)
-        .clamp(64, bitefoundry_html::graphics::MAX_RASTER_DIM_PX);
+        .clamp(64, MAX_SVG_RASTER_DIM_PX);
     let (raster_bytes, _is_svg) = maybe_rasterize_svg(bytes, max_px_w, max_px_h)?;
     let bytes = raster_bytes.as_ref();
     let fit = FitBox::contained(max_cols, max_rows);
@@ -3436,14 +3449,24 @@ mod tests {
             .to_string();
         assert!(html_err.contains("HTML"), "unexpected html err: {html_err}");
 
-        let svg_rendered = decode_and_render_halfblocks(svg_raw, 20, 10, (0, 0, 0))
-            .expect("standalone SVG should render via Pure-Rust resvg");
-        assert_eq!(svg_rendered.format_label, "SVG");
-        assert!(!svg_rendered.lines.is_empty());
-        assert!(svg_rendered
-            .lines
-            .iter()
-            .any(|l| l.spans.iter().any(|s| s.content.contains('▀'))));
+        #[cfg(feature = "svg-graphics")]
+        {
+            let svg_rendered = decode_and_render_halfblocks(svg_raw, 20, 10, (0, 0, 0))
+                .expect("standalone SVG should render via Pure-Rust resvg");
+            assert_eq!(svg_rendered.format_label, "SVG");
+            assert!(!svg_rendered.lines.is_empty());
+            assert!(svg_rendered
+                .lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.content.contains('▀'))));
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            let svg_err = decode_and_render_halfblocks(svg_raw, 20, 10, (0, 0, 0))
+                .unwrap_err()
+                .to_string();
+            assert!(svg_err.contains("svg-graphics"), "unexpected svg err: {svg_err}");
+        }
 
         for proto in [
             TerminalImageProtocol::Kitty,
@@ -3465,16 +3488,30 @@ mod tests {
             .unwrap_err()
             .to_string();
             assert!(err_h.contains("HTML"));
-            let rendered_s = decode_and_render_for_protocol(
-                svg_xml,
-                FitBox::contained(20, 10),
-                (0, 0, 0),
-                caps,
-            )
-            .expect("SVG should render for all terminal protocols");
-            assert_eq!(rendered_s.format_label, "SVG");
+            #[cfg(feature = "svg-graphics")]
+            {
+                let rendered_s = decode_and_render_for_protocol(
+                    svg_xml,
+                    FitBox::contained(20, 10),
+                    (0, 0, 0),
+                    caps,
+                )
+                .expect("SVG should render for all terminal protocols");
+                assert_eq!(rendered_s.format_label, "SVG");
+                assert!(render_ansi_stdout_with_caps(svg_raw, 20, 10, caps).is_ok());
+            }
+            #[cfg(not(feature = "svg-graphics"))]
+            {
+                assert!(decode_and_render_for_protocol(
+                    svg_xml,
+                    FitBox::contained(20, 10),
+                    (0, 0, 0),
+                    caps,
+                )
+                .is_err());
+                assert!(render_ansi_stdout_with_caps(svg_raw, 20, 10, caps).is_err());
+            }
             assert!(render_ansi_stdout_with_caps(html_doc, 20, 10, caps).is_err());
-            assert!(render_ansi_stdout_with_caps(svg_raw, 20, 10, caps).is_ok());
         }
     }
 

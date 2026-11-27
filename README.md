@@ -14,7 +14,7 @@
 
 <br />
 
-![Microsoft OneNote TUI Demo](https://raw.githubusercontent.com/BiteFoundry/onenote/master/assets/demo.gif)
+![Microsoft OneNote TUI Demo](https://bitefoundry.dev/assets/demos/onenote.gif)
 
 </div>
 

@@ -733,6 +733,7 @@ mod tests {
         (hitmap, out)
     }
 
+    #[cfg(feature = "html-js")]
     #[test]
     fn test_html_preview_onclick_button_click_at_and_raw_toggle() {
         let html = r#"
@@ -846,6 +847,7 @@ mod tests {
         assert_eq!(overlay.session.scroll_y, 0);
     }
 
+    #[cfg(all(feature = "html-js", feature = "svg-graphics"))]
     #[test]
     fn test_html_preview_inline_svg_renders_halfblock_and_pixel_preserving_button_click() {
         let html = r##"
