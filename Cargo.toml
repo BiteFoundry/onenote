@@ -4,6 +4,18 @@ version = "0.4.9"
 edition = "2021"
 description = "Microsoft OneNote terminal client & AI agent toolkit — Notebooks, Sections, Pages, XHTML/Markdown & Resources (CLI, TUI, HTTP API, MCP)"
 license = "MIT"
+repository = "https://github.com/BiteFoundry/onenote"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/onenote-{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "onenote{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [lib]
 name = "onenote_cli"

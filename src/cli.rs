@@ -24,7 +24,9 @@ use crate::{
         OnenoteNotebook, OnenotePageDetail, OnenotePageSummary, OnenoteResource, OnenoteScope,
         OnenoteSearchHit, OnenoteSection, OnenoteTagKind, OutgoingOnenotePage,
     },
-    parser, resolver, serve,
+    parser, resolver,
+    safe_text::{sanitize_terminal_inline, sanitize_terminal_text},
+    serve,
     storage::Storage,
     sync, tui, updater,
 };
@@ -977,7 +979,11 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             if json {
                 println!("{}", serde_json::to_string_pretty(&json!({ "ok": true, "drive_item": item }))?);
             } else {
-                println!("Notebook storage item '{}' is named '{}'.", item.item_id, item.name);
+                println!(
+                    "Notebook storage item '{}' is named '{}'.",
+                    sanitize_terminal_inline(&item.item_id),
+                    sanitize_terminal_inline(&item.name),
+                );
             }
             Ok(())
         }
@@ -1008,7 +1014,10 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!("OneNote desktop page '{page_id}' is at level {level}.");
+                println!(
+                    "OneNote desktop page '{}' is at level {level}.",
+                    sanitize_terminal_inline(&page_id),
+                );
             }
             Ok(())
         }
@@ -1018,7 +1027,11 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!("OneNote desktop section '{section_id}' is named '{}'.", name.trim());
+                println!(
+                    "OneNote desktop section '{}' is named '{}'.",
+                    sanitize_terminal_inline(&section_id),
+                    sanitize_terminal_inline(name.trim()),
+                );
             }
             Ok(())
         }
@@ -1136,9 +1149,9 @@ pub async fn dispatch_command(cfg: &mut AppConfig, cmd: Option<Command>) -> Resu
             } else {
                 println!(
                     "Copied {} to {} as {}",
-                    outcome.source_page_key,
-                    outcome.destination_section_key,
-                    outcome.new_page_key.as_deref().unwrap_or_default(),
+                    sanitize_terminal_inline(&outcome.source_page_key),
+                    sanitize_terminal_inline(&outcome.destination_section_key),
+                    sanitize_terminal_inline(outcome.new_page_key.as_deref().unwrap_or_default()),
                 );
             }
             Ok(())
@@ -3064,7 +3077,11 @@ async fn cmd_login(
             .map(|p| p.display_name.as_str())
             .or(tokens.user_display_name.as_deref())
             .unwrap_or("Signed-in user");
-        println!("Signed in to Microsoft OneNote as {who} ({}).", tokens.auth_mode);
+        println!(
+            "Signed in to Microsoft OneNote as {} ({}).",
+            sanitize_terminal_inline(who),
+            sanitize_terminal_inline(&tokens.auth_mode),
+        );
         for w in &diag.warnings {
             eprintln!("Warning: {w}");
         }
@@ -3115,9 +3132,13 @@ async fn cmd_whoami(cfg: &AppConfig, json_out: bool) -> Result<()> {
             }))?
         );
     } else {
-        println!("User:   {} ({})", me.display_name, me.id);
+        println!(
+            "User:   {} ({})",
+            sanitize_terminal_inline(&me.display_name),
+            sanitize_terminal_inline(&me.id),
+        );
         if let Some(ref email) = me.email {
-            println!("Email:  {email}");
+            println!("Email:  {}", sanitize_terminal_inline(email));
         }
         if let Some(ref t) = tok {
             println!("Auth:   {} (expires {})", t.auth_mode, format_unix_ts(t.expires_at));
@@ -3312,7 +3333,12 @@ async fn cmd_notebooks(
         for nb in &notebooks {
             let def = if nb.is_default { " [default]" } else { "" };
             let owner = nb.scope.owner_label();
-            println!("{}  ({owner}){def}  [{}]", nb.display_name, nb.notebook_key);
+            println!(
+                "{}  ({}){def}  [{}]",
+                sanitize_terminal_inline(&nb.display_name),
+                sanitize_terminal_inline(&owner),
+                sanitize_terminal_inline(&nb.notebook_key),
+            );
         }
         if let Some(next) = next {
             eprintln!("More results: rerun with --cursor {next}");
@@ -3341,7 +3367,8 @@ async fn cmd_create_notebook(
     } else {
         println!(
             "Created notebook '{}' ({})",
-            created.display_name, created.notebook_key
+            sanitize_terminal_inline(&created.display_name),
+            sanitize_terminal_inline(&created.notebook_key),
         );
     }
     Ok(())
@@ -3407,9 +3434,10 @@ async fn cmd_sections(
         for sec in &sections {
             let nb_label = sec.notebook_name.as_deref().unwrap_or("Notebook");
             println!(
-                "{nb_label} › {}  [{}]",
-                sec.group_qualified_name(),
-                sec.section_key
+                "{} › {}  [{}]",
+                sanitize_terminal_inline(nb_label),
+                sanitize_terminal_inline(&sec.group_qualified_name()),
+                sanitize_terminal_inline(&sec.section_key),
             );
         }
         if let Some(next) = next {
@@ -3440,7 +3468,9 @@ async fn cmd_create_section(
     } else {
         println!(
             "Created section '{} › {}' ({})",
-            nb.display_name, created.display_name, created.section_key
+            sanitize_terminal_inline(&nb.display_name),
+            sanitize_terminal_inline(&created.display_name),
+            sanitize_terminal_inline(&created.section_key),
         );
     }
     Ok(())
@@ -3463,7 +3493,8 @@ async fn cmd_rename_section(
     } else {
         println!(
             "Renamed section to '{}' ({})",
-            section.display_name, section.section_key
+            sanitize_terminal_inline(&section.display_name),
+            sanitize_terminal_inline(&section.section_key),
         );
     }
     Ok(())
@@ -3511,12 +3542,20 @@ async fn cmd_pages(
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if pages.is_empty() {
-        println!("No pages in section '{}'.", sec.display_name);
+        println!(
+            "No pages in section '{}'.",
+            sanitize_terminal_inline(&sec.display_name),
+        );
     } else {
         for p in &pages {
             let indent = "  ".repeat(p.level.clamp(0, 2) as usize);
             let todo_mark = if p.has_todo { " [todo]" } else { "" };
-            println!("{indent}{}{}  [{}]", p.title, todo_mark, p.page_key);
+            println!(
+                "{indent}{}{}  [{}]",
+                sanitize_terminal_inline(&p.title),
+                todo_mark,
+                sanitize_terminal_inline(&p.page_key),
+            );
         }
         if let Some(next) = next {
             eprintln!("More pages: rerun with --cursor {next}");
@@ -3657,25 +3696,29 @@ async fn cmd_read(
     match format.unwrap_or("md") {
         "xhtml" => println!("{}", detail.raw_xhtml),
         "plain" => {
-            println!("# {}\n", detail.summary.title);
-            println!("{}", detail.body_plain);
+            println!("# {}\n", sanitize_terminal_inline(&detail.summary.title));
+            println!("{}", sanitize_terminal_text(&detail.body_plain));
         }
         "blocks" => {
-            println!("# {} [{}]\n", detail.summary.title, detail.summary.page_key);
+            println!(
+                "# {} [{}]\n",
+                sanitize_terminal_inline(&detail.summary.title),
+                sanitize_terminal_inline(&detail.summary.page_key),
+            );
             for (idx, blk) in detail.blocks.iter().enumerate() {
-                let id = blk.element_id.as_deref().unwrap_or("-");
+                let id = sanitize_terminal_inline(blk.element_id.as_deref().unwrap_or("-"));
                 let tag = blk
                     .tag
                     .as_ref()
-                    .map(|t| format!(" [{}]", t.data_tag_value()))
+                    .map(|t| format!(" [{}]", sanitize_terminal_inline(&t.data_tag_value())))
                     .unwrap_or_default();
                 let preview = truncate_single_line(&parser::onenote_blocks_to_plain(std::slice::from_ref(blk)), 90);
                 println!("[{idx}] id={id}{tag}  {preview}");
             }
         }
         _ => {
-            println!("# {}\n", detail.summary.title);
-            println!("{}", detail.body_markdown);
+            println!("# {}\n", sanitize_terminal_inline(&detail.summary.title));
+            println!("{}", sanitize_terminal_text(&detail.body_markdown));
         }
     }
 
@@ -3732,7 +3775,9 @@ async fn cmd_create(
     } else {
         println!(
             "Created page '{}' in '{}' ({})",
-            created.title, sec.display_name, created.page_key
+            sanitize_terminal_inline(&created.title),
+            sanitize_terminal_inline(&sec.display_name),
+            sanitize_terminal_inline(&created.page_key),
         );
     }
     Ok(())
@@ -3783,7 +3828,11 @@ async fn cmd_append(
             serde_json::to_string_pretty(&write_result_json(&updated, None, None, full))?
         );
     } else {
-        println!("Appended content to page '{}' ({}).", updated.summary.title, updated.summary.page_key);
+        println!(
+            "Appended content to page '{}' ({}).",
+            sanitize_terminal_inline(&updated.summary.title),
+            sanitize_terminal_inline(&updated.summary.page_key),
+        );
     }
     Ok(())
 }
@@ -3853,7 +3902,11 @@ async fn cmd_update_page(
             serde_json::to_string_pretty(&write_result_json(&updated, block_id, None, full))?
         );
     } else {
-        println!("Updated page '{}' ({}).", updated.summary.title, updated.summary.page_key);
+        println!(
+            "Updated page '{}' ({}).",
+            sanitize_terminal_inline(&updated.summary.title),
+            sanitize_terminal_inline(&updated.summary.page_key),
+        );
     }
     Ok(())
 }
@@ -3918,7 +3971,7 @@ async fn cmd_check(
         );
     } else {
         let state = if completed { "checked [x]" } else { "unchecked [ ]" };
-        println!("Toggled to-do {target_id} -> {state}");
+        println!("Toggled to-do {} -> {state}", sanitize_terminal_inline(&target_id));
     }
     Ok(())
 }
@@ -3941,13 +3994,20 @@ fn delete_prompt_text(resolved_query: &str, cached: Option<&OnenotePageSummary>)
                 .unwrap_or(page.section_id.as_str());
             let modified = page.last_modified_at.as_deref().unwrap_or("unknown");
             format!(
-                "Delete this OneNote page?\n  Title:         {}\n  Location:      {notebook} / {section}\n  Last modified: {modified}\n  Page key:      {}\n[y/N]: ",
-                page.title, page.page_key
+                "Delete this OneNote page?\n  Title:         {}\n  Location:      {} / {}\n  Last modified: {}\n  Page key:      {}\n[y/N]: ",
+                sanitize_terminal_inline(&page.title),
+                sanitize_terminal_inline(notebook),
+                sanitize_terminal_inline(section),
+                sanitize_terminal_inline(modified),
+                sanitize_terminal_inline(&page.page_key),
             )
         }
-        None => format!(
-            "'{resolved_query}' is not in the local cache, so its title and location cannot be shown.\nIt will be sent to Microsoft Graph as a raw page ID.\nDelete OneNote page ID '{resolved_query}'? [y/N]: "
-        ),
+        None => {
+            let safe_query = sanitize_terminal_inline(resolved_query);
+            format!(
+                "'{safe_query}' is not in the local cache, so its title and location cannot be shown.\nIt will be sent to Microsoft Graph as a raw page ID.\nDelete OneNote page ID '{safe_query}'? [y/N]: "
+            )
+        }
     }
 }
 
@@ -3993,7 +4053,7 @@ async fn cmd_delete(
             serde_json::to_string_pretty(&json!({ "ok": true, "deleted": deleted_key }))?
         );
     } else {
-        println!("Deleted OneNote page: {deleted_key}");
+        println!("Deleted OneNote page: {}", sanitize_terminal_inline(&deleted_key));
     }
     Ok(())
 }
@@ -4035,15 +4095,26 @@ async fn cmd_search(
             }))?
         );
     } else if hits.is_empty() {
-        println!("No matching OneNote pages found for '{query}'.");
+        println!(
+            "No matching OneNote pages found for '{}'.",
+            sanitize_terminal_inline(query),
+        );
     } else {
         for hit in &hits {
             let loc = match (hit.notebook_name.as_deref(), hit.section_name.as_deref()) {
-                (Some(n), Some(s)) => format!("{n} › {s}"),
-                (None, Some(s)) => s.to_string(),
-                _ => hit.section_id.clone(),
+                (Some(n), Some(s)) => format!(
+                    "{} › {}",
+                    sanitize_terminal_inline(n),
+                    sanitize_terminal_inline(s),
+                ),
+                (None, Some(s)) => sanitize_terminal_inline(s).into_owned(),
+                _ => sanitize_terminal_inline(&hit.section_id).into_owned(),
             };
-            println!("{}  ({loc})  [{}]", hit.title, hit.page_key);
+            println!(
+                "{}  ({loc})  [{}]",
+                sanitize_terminal_inline(&hit.title),
+                sanitize_terminal_inline(&hit.page_key),
+            );
             if !hit.snippet.trim().is_empty() {
                 println!("  {}", truncate_single_line(&hit.snippet, 120));
             }
@@ -4092,7 +4163,9 @@ async fn cmd_resource(
     } else {
         println!(
             "Downloaded OneNote resource: {} ({} bytes, {})",
-            downloaded.path, downloaded.size_bytes, downloaded.mime_type
+            sanitize_terminal_inline(&downloaded.path),
+            downloaded.size_bytes,
+            sanitize_terminal_inline(&downloaded.mime_type),
         );
         if preview && downloaded.is_image {
             if let Ok(bytes) = std::fs::read(&downloaded.path) {
@@ -4259,7 +4332,7 @@ fn format_unix_ts(ts: i64) -> String {
 }
 
 fn truncate_single_line(input: &str, max_chars: usize) -> String {
-    let single = input.replace(['\r', '\n'], " ");
+    let single = sanitize_terminal_inline(input);
     let trimmed = single.trim();
     if trimmed.chars().count() <= max_chars {
         trimmed.to_string()
