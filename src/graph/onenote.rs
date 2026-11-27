@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{bail, Result};
-use futures_util::future::join_all;
+use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -884,25 +884,23 @@ impl GraphClient {
                 })
                 .collect();
 
-            for chunk in scopes.chunks(ONENOTE_SCOPE_CONCURRENCY) {
-                let futs = chunk.iter().map(|s| async move {
-                    let scope_key = s.scope_key();
-                    (scope_key, self.list_onenote_notebooks(s).await)
-                });
-                let results = join_all(futs).await;
-                for (scope_key, res) in results {
-                    if let Ok(group_nbs) = res {
-                        complete_scopes.insert(scope_key);
-                        if !group_nbs.is_empty() {
-                            any_succeeded = true;
-                        }
-                        for nb in group_nbs {
-                            if let Some(&pos) = index_by_id.get(&nb.id) {
-                                merge_duplicate_notebook(&mut merged[pos], nb);
-                            } else {
-                                index_by_id.insert(nb.id.clone(), merged.len());
-                                merged.push(nb);
-                            }
+            let mut scope_stream = stream::iter(scopes.into_iter().map(|s| async move {
+                let scope_key = s.scope_key();
+                (scope_key, self.list_onenote_notebooks(&s).await)
+            }))
+            .buffer_unordered(ONENOTE_SCOPE_CONCURRENCY);
+            while let Some((scope_key, res)) = scope_stream.next().await {
+                if let Ok(group_nbs) = res {
+                    complete_scopes.insert(scope_key);
+                    if !group_nbs.is_empty() {
+                        any_succeeded = true;
+                    }
+                    for nb in group_nbs {
+                        if let Some(&pos) = index_by_id.get(&nb.id) {
+                            merge_duplicate_notebook(&mut merged[pos], nb);
+                        } else {
+                            index_by_id.insert(nb.id.clone(), merged.len());
+                            merged.push(nb);
                         }
                     }
                 }
@@ -1079,50 +1077,75 @@ impl GraphClient {
     ) -> bool {
         let mut complete = true;
         let mut visited_sg_ids: HashSet<String> = HashSet::new();
-        for nb in notebooks {
-            let nb_sgs = match self.list_onenote_section_groups(scope, Some(&nb.id)).await {
-                Ok(nb_sgs) => nb_sgs,
-                Err(_) => {
-                    complete = false;
-                    continue;
-                }
-            };
-            let mut queue: VecDeque<OnenoteSectionGroup> = VecDeque::new();
-            let mut admit = |sg: OnenoteSectionGroup,
-                             queue: &mut VecDeque<OnenoteSectionGroup>,
-                             complete: &mut bool|
-             -> bool {
-                if visited_sg_ids.contains(&sg.id) {
-                    return true;
-                }
-                if visited_sg_ids.len() >= MAX_SECTION_GROUP_TRAVERSAL {
-                    *complete = false;
-                    return false;
-                }
-                visited_sg_ids.insert(sg.id.clone());
-                groups.push(sg.clone());
-                queue.push_back(sg);
-                true
-            };
-            for sg in nb_sgs {
-                if !admit(sg, &mut queue, &mut complete) {
-                    break;
-                }
+        let mut queue: VecDeque<(OnenoteSectionGroup, String)> = VecDeque::new();
+
+        let mut admit = |sg: OnenoteSectionGroup,
+                         nb_id: &str,
+                         queue: &mut VecDeque<(OnenoteSectionGroup, String)>,
+                         complete: &mut bool|
+         -> bool {
+            if visited_sg_ids.contains(&sg.id) {
+                return true;
             }
-            while let Some(sg) = queue.pop_front() {
-                let eff_nb = sg.notebook_id.as_deref().or(Some(nb.id.as_str()));
-                match self.list_child_section_groups(scope, &sg.id, eff_nb).await {
-                    Ok(children) => {
-                        for child in children {
-                            if !admit(child, &mut queue, &mut complete) {
-                                break;
-                            }
+            if visited_sg_ids.len() >= MAX_SECTION_GROUP_TRAVERSAL {
+                *complete = false;
+                return false;
+            }
+            visited_sg_ids.insert(sg.id.clone());
+            groups.push(sg.clone());
+            queue.push_back((sg, nb_id.to_string()));
+            true
+        };
+
+        let nb_ids: Vec<String> = notebooks.iter().map(|nb| nb.id.clone()).collect();
+        let mut nb_stream = stream::iter(nb_ids.into_iter().map(|nb_id| async move {
+            let res = self.list_onenote_section_groups(scope, Some(&nb_id)).await;
+            (nb_id, res)
+        }))
+        .buffer_unordered(ONENOTE_SCOPE_CONCURRENCY);
+
+        while let Some((nb_id, res)) = nb_stream.next().await {
+            match res {
+                Ok(nb_sgs) => {
+                    for sg in nb_sgs {
+                        if !admit(sg, &nb_id, &mut queue, &mut complete) {
+                            break;
                         }
                     }
-                    Err(_) => complete = false,
+                }
+                Err(_) => {
+                    complete = false;
                 }
             }
         }
+
+        let mut in_flight = FuturesUnordered::new();
+        loop {
+            while in_flight.len() < ONENOTE_SCOPE_CONCURRENCY {
+                let Some((sg, nb_id)) = queue.pop_front() else {
+                    break;
+                };
+                in_flight.push(async move {
+                    let eff_nb = sg.notebook_id.as_deref().or(Some(nb_id.as_str()));
+                    let res = self.list_child_section_groups(scope, &sg.id, eff_nb).await;
+                    (nb_id, res)
+                });
+            }
+            let Some((nb_id, res)) = in_flight.next().await else {
+                break;
+            };
+            match res {
+                Ok(children) => {
+                    for child in children {
+                        if !admit(child, &nb_id, &mut queue, &mut complete) {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => complete = false,
+            }
+        }
+
         complete
     }
 
@@ -1403,9 +1426,9 @@ impl GraphClient {
         let mut me_err: Option<anyhow::Error> = None;
         let mut first_err: Option<anyhow::Error> = None;
 
-        for chunk in unique_scopes.chunks(ONENOTE_SCOPE_CONCURRENCY) {
-            let futs: Vec<_> = chunk
-                .iter()
+        let scope_tasks: Vec<(OnenoteScope, Vec<OnenoteNotebook>, Option<PrefetchedMeSections>)> =
+            unique_scopes
+                .into_iter()
                 .map(|scope| {
                     let scope_nbs = notebooks_by_scope
                         .get(&scope.scope_key())
@@ -1416,20 +1439,22 @@ impl GraphClient {
                     } else {
                         None
                     };
-                    async move {
-                        let (groups_res, secs_res) = match pre {
-                            Some(res) => res,
-                            None => tokio::join!(
-                                self.list_onenote_section_groups(scope, None),
-                                self.list_onenote_sections_direct(scope, None)
-                            ),
-                        };
-                        (scope.clone(), scope_nbs, groups_res, secs_res)
-                    }
+                    (scope, scope_nbs, pre)
                 })
                 .collect();
-            let results = join_all(futs).await;
-            for (scope, scope_nbs, groups_res, secs_res) in results {
+        let mut scope_stream =
+            stream::iter(scope_tasks.into_iter().map(|(scope, scope_nbs, pre)| async move {
+                let (groups_res, secs_res) = match pre {
+                    Some(res) => res,
+                    None => tokio::join!(
+                        self.list_onenote_section_groups(&scope, None),
+                        self.list_onenote_sections_direct(&scope, None)
+                    ),
+                };
+                (scope, scope_nbs, groups_res, secs_res)
+            }))
+            .buffer_unordered(ONENOTE_SCOPE_CONCURRENCY);
+        while let Some((scope, scope_nbs, groups_res, secs_res)) = scope_stream.next().await {
                 let mut scope_groups: Vec<OnenoteSectionGroup> = Vec::new();
                 let mut scope_sections: Vec<OnenoteSection> = Vec::new();
                 let mut scope_succeeded = false;
@@ -1554,7 +1579,6 @@ impl GraphClient {
                     }
                 }
             }
-        }
 
         if all_sections.is_empty() {
             if let Some(err) = me_err {

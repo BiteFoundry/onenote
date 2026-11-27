@@ -14,7 +14,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
-use image::{imageops::FilterType, DynamicImage, ImageFormat, Rgba};
+use image::{
+    codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
+    imageops::FilterType,
+    DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, Rgba,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -1457,54 +1461,121 @@ pub fn decode_and_render_halfblocks_with_cell_px(
         format_label_for(guessed)
     };
     let dyn_img = image::load_from_memory(&raster_bytes).context("Failed to decode image")?;
-    let rgba = dyn_img.into_rgba8();
-    let (width_px, height_px) = rgba.dimensions();
+    let (width_px, height_px) = (dyn_img.width(), dyn_img.height());
     if width_px == 0 || height_px == 0 {
         bail!("Image dimensions are 0x0");
     }
 
     let (target_w, target_h) = compute_halfblock_dims(width_px, height_px, fit, cell_px);
-
-    let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
     type RgbPair = ((u8, u8, u8), (u8, u8, u8));
-    for y in (0..target_h).step_by(2) {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut current_pair: Option<RgbPair> = None;
-        let mut run = String::new();
-
-        for x in 0..target_w {
-            let top = blend_over_bg(*resized.get_pixel(x, y), bg_rgb);
-            let bot = blend_over_bg(*resized.get_pixel(x, y + 1), bg_rgb);
-            let pair = (top, bot);
-
-            if current_pair == Some(pair) {
-                run.push('▀');
+    match dyn_img {
+        DynamicImage::ImageRgb8(rgb) => {
+            let resized = if width_px == target_w && height_px == target_h {
+                rgb
             } else {
+                image::imageops::resize(&rgb, target_w, target_h, FilterType::Triangle)
+            };
+            let raw = resized.as_raw();
+            let stride = target_w as usize * 3;
+            for y in (0..target_h as usize).step_by(2) {
+                let row_top = &raw[y * stride..(y + 1) * stride];
+                let row_bot = &raw[(y + 1) * stride..(y + 2) * stride];
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                let mut current_pair: Option<RgbPair> = None;
+                let mut run = String::new();
+
+                for x in 0..target_w as usize {
+                    let o = x * 3;
+                    let top = (row_top[o], row_top[o + 1], row_top[o + 2]);
+                    let bot = (row_bot[o], row_bot[o + 1], row_bot[o + 2]);
+                    let pair = (top, bot);
+
+                    if current_pair == Some(pair) {
+                        run.push('▀');
+                    } else {
+                        if let Some((prev_top, prev_bot)) = current_pair {
+                            spans.push(Span::styled(
+                                std::mem::take(&mut run),
+                                Style::default()
+                                    .fg(Color::Rgb(prev_top.0, prev_top.1, prev_top.2))
+                                    .bg(Color::Rgb(prev_bot.0, prev_bot.1, prev_bot.2)),
+                            ));
+                        }
+                        current_pair = Some(pair);
+                        run.push('▀');
+                    }
+                }
+
                 if let Some((prev_top, prev_bot)) = current_pair {
                     spans.push(Span::styled(
-                        std::mem::take(&mut run),
+                        run,
                         Style::default()
                             .fg(Color::Rgb(prev_top.0, prev_top.1, prev_top.2))
                             .bg(Color::Rgb(prev_bot.0, prev_bot.1, prev_bot.2)),
                     ));
                 }
-                current_pair = Some(pair);
-                run.push('▀');
+
+                lines.push(Line::from(spans));
             }
         }
+        other => {
+            let rgba = other.into_rgba8();
+            let resized = if width_px == target_w && height_px == target_h {
+                rgba
+            } else {
+                image::imageops::resize(&rgba, target_w, target_h, FilterType::Triangle)
+            };
+            let raw = resized.as_raw();
+            let stride = target_w as usize * 4;
+            for y in (0..target_h as usize).step_by(2) {
+                let row_top = &raw[y * stride..(y + 1) * stride];
+                let row_bot = &raw[(y + 1) * stride..(y + 2) * stride];
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                let mut current_pair: Option<RgbPair> = None;
+                let mut run = String::new();
 
-        if let Some((prev_top, prev_bot)) = current_pair {
-            spans.push(Span::styled(
-                run,
-                Style::default()
-                    .fg(Color::Rgb(prev_top.0, prev_top.1, prev_top.2))
-                    .bg(Color::Rgb(prev_bot.0, prev_bot.1, prev_bot.2)),
-            ));
+                for x in 0..target_w as usize {
+                    let o = x * 4;
+                    let top = blend_over_bg(
+                        Rgba([row_top[o], row_top[o + 1], row_top[o + 2], row_top[o + 3]]),
+                        bg_rgb,
+                    );
+                    let bot = blend_over_bg(
+                        Rgba([row_bot[o], row_bot[o + 1], row_bot[o + 2], row_bot[o + 3]]),
+                        bg_rgb,
+                    );
+                    let pair = (top, bot);
+
+                    if current_pair == Some(pair) {
+                        run.push('▀');
+                    } else {
+                        if let Some((prev_top, prev_bot)) = current_pair {
+                            spans.push(Span::styled(
+                                std::mem::take(&mut run),
+                                Style::default()
+                                    .fg(Color::Rgb(prev_top.0, prev_top.1, prev_top.2))
+                                    .bg(Color::Rgb(prev_bot.0, prev_bot.1, prev_bot.2)),
+                            ));
+                        }
+                        current_pair = Some(pair);
+                        run.push('▀');
+                    }
+                }
+
+                if let Some((prev_top, prev_bot)) = current_pair {
+                    spans.push(Span::styled(
+                        run,
+                        Style::default()
+                            .fg(Color::Rgb(prev_top.0, prev_top.1, prev_top.2))
+                            .bg(Color::Rgb(prev_bot.0, prev_bot.1, prev_bot.2)),
+                    ));
+                }
+
+                lines.push(Line::from(spans));
+            }
         }
-
-        lines.push(Line::from(spans));
     }
 
     Ok(RenderedTerminalImage {
@@ -1632,17 +1703,37 @@ pub fn decode_and_render_for_protocol(
             (payload, Some(backing))
         }
         TerminalImageProtocol::Sixel => {
-            let rgba = dyn_img.to_rgba8();
-            let resized = if width_px == target_px_w && height_px == target_px_h {
-                rgba
+            let filter = if fit.scrollable {
+                FilterType::Lanczos3
             } else {
-                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
+                FilterType::Triangle
             };
-            let mut flat_rgba = Vec::with_capacity((target_px_w * target_px_h * 4) as usize);
-            for px in resized.pixels() {
-                let (r, g, b) = blend_over_bg(*px, bg_rgb);
-                flat_rgba.extend_from_slice(&[r, g, b, 255]);
-            }
+            let flat_rgba = match dyn_img {
+                DynamicImage::ImageRgb8(rgb) => {
+                    let resized = if width_px == target_px_w && height_px == target_px_h {
+                        rgb
+                    } else {
+                        image::imageops::resize(&rgb, target_px_w, target_px_h, filter)
+                    };
+                    let raw = resized.as_raw();
+                    let mut out = Vec::with_capacity((target_px_w * target_px_h * 4) as usize);
+                    for px in raw.as_chunks::<3>().0 {
+                        out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                    }
+                    out
+                }
+                other => {
+                    let rgba = other.into_rgba8();
+                    let resized = if width_px == target_px_w && height_px == target_px_h {
+                        rgba
+                    } else {
+                        image::imageops::resize(&rgba, target_px_w, target_px_h, filter)
+                    };
+                    let mut out = resized.into_raw();
+                    blend_rgba_in_place(&mut out, bg_rgb);
+                    out
+                }
+            };
             let (palette, indexed) =
                 quantize_rgba_to_256(&flat_rgba, target_px_w as usize, target_px_h as usize);
             let payload = encode_sixel_indexed_slice(
@@ -1890,6 +1981,36 @@ pub fn encode_sixel_rgba(flat_rgba: &[u8], width: u32, height: u32) -> String {
     encode_sixel_indexed_slice(&palette, &indexed, w, 0, 0, w, h)
 }
 
+#[inline]
+fn push_usize_ascii(out: &mut Vec<u8>, mut n: usize) {
+    if n < 10 {
+        out.push(b'0' + n as u8);
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+#[inline]
+fn write_sixel_run(out: &mut Vec<u8>, bits: u8, run_len: usize) {
+    let ch = bits + 63;
+    if run_len >= 4 {
+        out.push(b'!');
+        push_usize_ascii(out, run_len);
+        out.push(ch);
+    } else {
+        for _ in 0..run_len {
+            out.push(ch);
+        }
+    }
+}
+
 fn encode_sixel_indexed_slice(
     palette: &[(u8, u8, u8)],
     indexed: &[u8],
@@ -1903,17 +2024,29 @@ fn encode_sixel_indexed_slice(
         return String::from("\x1bP0;1;q\"1;1;0;0\x1b\\");
     }
 
-    let mut out = String::with_capacity(crop_w * crop_h / 2 + palette.len() * 16 + 32);
-    let _ = write!(out, "\x1bP0;1;q\"1;1;{crop_w};{crop_h}");
+    let mut out: Vec<u8> = Vec::with_capacity(crop_w * crop_h / 2 + palette.len() * 16 + 32);
+    out.extend_from_slice(b"\x1bP0;1;q\"1;1;");
+    push_usize_ascii(&mut out, crop_w);
+    out.push(b';');
+    push_usize_ascii(&mut out, crop_h);
 
     for (idx, &(r, g, b)) in palette.iter().enumerate() {
-        let r_pct = (r as u32 * 100 + 127) / 255;
-        let g_pct = (g as u32 * 100 + 127) / 255;
-        let b_pct = (b as u32 * 100 + 127) / 255;
-        let _ = write!(out, "#{idx};2;{r_pct};{g_pct};{b_pct}");
+        let r_pct = (r as usize * 100 + 127) / 255;
+        let g_pct = (g as usize * 100 + 127) / 255;
+        let b_pct = (b as usize * 100 + 127) / 255;
+        out.push(b'#');
+        push_usize_ascii(&mut out, idx);
+        out.extend_from_slice(b";2;");
+        push_usize_ascii(&mut out, r_pct);
+        out.push(b';');
+        push_usize_ascii(&mut out, g_pct);
+        out.push(b';');
+        push_usize_ascii(&mut out, b_pct);
     }
 
     let mut color_seen = [false; 256];
+    let mut min_x = [usize::MAX; 256];
+    let mut max_x = [0usize; 256];
     let mut band_colors: Vec<u8> = Vec::with_capacity(palette.len().min(64));
     let mut band_masks = vec![0u8; palette.len().max(1) * crop_w];
 
@@ -1924,63 +2057,69 @@ fn encode_sixel_indexed_slice(
         for dy in 0..band_h {
             let bit = 1u8 << dy;
             let row_offset = (y0 + band_y + dy) * full_w + x0;
-            for x in 0..crop_w {
-                let c = indexed[row_offset + x];
-                if !color_seen[c as usize] {
-                    color_seen[c as usize] = true;
+            let row = &indexed[row_offset..row_offset + crop_w];
+            for (x, &c) in row.iter().enumerate() {
+                let ci = c as usize;
+                if !color_seen[ci] {
+                    color_seen[ci] = true;
                     band_colors.push(c);
+                    min_x[ci] = x;
+                    max_x[ci] = x;
+                } else {
+                    if x < min_x[ci] {
+                        min_x[ci] = x;
+                    }
+                    if x > max_x[ci] {
+                        max_x[ci] = x;
+                    }
                 }
-                band_masks[c as usize * crop_w + x] |= bit;
+                band_masks[ci * crop_w + x] |= bit;
             }
         }
 
         for (ci, &color_idx) in band_colors.iter().enumerate() {
             if ci > 0 {
-                out.push('$');
+                out.push(b'$');
             }
-            let _ = write!(out, "#{color_idx}");
+            let c_idx = color_idx as usize;
+            out.push(b'#');
+            push_usize_ascii(&mut out, c_idx);
 
-            let mask_start = color_idx as usize * crop_w;
-            let row_slice = &band_masks[mask_start..mask_start + crop_w];
-            let end = row_slice
-                .iter()
-                .rposition(|&bits| bits != 0)
-                .map_or(0, |idx| idx + 1);
-
-            write_sixel_rle(&row_slice[..end], &mut out);
+            let lo = min_x[c_idx];
+            let hi = max_x[c_idx];
+            if lo > 0 {
+                write_sixel_run(&mut out, 0, lo);
+            }
+            let mask_start = c_idx * crop_w;
+            write_sixel_rle_bytes(&band_masks[mask_start + lo..=mask_start + hi], &mut out);
         }
 
         for &c in &band_colors {
-            color_seen[c as usize] = false;
-            let start = c as usize * crop_w;
-            band_masks[start..start + crop_w].fill(0);
+            let ci = c as usize;
+            color_seen[ci] = false;
+            let start = ci * crop_w;
+            band_masks[start + min_x[ci]..=start + max_x[ci]].fill(0);
         }
 
         if band_y + 6 < crop_h {
-            out.push('-');
+            out.push(b'-');
         }
     }
 
-    out.push_str("\x1b\\");
-    out
+    out.extend_from_slice(b"\x1b\\");
+    String::from_utf8(out).expect("sixel stream is pure ASCII")
 }
 
-fn write_sixel_rle(masks: &[u8], out: &mut String) {
+fn write_sixel_rle_bytes(masks: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
-    while i < masks.len() {
+    let len = masks.len();
+    while i < len {
         let bits = masks[i];
         let mut run_len = 1usize;
-        while i + run_len < masks.len() && masks[i + run_len] == bits {
+        while i + run_len < len && masks[i + run_len] == bits {
             run_len += 1;
         }
-        let ch = (bits + 63) as char;
-        if run_len >= 4 {
-            let _ = write!(out, "!{run_len}{ch}");
-        } else {
-            for _ in 0..run_len {
-                out.push(ch);
-            }
-        }
+        write_sixel_run(out, bits, run_len);
         i += run_len;
     }
 }
@@ -2049,34 +2188,42 @@ fn quantize_rgba_to_256_with_cache_len(
         return (exact_palette, exact_indexed, 0);
     }
 
-    // Perceptually weighted median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
-    let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
+    // Perceptually weighted median-cut over flat 32K 5-5-5 RGB histogram buckets (zero hashing).
+    #[derive(Clone, Copy, Default)]
+    struct HistBin {
+        count: u32,
+        sum_r: u64,
+        sum_g: u64,
+        sum_b: u64,
+    }
+    let mut hist = vec![HistBin::default(); 32_768];
     for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
-        let qkey = (((px[0] as u16) >> 3) << 10)
-            | (((px[1] as u16) >> 3) << 5)
-            | ((px[2] as u16) >> 3);
-        let entry = hist.entry(qkey).or_insert((0, 0, 0, 0));
-        entry.0 += 1;
-        entry.1 += px[0] as u64;
-        entry.2 += px[1] as u64;
-        entry.3 += px[2] as u64;
+        let qkey = (((px[0] as usize) >> 3) << 10)
+            | (((px[1] as usize) >> 3) << 5)
+            | ((px[2] as usize) >> 3);
+        let entry = &mut hist[qkey];
+        entry.count += 1;
+        entry.sum_r += px[0] as u64;
+        entry.sum_g += px[1] as u64;
+        entry.sum_b += px[2] as u64;
     }
 
-    let mut buckets: Vec<ColorBucket> = hist
-        .into_values()
-        .map(|(count, sum_r, sum_g, sum_b)| {
-            let c = count as u64;
-            ColorBucket {
-                r_avg: (sum_r / c) as u8,
-                g_avg: (sum_g / c) as u8,
-                b_avg: (sum_b / c) as u8,
-                count,
-                sum_r,
-                sum_g,
-                sum_b,
-            }
-        })
-        .collect();
+    let mut buckets: Vec<ColorBucket> = Vec::with_capacity(4096);
+    for bin in &hist {
+        if bin.count == 0 {
+            continue;
+        }
+        let c = bin.count as u64;
+        buckets.push(ColorBucket {
+            r_avg: (bin.sum_r / c) as u8,
+            g_avg: (bin.sum_g / c) as u8,
+            b_avg: (bin.sum_b / c) as u8,
+            count: bin.count,
+            sum_r: bin.sum_r,
+            sum_g: bin.sum_g,
+            sum_b: bin.sum_b,
+        });
+    }
 
     let total_buckets = buckets.len();
     let mut boxes: Vec<(usize, usize)> = vec![(0, total_buckets)];
@@ -2175,12 +2322,24 @@ fn quantize_rgba_to_256_with_cache_len(
         .collect();
 
     let mut indexed = vec![0u8; pixel_count];
-    let mut lookup_cache: HashMap<u32, u8> = HashMap::with_capacity(2048);
-    let mut used = vec![false; raw_palette.len()];
+    // Direct 5-5-5 LUT (32,768 entries) with lazy nearest-color population and SoA palette arrays.
+    let mut lut = vec![0u8; 32_768];
+    let mut lut_valid = vec![false; 32_768];
+    let pal_len = raw_palette.len();
+    let mut pal_r = [0u8; 256];
+    let mut pal_g = [0u8; 256];
+    let mut pal_b = [0u8; 256];
+    for (pi, &(pr, pg, pb)) in raw_palette.iter().enumerate() {
+        pal_r[pi] = pr;
+        pal_g[pi] = pg;
+        pal_b[pi] = pb;
+    }
+    let mut used = [false; 256];
 
-    // Serpentine Floyd-Steinberg error diffusion with [-48, 48] error clamp and flat-region guard.
-    let mut err_curr = vec![[0.0f32; 3]; width];
-    let mut err_next = vec![[0.0f32; 3]; width];
+    // 2-row i16 Q4 fixed-point serpentine Floyd-Steinberg error diffusion
+    // (values scaled by 16; [-48, 48] error clamp + flat-region guard).
+    let mut err_curr = vec![[0i16; 3]; width];
+    let mut err_next = vec![[0i16; 3]; width];
 
     for y in 0..height {
         let row_base = y * width;
@@ -2192,18 +2351,21 @@ fn quantize_rgba_to_256_with_cache_len(
             let orig_g = flat_rgba[off + 1];
             let orig_b = flat_rgba[off + 2];
 
-            let r = (orig_r as f32 + err_curr[x][0]).round().clamp(0.0, 255.0) as u8;
-            let g = (orig_g as f32 + err_curr[x][1]).round().clamp(0.0, 255.0) as u8;
-            let b = (orig_b as f32 + err_curr[x][2]).round().clamp(0.0, 255.0) as u8;
+            let ec = err_curr[x];
+            let r = (orig_r as i16 + ((ec[0] + 8) >> 4)).clamp(0, 255) as u8;
+            let g = (orig_g as i16 + ((ec[1] + 8) >> 4)).clamp(0, 255) as u8;
+            let b = (orig_b as i16 + ((ec[2] + 8) >> 4)).clamp(0, 255) as u8;
 
-            let key = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-            let idx = if let Some(&cached) = lookup_cache.get(&key) {
-                cached
+            let qkey = (((r as usize) >> 3) << 10)
+                | (((g as usize) >> 3) << 5)
+                | ((b as usize) >> 3);
+            let idx = if lut_valid[qkey] {
+                lut[qkey]
             } else {
                 let mut best_idx = 0u8;
                 let mut best_dist = u32::MAX;
-                for (pi, &(pr, pg, pb)) in raw_palette.iter().enumerate() {
-                    let dist = redmean_dist_sq(r, g, b, pr, pg, pb);
+                for pi in 0..pal_len {
+                    let dist = redmean_dist_sq(r, g, b, pal_r[pi], pal_g[pi], pal_b[pi]);
                     if dist < best_dist {
                         best_dist = dist;
                         best_idx = pi as u8;
@@ -2212,21 +2374,22 @@ fn quantize_rgba_to_256_with_cache_len(
                         }
                     }
                 }
-                if lookup_cache.len() < MAX_QUANT_LOOKUP_CACHE {
-                    lookup_cache.insert(key, best_idx);
-                }
+                lut[qkey] = best_idx;
+                lut_valid[qkey] = true;
                 best_idx
             };
 
             used[idx as usize] = true;
             indexed[row_base + x] = idx;
 
-            let (pr, pg, pb) = raw_palette[idx as usize];
-            let er = (r as f32 - pr as f32).clamp(-48.0, 48.0);
-            let eg = (g as f32 - pg as f32).clamp(-48.0, 48.0);
-            let eb = (b as f32 - pb as f32).clamp(-48.0, 48.0);
+            let pr = pal_r[idx as usize];
+            let pg = pal_g[idx as usize];
+            let pb = pal_b[idx as usize];
+            let er = (r as i16 - pr as i16).clamp(-48, 48);
+            let eg = (g as i16 - pg as i16).clamp(-48, 48);
+            let eb = (b as i16 - pb as i16).clamp(-48, 48);
 
-            let tiny_err = er.abs() <= 3.0 && eg.abs() <= 3.0 && eb.abs() <= 3.0;
+            let tiny_err = er.abs() <= 3 && eg.abs() <= 3 && eb.abs() <= 3;
             let same_left = x > 0
                 && orig_r == flat_rgba[off - 4]
                 && orig_g == flat_rgba[off - 3]
@@ -2242,60 +2405,56 @@ fn quantize_rgba_to_256_with_cache_len(
                 continue;
             }
 
-            const W7: f32 = 7.0 / 16.0;
-            const W3: f32 = 3.0 / 16.0;
-            const W5: f32 = 5.0 / 16.0;
-            const W1: f32 = 1.0 / 16.0;
-
             if left_to_right {
                 if x + 1 < width {
-                    err_curr[x + 1][0] += er * W7;
-                    err_curr[x + 1][1] += eg * W7;
-                    err_curr[x + 1][2] += eb * W7;
+                    err_curr[x + 1][0] += er * 7;
+                    err_curr[x + 1][1] += eg * 7;
+                    err_curr[x + 1][2] += eb * 7;
                 }
                 if y + 1 < height {
                     if x > 0 {
-                        err_next[x - 1][0] += er * W3;
-                        err_next[x - 1][1] += eg * W3;
-                        err_next[x - 1][2] += eb * W3;
+                        err_next[x - 1][0] += er * 3;
+                        err_next[x - 1][1] += eg * 3;
+                        err_next[x - 1][2] += eb * 3;
                     }
-                    err_next[x][0] += er * W5;
-                    err_next[x][1] += eg * W5;
-                    err_next[x][2] += eb * W5;
+                    err_next[x][0] += er * 5;
+                    err_next[x][1] += eg * 5;
+                    err_next[x][2] += eb * 5;
                     if x + 1 < width {
-                        err_next[x + 1][0] += er * W1;
-                        err_next[x + 1][1] += eg * W1;
-                        err_next[x + 1][2] += eb * W1;
+                        err_next[x + 1][0] += er;
+                        err_next[x + 1][1] += eg;
+                        err_next[x + 1][2] += eb;
                     }
                 }
             } else {
                 if x > 0 {
-                    err_curr[x - 1][0] += er * W7;
-                    err_curr[x - 1][1] += eg * W7;
-                    err_curr[x - 1][2] += eb * W7;
+                    err_curr[x - 1][0] += er * 7;
+                    err_curr[x - 1][1] += eg * 7;
+                    err_curr[x - 1][2] += eb * 7;
                 }
                 if y + 1 < height {
                     if x + 1 < width {
-                        err_next[x + 1][0] += er * W3;
-                        err_next[x + 1][1] += eg * W3;
-                        err_next[x + 1][2] += eb * W3;
+                        err_next[x + 1][0] += er * 3;
+                        err_next[x + 1][1] += eg * 3;
+                        err_next[x + 1][2] += eb * 3;
                     }
-                    err_next[x][0] += er * W5;
-                    err_next[x][1] += eg * W5;
-                    err_next[x][2] += eb * W5;
+                    err_next[x][0] += er * 5;
+                    err_next[x][1] += eg * 5;
+                    err_next[x][2] += eb * 5;
                     if x > 0 {
-                        err_next[x - 1][0] += er * W1;
-                        err_next[x - 1][1] += eg * W1;
-                        err_next[x - 1][2] += eb * W1;
+                        err_next[x - 1][0] += er;
+                        err_next[x - 1][1] += eg;
+                        err_next[x - 1][2] += eb;
                     }
                 }
             }
         }
         std::mem::swap(&mut err_curr, &mut err_next);
-        err_next.fill([0.0, 0.0, 0.0]);
+        err_next.fill([0, 0, 0]);
     }
 
-    let cache_len = lookup_cache.len();
+    // Fixed-size 32K direct LUT has zero dynamic HashMap growth.
+    let cache_len = 0usize;
 
     // Compact palette so every emitted `#idx;2;...` entry is actually referenced.
     let mut remap = vec![0u8; raw_palette.len()];
@@ -2397,19 +2556,15 @@ fn render_ansi_stdout_with_caps(
                 &png_owned
             };
             let b64 = B64_STANDARD.encode(png_bytes);
-            let chunks: Vec<&str> = b64
-                .as_bytes()
-                .chunks(4096)
-                .map(|c| std::str::from_utf8(c).expect("base64 is valid ASCII"))
-                .collect();
-            let total = chunks.len();
-            let mut out = String::new();
-            for (idx, chunk) in chunks.into_iter().enumerate() {
-                let more = if idx + 1 < total { 1 } else { 0 };
+            let total = b64.len().div_ceil(4096);
+            let mut out = String::with_capacity(b64.len() + total * 32 + 1);
+            for (idx, chunk) in b64.as_bytes().chunks(4096).enumerate() {
+                let chunk_str = std::str::from_utf8(chunk).expect("base64 is valid ASCII");
+                let more = usize::from(idx + 1 < total);
                 if idx == 0 {
-                    out.push_str(&format!("\x1b_Gf=100,a=T,m={more};{chunk}\x1b\\"));
+                    let _ = write!(out, "\x1b_Gf=100,a=T,m={more};{chunk_str}\x1b\\");
                 } else {
-                    out.push_str(&format!("\x1b_Gm={more};{chunk}\x1b\\"));
+                    let _ = write!(out, "\x1b_Gm={more};{chunk_str}\x1b\\");
                 }
             }
             out.push('\n');
@@ -2424,21 +2579,29 @@ fn render_ansi_stdout_with_caps(
         TerminalImageProtocol::Halfblock => {
             let rendered =
                 decode_and_render_halfblocks_with_cell_px(bytes, fit, (0, 0, 0), caps.cell_px)?;
-            let mut out = String::new();
+            let mut out =
+                String::with_capacity(rendered.lines.len() * (rendered.cols as usize * 16 + 8));
             for line in &rendered.lines {
+                let mut prev_fg: Option<(u8, u8, u8)> = None;
+                let mut prev_bg: Option<(u8, u8, u8)> = None;
                 for span in &line.spans {
-                    let (tr, tg, tb) = match span.style.fg {
+                    let fg = match span.style.fg {
                         Some(Color::Rgb(r, g, b)) => (r, g, b),
                         _ => (255, 255, 255),
                     };
-                    let (br, bg_c, bb) = match span.style.bg {
+                    let bg = match span.style.bg {
                         Some(Color::Rgb(r, g, b)) => (r, g, b),
                         _ => (0, 0, 0),
                     };
-                    out.push_str(&format!(
-                        "\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg_c};{bb}m{}",
-                        span.content
-                    ));
+                    if prev_fg != Some(fg) {
+                        let _ = write!(out, "\x1b[38;2;{};{};{}m", fg.0, fg.1, fg.2);
+                        prev_fg = Some(fg);
+                    }
+                    if prev_bg != Some(bg) {
+                        let _ = write!(out, "\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
+                        prev_bg = Some(bg);
+                    }
+                    out.push_str(&span.content);
                 }
                 out.push_str("\x1b[0m\n");
             }
@@ -2458,25 +2621,65 @@ fn format_label_for(fmt: Option<ImageFormat>) -> String {
     }
 }
 
+#[inline(always)]
+fn div255_round(x: u32) -> u8 {
+    let t = x + 128;
+    ((t + (t >> 8)) >> 8) as u8
+}
+
+#[inline(always)]
 fn blend_over_bg(px: Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
-    let a = px[3] as u16;
-    if a == 255 {
-        return (px[0], px[1], px[2]);
-    }
-    if a == 0 {
-        return bg;
-    }
+    let a = px[3] as u32;
     let inv = 255 - a;
-    let r = ((px[0] as u16 * a + bg.0 as u16 * inv + 127) / 255) as u8;
-    let g = ((px[1] as u16 * a + bg.1 as u16 * inv + 127) / 255) as u8;
-    let b = ((px[2] as u16 * a + bg.2 as u16 * inv + 127) / 255) as u8;
+    let r = div255_round(px[0] as u32 * a + bg.0 as u32 * inv);
+    let g = div255_round(px[1] as u32 * a + bg.1 as u32 * inv);
+    let b = div255_round(px[2] as u32 * a + bg.2 as u32 * inv);
     (r, g, b)
+}
+
+fn blend_rgba_in_place(flat_rgba: &mut [u8], bg: (u8, u8, u8)) {
+    let bg_r = bg.0 as u32;
+    let bg_g = bg.1 as u32;
+    let bg_b = bg.2 as u32;
+    for px in flat_rgba.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        let inv = 255 - a;
+        px[0] = div255_round(px[0] as u32 * a + bg_r * inv);
+        px[1] = div255_round(px[1] as u32 * a + bg_g * inv);
+        px[2] = div255_round(px[2] as u32 * a + bg_b * inv);
+        px[3] = 255;
+    }
 }
 
 fn encode_png(img: &DynamicImage) -> Result<Vec<u8>> {
     let mut buf = Cursor::new(Vec::new());
-    img.write_to(&mut buf, ImageFormat::Png)
-        .context("Failed to encode PNG")?;
+    let encoder =
+        PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, PngFilterType::NoFilter);
+    match img {
+        DynamicImage::ImageRgb8(b) => encoder
+            .write_image(b.as_raw(), b.width(), b.height(), ExtendedColorType::Rgb8)
+            .context("Failed to encode PNG")?,
+        DynamicImage::ImageRgba8(b) => encoder
+            .write_image(b.as_raw(), b.width(), b.height(), ExtendedColorType::Rgba8)
+            .context("Failed to encode PNG")?,
+        DynamicImage::ImageLuma8(b) => encoder
+            .write_image(b.as_raw(), b.width(), b.height(), ExtendedColorType::L8)
+            .context("Failed to encode PNG")?,
+        DynamicImage::ImageLumaA8(b) => encoder
+            .write_image(b.as_raw(), b.width(), b.height(), ExtendedColorType::La8)
+            .context("Failed to encode PNG")?,
+        other => {
+            let rgba = other.to_rgba8();
+            encoder
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    ExtendedColorType::Rgba8,
+                )
+                .context("Failed to encode PNG")?;
+        }
+    }
     Ok(buf.into_inner())
 }
 

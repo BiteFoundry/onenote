@@ -13,12 +13,6 @@ use crate::{
     storage::escape_like,
 };
 
-const PAGE_SUMMARY_COLS: &str = "
-    page_key, id, scope_json, scope_key, section_id, section_name,
-    notebook_id, notebook_name, title, level, page_order,
-    created_at, last_modified_at, content_url, web_url, preview_text, has_todo
-";
-
 fn normalized_notebook_key(nb: &OnenoteNotebook) -> String {
     if nb.notebook_key.trim().is_empty() {
         nb.scope.make_entity_key(&nb.id)
@@ -58,7 +52,7 @@ fn upsert_onenote_notebooks_in_tx(
     if items.is_empty() {
         return Ok(());
     }
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "
         INSERT INTO onenote_notebooks (
             notebook_key, id, scope_json, scope_key, display_name, color,
@@ -119,7 +113,7 @@ pub fn upsert_onenote_notebooks(conn: &mut Connection, items: &[OnenoteNotebook]
 }
 
 pub fn list_onenote_notebooks(conn: &Connection) -> Result<Vec<OnenoteNotebook>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             notebook_key, id, scope_json, scope_key, display_name, color,
@@ -144,7 +138,7 @@ fn upsert_onenote_section_groups_in_tx(
     if items.is_empty() {
         return Ok(());
     }
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "
         INSERT INTO onenote_section_groups (
             section_group_key, id, scope_json, scope_key, notebook_id,
@@ -201,7 +195,7 @@ pub fn upsert_onenote_section_groups(
 }
 
 pub fn list_onenote_section_groups(conn: &Connection) -> Result<Vec<OnenoteSectionGroup>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             section_group_key, id, scope_json, scope_key, notebook_id,
@@ -294,7 +288,7 @@ fn upsert_onenote_sections_in_tx(
             web_url = COALESCE(excluded.web_url, onenote_sections.web_url)
         "
     };
-    let mut stmt = tx.prepare(sql)?;
+    let mut stmt = tx.prepare_cached(sql)?;
 
     for sec in items {
         let scope_key = sec.scope.scope_key();
@@ -340,7 +334,7 @@ pub fn list_onenote_sections(
         .filter(|s| !s.is_empty());
 
     if let Some(nb_filter) = filter {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 section_key, id, scope_json, scope_key, notebook_id, notebook_name,
@@ -360,7 +354,7 @@ pub fn list_onenote_sections(
         let rows = stmt.query_map(params![nb_filter], map_section_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 section_key, id, scope_json, scope_key, notebook_id, notebook_name,
@@ -408,25 +402,18 @@ fn upsert_onenote_pages_in_tx(
         return Ok(Vec::new());
     }
     let page_keys: Vec<String> = items.iter().map(normalized_page_key).collect();
-    let mut indexed_keys: HashSet<String> = {
-        // FTS page_key is unindexed. Check the whole batch in a single scan of just that column.
-        let mut stmt = tx.prepare(
-            "SELECT page_key FROM onenote_fts WHERE page_key IN (SELECT value FROM json_each(?1))",
-        )?;
-        let rows = stmt.query_map(params![serde_json::to_string(&page_keys)?], |r| r.get(0))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    let mut existing_stmt = tx.prepare(
+    let mut existing_stmt = tx.prepare_cached(
         "SELECT section_key, title, COALESCE(notebook_name, ''), COALESCE(section_name, ''),
                 CASE
                     WHEN body_plain IS NULL THEN COALESCE(preview_text, '')
                     WHEN ?2 IS NOT NULL AND ?2 IS NOT last_modified_at THEN
                         CASE WHEN body_plain = COALESCE(?3, '') THEN COALESCE(?3, '') END
                 END,
-                last_modified_at, detail_json IS NOT NULL
+                last_modified_at, detail_json IS NOT NULL,
+                EXISTS(SELECT 1 FROM onenote_fts WHERE rowid = onenote_pages.rowid)
          FROM onenote_pages WHERE page_key = ?1",
     )?;
-    let mut page_stmt = tx.prepare(
+    let mut page_stmt = tx.prepare_cached(
         "
         INSERT INTO onenote_pages (
             page_key, id, scope_json, scope_key, section_key, section_id,
@@ -525,17 +512,19 @@ fn upsert_onenote_pages_in_tx(
                 ELSE COALESCE(excluded.body_plain, onenote_pages.body_plain)
             END
         RETURNING section_key, title, COALESCE(notebook_name, ''), COALESCE(section_name, ''),
-                  CASE WHEN body_plain IS NULL THEN COALESCE(preview_text, '') END
+                  CASE WHEN body_plain IS NULL THEN COALESCE(preview_text, '') END,
+                  rowid
         ",
     )?;
 
-    let mut fts_del_stmt = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
-    let mut fts_ins_stmt = tx.prepare(
+    let mut fts_del_stmt = tx.prepare_cached("DELETE FROM onenote_fts WHERE rowid = ?1")?;
+    let mut fts_ins_stmt = tx.prepare_cached(
         "
         INSERT INTO onenote_fts (
-            page_key, section_key, title, notebook_name, section_name, body_plain
+            rowid, page_key, section_key, title, notebook_name, section_name, body_plain
         )
         SELECT
+            rowid,
             page_key,
             section_key,
             title,
@@ -543,7 +532,7 @@ fn upsert_onenote_pages_in_tx(
             COALESCE(section_name, ''),
             COALESCE(body_plain, preview_text, '')
         FROM onenote_pages
-        WHERE page_key = ?1
+        WHERE rowid = ?1
         ",
     )?;
 
@@ -566,16 +555,22 @@ fn upsert_onenote_pages_in_tx(
                     map_page_search_fields(r)?,
                     r.get::<_, Option<String>>(5)?,
                     r.get::<_, bool>(6)?,
+                    r.get::<_, bool>(7)?,
                 ))
             })
             .optional()?;
-        if existing.as_ref().is_some_and(|(_, existing_mod, had_detail)| {
-            *had_detail && invalidating_mod.is_some() && invalidating_mod != existing_mod.as_deref()
-        }) {
+        if existing
+            .as_ref()
+            .is_some_and(|(_, existing_mod, had_detail, _)| {
+                *had_detail
+                    && invalidating_mod.is_some()
+                    && invalidating_mod != existing_mod.as_deref()
+            })
+        {
             invalidated_keys.push(page_key.clone());
         }
 
-        let search_fields = page_stmt.query_row(
+        let (search_fields, page_rowid) = page_stmt.query_row(
             params![
                 page_key,
                 item.id,
@@ -597,16 +592,17 @@ fn upsert_onenote_pages_in_tx(
                 bool_to_i32(item.has_todo),
                 bool_to_i32(preserve_detail),
             ],
-            map_page_search_fields,
+            |r| Ok((map_page_search_fields(r)?, r.get::<_, i64>(5)?)),
         )?;
 
-        let was_indexed = indexed_keys.contains(&page_key);
-        if !was_indexed || existing.as_ref().map(|(fields, _, _)| fields) != Some(&search_fields) {
+        let was_indexed = existing.as_ref().is_some_and(|(_, _, _, indexed)| *indexed);
+        if !was_indexed
+            || existing.as_ref().map(|(fields, _, _, _)| fields) != Some(&search_fields)
+        {
             if was_indexed {
-                fts_del_stmt.execute(params![page_key])?;
+                fts_del_stmt.execute(params![page_rowid])?;
             }
-            fts_ins_stmt.execute(params![page_key])?;
-            indexed_keys.insert(page_key);
+            fts_ins_stmt.execute(params![page_rowid])?;
         }
     }
     Ok(invalidated_keys)
@@ -700,7 +696,8 @@ fn reconcile_onenote_hierarchy_inner(
 
         // Prune stale notebooks
         let stale_nbs: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT notebook_key, scope_key FROM onenote_notebooks")?;
+            let mut stmt =
+                tx.prepare_cached("SELECT notebook_key, scope_key FROM onenote_notebooks")?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
@@ -709,7 +706,8 @@ fn reconcile_onenote_hierarchy_inner(
                 .collect()
         };
         if !stale_nbs.is_empty() {
-            let mut del = tx.prepare("DELETE FROM onenote_notebooks WHERE notebook_key = ?1")?;
+            let mut del =
+                tx.prepare_cached("DELETE FROM onenote_notebooks WHERE notebook_key = ?1")?;
             for k in stale_nbs {
                 del.execute(params![k])?;
             }
@@ -717,8 +715,9 @@ fn reconcile_onenote_hierarchy_inner(
 
         // Prune stale section groups
         let stale_sgs: Vec<String> = {
-            let mut stmt =
-                tx.prepare("SELECT section_group_key, scope_key FROM onenote_section_groups")?;
+            let mut stmt = tx.prepare_cached(
+                "SELECT section_group_key, scope_key FROM onenote_section_groups",
+            )?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
@@ -727,8 +726,9 @@ fn reconcile_onenote_hierarchy_inner(
                 .collect()
         };
         if !stale_sgs.is_empty() {
-            let mut del =
-                tx.prepare("DELETE FROM onenote_section_groups WHERE section_group_key = ?1")?;
+            let mut del = tx.prepare_cached(
+                "DELETE FROM onenote_section_groups WHERE section_group_key = ?1",
+            )?;
             for k in stale_sgs {
                 del.execute(params![k])?;
             }
@@ -736,7 +736,8 @@ fn reconcile_onenote_hierarchy_inner(
 
         // Prune stale sections and their per-section sync cursors
         let stale_secs: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT section_key, scope_key FROM onenote_sections")?;
+            let mut stmt =
+                tx.prepare_cached("SELECT section_key, scope_key FROM onenote_sections")?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
@@ -745,8 +746,10 @@ fn reconcile_onenote_hierarchy_inner(
                 .collect()
         };
         if !stale_secs.is_empty() {
-            let mut del_sec = tx.prepare("DELETE FROM onenote_sections WHERE section_key = ?1")?;
-            let mut del_cur = tx.prepare("DELETE FROM sync_cursors WHERE scope_key = ?1")?;
+            let mut del_sec =
+                tx.prepare_cached("DELETE FROM onenote_sections WHERE section_key = ?1")?;
+            let mut del_cur =
+                tx.prepare_cached("DELETE FROM sync_cursors WHERE scope_key = ?1")?;
             for k in stale_secs {
                 del_sec.execute(params![k])?;
                 let cursor_key = format!("onenote:pages:{k}");
@@ -755,12 +758,12 @@ fn reconcile_onenote_hierarchy_inner(
         }
 
         // Prune orphaned pages (belonging to removed sections) and their FTS5 entries
-        let orphan_pages: Vec<String> = {
+        let orphan_rowids: Vec<i64> = {
             let mut stmt =
-                tx.prepare("SELECT page_key, section_key, scope_key FROM onenote_pages")?;
+                tx.prepare_cached("SELECT rowid, section_key, scope_key FROM onenote_pages")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
-                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                 ))
@@ -770,15 +773,15 @@ fn reconcile_onenote_hierarchy_inner(
                 .filter(|(_, sec_key, scope)| {
                     scope_in_reconciled(scope) && !keep_sec_keys.contains(sec_key)
                 })
-                .map(|(pk, _, _)| pk)
+                .map(|(rid, _, _)| rid)
                 .collect()
         };
-        if !orphan_pages.is_empty() {
-            let mut del_page = tx.prepare("DELETE FROM onenote_pages WHERE page_key = ?1")?;
-            let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
-            for pk in orphan_pages {
-                del_page.execute(params![pk])?;
-                del_fts.execute(params![pk])?;
+        if !orphan_rowids.is_empty() {
+            let mut del_page = tx.prepare_cached("DELETE FROM onenote_pages WHERE rowid = ?1")?;
+            let mut del_fts = tx.prepare_cached("DELETE FROM onenote_fts WHERE rowid = ?1")?;
+            for rid in orphan_rowids {
+                del_page.execute(params![rid])?;
+                del_fts.execute(params![rid])?;
             }
         }
     }
@@ -801,7 +804,7 @@ pub fn reconcile_onenote_notebooks_for_scopes(
         let keep_nb_keys: HashSet<String> = notebooks.iter().map(normalized_notebook_key).collect();
         let stale_nbs: Vec<(String, String, String)> = {
             let mut stmt =
-                tx.prepare("SELECT notebook_key, id, scope_key FROM onenote_notebooks")?;
+                tx.prepare_cached("SELECT notebook_key, id, scope_key FROM onenote_notebooks")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -815,47 +818,51 @@ pub fn reconcile_onenote_notebooks_for_scopes(
                 .collect()
         };
         if !stale_nbs.is_empty() {
-            let mut del_nb = tx.prepare("DELETE FROM onenote_notebooks WHERE notebook_key = ?1")?;
-            let mut del_sg = tx.prepare(
+            let mut del_nb =
+                tx.prepare_cached("DELETE FROM onenote_notebooks WHERE notebook_key = ?1")?;
+            let mut del_sg = tx.prepare_cached(
                 "DELETE FROM onenote_section_groups WHERE scope_key = ?1 AND notebook_id = ?2",
             )?;
-            let mut del_sec = tx.prepare("DELETE FROM onenote_sections WHERE section_key = ?1")?;
-            let mut del_cur = tx.prepare("DELETE FROM sync_cursors WHERE scope_key = ?1")?;
-            let mut del_page = tx.prepare("DELETE FROM onenote_pages WHERE page_key = ?1")?;
-            let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
+            let mut del_sec =
+                tx.prepare_cached("DELETE FROM onenote_sections WHERE section_key = ?1")?;
+            let mut del_cur =
+                tx.prepare_cached("DELETE FROM sync_cursors WHERE scope_key = ?1")?;
+            let mut del_page = tx.prepare_cached("DELETE FROM onenote_pages WHERE rowid = ?1")?;
+            let mut del_fts = tx.prepare_cached("DELETE FROM onenote_fts WHERE rowid = ?1")?;
 
             for (nb_key, nb_id, scope_key) in stale_nbs {
                 let sec_keys: Vec<String> = {
-                    let mut stmt = tx.prepare(
+                    let mut stmt = tx.prepare_cached(
                         "SELECT section_key FROM onenote_sections WHERE scope_key = ?1 AND notebook_id = ?2",
                     )?;
                     let rows = stmt.query_map(params![&scope_key, &nb_id], |r| r.get(0))?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()?
                 };
                 for sec_key in sec_keys {
-                    let page_keys: Vec<String> = {
-                        let mut stmt = tx
-                            .prepare("SELECT page_key FROM onenote_pages WHERE section_key = ?1")?;
+                    let page_rowids: Vec<i64> = {
+                        let mut stmt = tx.prepare_cached(
+                            "SELECT rowid FROM onenote_pages WHERE section_key = ?1",
+                        )?;
                         let rows = stmt.query_map(params![&sec_key], |r| r.get(0))?;
                         rows.collect::<rusqlite::Result<Vec<_>>>()?
                     };
-                    for pk in page_keys {
-                        del_page.execute(params![&pk])?;
-                        del_fts.execute(params![&pk])?;
+                    for rid in page_rowids {
+                        del_page.execute(params![rid])?;
+                        del_fts.execute(params![rid])?;
                     }
                     del_sec.execute(params![&sec_key])?;
                     del_cur.execute(params![format!("onenote:pages:{sec_key}")])?;
                 }
-                let direct_pages: Vec<String> = {
-                    let mut stmt = tx.prepare(
-                        "SELECT page_key FROM onenote_pages WHERE scope_key = ?1 AND notebook_id = ?2",
+                let direct_rowids: Vec<i64> = {
+                    let mut stmt = tx.prepare_cached(
+                        "SELECT rowid FROM onenote_pages WHERE scope_key = ?1 AND notebook_id = ?2",
                     )?;
                     let rows = stmt.query_map(params![&scope_key, &nb_id], |r| r.get(0))?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()?
                 };
-                for pk in direct_pages {
-                    del_page.execute(params![&pk])?;
-                    del_fts.execute(params![&pk])?;
+                for rid in direct_rowids {
+                    del_page.execute(params![rid])?;
+                    del_fts.execute(params![rid])?;
                 }
                 del_sg.execute(params![&scope_key, &nb_id])?;
                 del_cur.execute(params![format!("onenote:sections:{nb_key}")])?;
@@ -888,8 +895,9 @@ pub fn reconcile_onenote_sections_for_scopes(
         let keep_sec_keys: HashSet<String> = sections.iter().map(normalized_section_key).collect();
 
         let stale_sgs: Vec<String> = {
-            let mut stmt =
-                tx.prepare("SELECT section_group_key, scope_key FROM onenote_section_groups")?;
+            let mut stmt = tx.prepare_cached(
+                "SELECT section_group_key, scope_key FROM onenote_section_groups",
+            )?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
@@ -898,15 +906,17 @@ pub fn reconcile_onenote_sections_for_scopes(
                 .collect()
         };
         if !stale_sgs.is_empty() {
-            let mut del =
-                tx.prepare("DELETE FROM onenote_section_groups WHERE section_group_key = ?1")?;
+            let mut del = tx.prepare_cached(
+                "DELETE FROM onenote_section_groups WHERE section_group_key = ?1",
+            )?;
             for k in stale_sgs {
                 del.execute(params![k])?;
             }
         }
 
         let stale_secs: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT section_key, scope_key FROM onenote_sections")?;
+            let mut stmt =
+                tx.prepare_cached("SELECT section_key, scope_key FROM onenote_sections")?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
@@ -915,20 +925,22 @@ pub fn reconcile_onenote_sections_for_scopes(
                 .collect()
         };
         if !stale_secs.is_empty() {
-            let mut del_sec = tx.prepare("DELETE FROM onenote_sections WHERE section_key = ?1")?;
-            let mut del_cur = tx.prepare("DELETE FROM sync_cursors WHERE scope_key = ?1")?;
-            let mut del_page = tx.prepare("DELETE FROM onenote_pages WHERE page_key = ?1")?;
-            let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
+            let mut del_sec =
+                tx.prepare_cached("DELETE FROM onenote_sections WHERE section_key = ?1")?;
+            let mut del_cur =
+                tx.prepare_cached("DELETE FROM sync_cursors WHERE scope_key = ?1")?;
+            let mut del_page = tx.prepare_cached("DELETE FROM onenote_pages WHERE rowid = ?1")?;
+            let mut del_fts = tx.prepare_cached("DELETE FROM onenote_fts WHERE rowid = ?1")?;
             for k in stale_secs {
-                let page_keys: Vec<String> = {
+                let page_rowids: Vec<i64> = {
                     let mut stmt =
-                        tx.prepare("SELECT page_key FROM onenote_pages WHERE section_key = ?1")?;
+                        tx.prepare_cached("SELECT rowid FROM onenote_pages WHERE section_key = ?1")?;
                     let rows = stmt.query_map(params![&k], |r| r.get(0))?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()?
                 };
-                for pk in page_keys {
-                    del_page.execute(params![&pk])?;
-                    del_fts.execute(params![&pk])?;
+                for rid in page_rowids {
+                    del_page.execute(params![rid])?;
+                    del_fts.execute(params![rid])?;
                 }
                 del_sec.execute(params![&k])?;
                 del_cur.execute(params![format!("onenote:pages:{k}")])?;
@@ -959,7 +971,7 @@ pub fn reconcile_onenote_notebook_sections(
     if is_complete {
         let keep_sec_keys: HashSet<String> = sections.iter().map(normalized_section_key).collect();
         let stale_secs: Vec<String> = {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "SELECT section_key FROM onenote_sections WHERE (scope_key || '|' || COALESCE(notebook_id, '')) = ?1",
             )?;
             let rows = stmt.query_map(params![trimmed], |r| r.get::<_, String>(0))?;
@@ -969,20 +981,22 @@ pub fn reconcile_onenote_notebook_sections(
                 .collect()
         };
         if !stale_secs.is_empty() {
-            let mut del_sec = tx.prepare("DELETE FROM onenote_sections WHERE section_key = ?1")?;
-            let mut del_cur = tx.prepare("DELETE FROM sync_cursors WHERE scope_key = ?1")?;
-            let mut del_page = tx.prepare("DELETE FROM onenote_pages WHERE page_key = ?1")?;
-            let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
+            let mut del_sec =
+                tx.prepare_cached("DELETE FROM onenote_sections WHERE section_key = ?1")?;
+            let mut del_cur =
+                tx.prepare_cached("DELETE FROM sync_cursors WHERE scope_key = ?1")?;
+            let mut del_page = tx.prepare_cached("DELETE FROM onenote_pages WHERE rowid = ?1")?;
+            let mut del_fts = tx.prepare_cached("DELETE FROM onenote_fts WHERE rowid = ?1")?;
             for k in stale_secs {
-                let page_keys: Vec<String> = {
+                let page_rowids: Vec<i64> = {
                     let mut stmt =
-                        tx.prepare("SELECT page_key FROM onenote_pages WHERE section_key = ?1")?;
+                        tx.prepare_cached("SELECT rowid FROM onenote_pages WHERE section_key = ?1")?;
                     let rows = stmt.query_map(params![&k], |r| r.get(0))?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()?
                 };
-                for pk in page_keys {
-                    del_page.execute(params![&pk])?;
-                    del_fts.execute(params![&pk])?;
+                for rid in page_rowids {
+                    del_page.execute(params![rid])?;
+                    del_fts.execute(params![rid])?;
                 }
                 del_sec.execute(params![&k])?;
                 del_cur.execute(params![format!("onenote:pages:{k}")])?;
@@ -1094,16 +1108,24 @@ fn prune_onenote_section_pages_in_tx(
     preserve_page_keys: &HashSet<String>,
 ) -> Result<()> {
     let keep_page_keys: HashSet<String> = pages.iter().map(normalized_page_key).collect();
-    let stale_pages: Vec<String> = list_onenote_page_keys(tx, canonical_section_key)?
-        .into_iter()
-        .filter(|pk| !keep_page_keys.contains(pk) && !preserve_page_keys.contains(pk))
-        .collect();
-    if !stale_pages.is_empty() {
-        let mut del_page = tx.prepare("DELETE FROM onenote_pages WHERE page_key = ?1")?;
-        let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
-        for pk in stale_pages {
-            del_page.execute(params![pk])?;
-            del_fts.execute(params![pk])?;
+    let stale_rowids: Vec<i64> = {
+        let mut stmt =
+            tx.prepare_cached("SELECT rowid, page_key FROM onenote_pages WHERE section_key = ?1")?;
+        let rows = stmt.query_map(params![canonical_section_key], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, pk)| !keep_page_keys.contains(pk) && !preserve_page_keys.contains(pk))
+            .map(|(rid, _)| rid)
+            .collect()
+    };
+    if !stale_rowids.is_empty() {
+        let mut del_page = tx.prepare_cached("DELETE FROM onenote_pages WHERE rowid = ?1")?;
+        let mut del_fts = tx.prepare_cached("DELETE FROM onenote_fts WHERE rowid = ?1")?;
+        for rid in stale_rowids {
+            del_page.execute(params![rid])?;
+            del_fts.execute(params![rid])?;
         }
     }
     Ok(())
@@ -1155,7 +1177,7 @@ pub fn list_onenote_page_keys(conn: &Connection, section_key: &str) -> Result<Ve
             vec![OnenoteScope::Me.make_entity_key(trimmed), trimmed.to_owned()],
         )
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?;
     rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
 }
@@ -1167,28 +1189,32 @@ pub fn list_onenote_pages(conn: &Connection, section_key: &str) -> Result<Vec<On
     }
 
     if trimmed.contains('|') {
-        let sql = format!(
+        let mut stmt = conn.prepare_cached(
             "
-            SELECT {PAGE_SUMMARY_COLS}
+            SELECT
+                page_key, id, scope_json, scope_key, section_id, section_name,
+                notebook_id, notebook_name, title, level, page_order,
+                created_at, last_modified_at, content_url, web_url, preview_text, has_todo
             FROM onenote_pages
             WHERE section_key = ?1
             ORDER BY page_order ASC, COALESCE(last_modified_at, '') DESC, id ASC
-            "
-        );
-        let mut stmt = conn.prepare(&sql)?;
+            ",
+        )?;
         let rows = stmt.query_map(params![trimmed], map_page_summary_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     } else {
         let me_key = OnenoteScope::Me.make_entity_key(trimmed);
-        let sql = format!(
+        let mut stmt = conn.prepare_cached(
             "
-            SELECT {PAGE_SUMMARY_COLS}
+            SELECT
+                page_key, id, scope_json, scope_key, section_id, section_name,
+                notebook_id, notebook_name, title, level, page_order,
+                created_at, last_modified_at, content_url, web_url, preview_text, has_todo
             FROM onenote_pages
             WHERE section_key = ?1 OR section_id = ?2
             ORDER BY page_order ASC, COALESCE(last_modified_at, '') DESC, id ASC
-            "
-        );
-        let mut stmt = conn.prepare(&sql)?;
+            ",
+        )?;
         let rows = stmt.query_map(params![me_key, trimmed], map_page_summary_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
@@ -1213,8 +1239,9 @@ pub fn preserve_cached_page_hierarchy(
     } else {
         OnenoteScope::Me.make_entity_key(trimmed)
     };
-    let mut stmt = conn
-        .prepare("SELECT page_key, level, page_order FROM onenote_pages WHERE section_key = ?1")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT page_key, level, page_order FROM onenote_pages WHERE section_key = ?1",
+    )?;
     let cached: std::collections::HashMap<String, (i32, i32)> = stmt
         .query_map(params![canonical], |r| {
             Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
@@ -1276,7 +1303,7 @@ pub fn upsert_onenote_page_detail(conn: &mut Connection, detail: &OnenotePageDet
 
     let tx = conn.transaction()?;
     {
-        tx.execute(
+        let mut upsert_stmt = tx.prepare_cached(
             "
             INSERT INTO onenote_pages (
                 page_key, id, scope_json, scope_key, section_key, section_id,
@@ -1333,7 +1360,10 @@ pub fn upsert_onenote_page_detail(conn: &mut Connection, detail: &OnenotePageDet
                 has_todo = excluded.has_todo,
                 detail_json = excluded.detail_json,
                 body_plain = excluded.body_plain
+            RETURNING rowid
             ",
+        )?;
+        let page_rowid: i64 = upsert_stmt.query_row(
             params![
                 page_key,
                 normalized.summary.id,
@@ -1356,15 +1386,19 @@ pub fn upsert_onenote_page_detail(conn: &mut Connection, detail: &OnenotePageDet
                 detail_json,
                 normalized.body_plain,
             ],
+            |r| r.get(0),
         )?;
 
-        tx.execute("DELETE FROM onenote_fts WHERE page_key = ?1", params![page_key])?;
-        tx.execute(
+        let mut fts_del_stmt = tx.prepare_cached("DELETE FROM onenote_fts WHERE rowid = ?1")?;
+        fts_del_stmt.execute(params![page_rowid])?;
+
+        let mut fts_ins_stmt = tx.prepare_cached(
             "
             INSERT INTO onenote_fts (
-                page_key, section_key, title, notebook_name, section_name, body_plain
+                rowid, page_key, section_key, title, notebook_name, section_name, body_plain
             )
             SELECT
+                rowid,
                 page_key,
                 section_key,
                 title,
@@ -1372,10 +1406,10 @@ pub fn upsert_onenote_page_detail(conn: &mut Connection, detail: &OnenotePageDet
                 COALESCE(section_name, ''),
                 COALESCE(body_plain, preview_text, '')
             FROM onenote_pages
-            WHERE page_key = ?1
+            WHERE rowid = ?1
             ",
-            params![page_key],
         )?;
+        fts_ins_stmt.execute(params![page_rowid])?;
     }
     tx.commit()?;
     Ok(())
@@ -1403,16 +1437,48 @@ pub fn get_onenote_page_detail(
         Option<String>,
     );
 
-    let row_opt: Option<DetailRow> = conn
-        .query_row(
+    let row_opt: Option<DetailRow> = {
+        let mut stmt = conn.prepare_cached(
             "
             SELECT detail_json, title, level, page_order, last_modified_at,
                    section_id, section_name, notebook_id, notebook_name, preview_text
             FROM onenote_pages
             WHERE page_key = ?1
             ",
-            params![key],
-            |r| {
+        )?;
+        stmt.query_row(params![key], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+            ))
+        })
+        .optional()?
+    };
+
+    let row_data = match row_opt {
+        Some(data) => Some(data),
+        None => {
+            let mut stmt = conn.prepare_cached(
+                "
+                SELECT detail_json, title, level, page_order, last_modified_at,
+                       section_id, section_name, notebook_id, notebook_name, preview_text
+                FROM onenote_pages
+                WHERE id = ?1
+                ORDER BY
+                    CASE WHEN detail_json IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    COALESCE(last_modified_at, '') DESC
+                LIMIT 1
+                ",
+            )?;
+            stmt.query_row(params![key], |r| {
                 Ok((
                     r.get(0)?,
                     r.get(1)?,
@@ -1425,41 +1491,9 @@ pub fn get_onenote_page_detail(
                     r.get(8)?,
                     r.get(9)?,
                 ))
-            },
-        )
-        .optional()?;
-
-    let row_data = match row_opt {
-        Some(data) => Some(data),
-        None => conn
-            .query_row(
-                "
-                SELECT detail_json, title, level, page_order, last_modified_at,
-                       section_id, section_name, notebook_id, notebook_name, preview_text
-                FROM onenote_pages
-                WHERE id = ?1
-                ORDER BY
-                    CASE WHEN detail_json IS NOT NULL THEN 0 ELSE 1 END ASC,
-                    COALESCE(last_modified_at, '') DESC
-                LIMIT 1
-                ",
-                params![key],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?,
-                    ))
-                },
-            )
-            .optional()?,
+            })
+            .optional()?
+        }
     };
 
     let Some((
@@ -1511,30 +1545,35 @@ pub fn get_onenote_page_summary(
         return Ok(None);
     }
 
-    let exact_sql = format!(
-        "
-        SELECT {PAGE_SUMMARY_COLS}
-        FROM onenote_pages
-        WHERE page_key = ?1
-        "
-    );
-    if let Some(found) = conn
-        .query_row(&exact_sql, params![key], map_page_summary_row)
-        .optional()?
     {
-        return Ok(Some(found));
+        let mut stmt = conn.prepare_cached(
+            "
+            SELECT
+                page_key, id, scope_json, scope_key, section_id, section_name,
+                notebook_id, notebook_name, title, level, page_order,
+                created_at, last_modified_at, content_url, web_url, preview_text, has_todo
+            FROM onenote_pages
+            WHERE page_key = ?1
+            ",
+        )?;
+        if let Some(found) = stmt.query_row(params![key], map_page_summary_row).optional()? {
+            return Ok(Some(found));
+        }
     }
 
-    let fallback_sql = format!(
+    let mut stmt = conn.prepare_cached(
         "
-        SELECT {PAGE_SUMMARY_COLS}
+        SELECT
+            page_key, id, scope_json, scope_key, section_id, section_name,
+            notebook_id, notebook_name, title, level, page_order,
+            created_at, last_modified_at, content_url, web_url, preview_text, has_todo
         FROM onenote_pages
         WHERE id = ?1
         ORDER BY COALESCE(last_modified_at, '') DESC, page_key ASC
         LIMIT 1
-        "
-    );
-    conn.query_row(&fallback_sql, params![key], map_page_summary_row)
+        ",
+    )?;
+    stmt.query_row(params![key], map_page_summary_row)
         .optional()
         .map_err(Into::into)
 }
@@ -1545,24 +1584,22 @@ pub fn delete_onenote_page(conn: &mut Connection, page_key_or_id: &str) -> Resul
         return Ok(());
     }
 
-    let matched_keys: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT page_key FROM onenote_pages WHERE page_key = ?1 OR id = ?1",
-        )?;
-        let rows = stmt.query_map(params![key], |r| r.get(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
     let tx = conn.transaction()?;
     {
-        tx.execute(
-            "DELETE FROM onenote_pages WHERE page_key = ?1 OR id = ?1",
-            params![key],
-        )?;
-        let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
-        del_fts.execute(params![key])?;
-        for pk in matched_keys {
-            del_fts.execute(params![pk])?;
+        let rowids: Vec<i64> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT rowid FROM onenote_pages WHERE page_key = ?1 OR id = ?1",
+            )?;
+            let rows = stmt.query_map(params![key], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !rowids.is_empty() {
+            let mut del_page = tx.prepare_cached("DELETE FROM onenote_pages WHERE rowid = ?1")?;
+            let mut del_fts = tx.prepare_cached("DELETE FROM onenote_fts WHERE rowid = ?1")?;
+            for rid in rowids {
+                del_page.execute(params![rid])?;
+                del_fts.execute(params![rid])?;
+            }
         }
     }
     tx.commit()?;
@@ -1570,11 +1607,11 @@ pub fn delete_onenote_page(conn: &mut Connection, page_key_or_id: &str) -> Resul
 }
 
 pub fn count_onenote_pages(conn: &Connection) -> Result<(u64, u64)> {
-    let (pages, pages_with_body): (i64, i64) = conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "SELECT COUNT(*), COALESCE(SUM(detail_json IS NOT NULL), 0) FROM onenote_pages",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let (pages, pages_with_body): (i64, i64) =
+        stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok((pages.max(0) as u64, pages_with_body.max(0) as u64))
 }
 
@@ -1586,29 +1623,6 @@ enum SearchSectionFilter<'a> {
     KeyOrId(&'a str),
     /// Any of these scoped section keys.
     Keys(&'a [String]),
-}
-
-impl SearchSectionFilter<'_> {
-    /// SQL condition on alias `p` and its bound values; placeholders start at `first_param`.
-    fn sql(&self, first_param: usize) -> (String, Vec<rusqlite::types::Value>) {
-        use rusqlite::types::Value;
-        match self {
-            Self::All => (String::new(), Vec::new()),
-            Self::KeyOrId(sec) => (
-                format!("AND (p.section_key = ?{first_param} OR p.section_id = ?{first_param})"),
-                vec![Value::Text(sec.to_string())],
-            ),
-            Self::Keys(keys) => {
-                let marks: Vec<String> = (0..keys.len())
-                    .map(|i| format!("?{}", first_param + i))
-                    .collect();
-                (
-                    format!("AND p.section_key IN ({})", marks.join(", ")),
-                    keys.iter().map(|k| Value::Text(k.clone())).collect(),
-                )
-            }
-        }
-    }
 }
 
 pub fn search_onenote_pages(
@@ -1673,12 +1687,6 @@ fn search_onenote_pages_filtered(
     run_onenote_like_search(conn, trimmed, filter, limit)
 }
 
-const SEARCH_HIT_COLUMNS: &str = "
-        p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
-        p.section_id, p.section_name, p.title, p.last_modified_at,
-        COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
-    ";
-
 fn run_onenote_fts_search(
     conn: &Connection,
     fts_query: &str,
@@ -1686,28 +1694,68 @@ fn run_onenote_fts_search(
     filter: SearchSectionFilter<'_>,
     limit: usize,
 ) -> Result<Vec<OnenoteSearchHit>> {
-    use rusqlite::types::Value;
-    let (section_sql, section_values) = filter.sql(2);
-    let limit_param = 2 + section_values.len();
-    let sql = format!(
-        "
-        SELECT {SEARCH_HIT_COLUMNS}
-        FROM onenote_fts f
-        JOIN onenote_pages p ON p.page_key = f.page_key
-        WHERE onenote_fts MATCH ?1
-          {section_sql}
-        ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
-        LIMIT ?{limit_param}
-        "
-    );
-    let mut values = vec![Value::Text(fts_query.to_string())];
-    values.extend(section_values);
-    values.push(Value::Integer(limit as i64));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
-        map_onenote_search_hit_row(row, raw_query)
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    match filter {
+        SearchSectionFilter::All => {
+            let mut stmt = conn.prepare_cached(
+                "
+                SELECT
+                    p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
+                    p.section_id, p.section_name, p.title, p.last_modified_at,
+                    COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
+                FROM onenote_fts f
+                JOIN onenote_pages p ON p.rowid = f.rowid
+                WHERE onenote_fts MATCH ?1
+                ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
+                LIMIT ?2
+                ",
+            )?;
+            let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+                map_onenote_search_hit_row(row, raw_query)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }
+        SearchSectionFilter::KeyOrId(sec) => {
+            let mut stmt = conn.prepare_cached(
+                "
+                SELECT
+                    p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
+                    p.section_id, p.section_name, p.title, p.last_modified_at,
+                    COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
+                FROM onenote_fts f
+                JOIN onenote_pages p ON p.rowid = f.rowid
+                WHERE onenote_fts MATCH ?1
+                  AND (p.section_key = ?2 OR p.section_id = ?2)
+                ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
+                LIMIT ?3
+                ",
+            )?;
+            let rows = stmt.query_map(params![fts_query, sec, limit as i64], |row| {
+                map_onenote_search_hit_row(row, raw_query)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }
+        SearchSectionFilter::Keys(keys) => {
+            let keys_json = serde_json::to_string(keys)?;
+            let mut stmt = conn.prepare_cached(
+                "
+                SELECT
+                    p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
+                    p.section_id, p.section_name, p.title, p.last_modified_at,
+                    COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
+                FROM onenote_fts f
+                JOIN onenote_pages p ON p.rowid = f.rowid
+                WHERE onenote_fts MATCH ?1
+                  AND p.section_key IN (SELECT value FROM json_each(?2))
+                ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
+                LIMIT ?3
+                ",
+            )?;
+            let rows = stmt.query_map(params![fts_query, keys_json, limit as i64], |row| {
+                map_onenote_search_hit_row(row, raw_query)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }
+    }
 }
 
 fn run_onenote_like_search(
@@ -1716,34 +1764,84 @@ fn run_onenote_like_search(
     filter: SearchSectionFilter<'_>,
     limit: usize,
 ) -> Result<Vec<OnenoteSearchHit>> {
-    use rusqlite::types::Value;
     let pattern = format!("%{}%", escape_like(&raw_query.to_lowercase()));
-    let (section_sql, section_values) = filter.sql(2);
-    let limit_param = 2 + section_values.len();
-    let sql = format!(
-        "
-        SELECT {SEARCH_HIT_COLUMNS}
-        FROM onenote_pages p
-        WHERE (
-            LOWER(p.title) LIKE ?1 ESCAPE '\\'
-            OR LOWER(COALESCE(p.body_plain, '')) LIKE ?1 ESCAPE '\\'
-            OR LOWER(COALESCE(p.preview_text, '')) LIKE ?1 ESCAPE '\\'
-            OR LOWER(COALESCE(p.notebook_name, '')) LIKE ?1 ESCAPE '\\'
-            OR LOWER(COALESCE(p.section_name, '')) LIKE ?1 ESCAPE '\\'
-        )
-          {section_sql}
-        ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
-        LIMIT ?{limit_param}
-        "
-    );
-    let mut values = vec![Value::Text(pattern)];
-    values.extend(section_values);
-    values.push(Value::Integer(limit as i64));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
-        map_onenote_search_hit_row(row, raw_query)
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    match filter {
+        SearchSectionFilter::All => {
+            let mut stmt = conn.prepare_cached(
+                "
+                SELECT
+                    p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
+                    p.section_id, p.section_name, p.title, p.last_modified_at,
+                    COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
+                FROM onenote_pages p
+                WHERE (
+                    LOWER(p.title) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.body_plain, '')) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.preview_text, '')) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.notebook_name, '')) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.section_name, '')) LIKE ?1 ESCAPE '\\'
+                )
+                ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
+                LIMIT ?2
+                ",
+            )?;
+            let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+                map_onenote_search_hit_row(row, raw_query)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }
+        SearchSectionFilter::KeyOrId(sec) => {
+            let mut stmt = conn.prepare_cached(
+                "
+                SELECT
+                    p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
+                    p.section_id, p.section_name, p.title, p.last_modified_at,
+                    COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
+                FROM onenote_pages p
+                WHERE (
+                    LOWER(p.title) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.body_plain, '')) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.preview_text, '')) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.notebook_name, '')) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.section_name, '')) LIKE ?1 ESCAPE '\\'
+                )
+                  AND (p.section_key = ?2 OR p.section_id = ?2)
+                ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
+                LIMIT ?3
+                ",
+            )?;
+            let rows = stmt.query_map(params![pattern, sec, limit as i64], |row| {
+                map_onenote_search_hit_row(row, raw_query)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }
+        SearchSectionFilter::Keys(keys) => {
+            let keys_json = serde_json::to_string(keys)?;
+            let mut stmt = conn.prepare_cached(
+                "
+                SELECT
+                    p.page_key, p.id, p.scope_json, p.scope_key, p.notebook_name,
+                    p.section_id, p.section_name, p.title, p.last_modified_at,
+                    COALESCE(p.body_plain, ''), COALESCE(p.preview_text, ''), p.web_url
+                FROM onenote_pages p
+                WHERE (
+                    LOWER(p.title) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.body_plain, '')) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.preview_text, '')) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.notebook_name, '')) LIKE ?1 ESCAPE '\\'
+                    OR LOWER(COALESCE(p.section_name, '')) LIKE ?1 ESCAPE '\\'
+                )
+                  AND p.section_key IN (SELECT value FROM json_each(?2))
+                ORDER BY COALESCE(p.last_modified_at, '') DESC, p.page_order ASC, p.id DESC
+                LIMIT ?3
+                ",
+            )?;
+            let rows = stmt.query_map(params![pattern, keys_json, limit as i64], |row| {
+                map_onenote_search_hit_row(row, raw_query)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }
+    }
 }
 
 /// Cached pages that `resolver::resolve_page_in_slice` can match for `query`:
@@ -1759,7 +1857,7 @@ pub fn list_onenote_page_lookup_candidates(
         return Ok(Vec::new());
     }
     let q_lower = q.to_lowercase();
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             page_key, id, scope_json, scope_key, section_id, section_name,
@@ -1793,7 +1891,7 @@ pub fn list_onenote_page_lookup_candidates(
 pub fn list_onenote_page_section_refs(
     conn: &Connection,
 ) -> Result<Vec<(String, String, Option<String>)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT section_key, section_id, section_name FROM onenote_pages",
     )?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;

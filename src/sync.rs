@@ -336,73 +336,90 @@ async fn sync_hierarchy_and_sections_inner(
     let start_epoch = storage.current_mutation_epoch();
     let (mut nb_res, mut sec_res) = graph.list_all_accessible_hierarchy_scoped(true).await?;
 
-    // Guard against in-flight local notebook/section creations that completed after `start_epoch`.
-    if storage.hierarchy_mutated_since(start_epoch) {
-        let created_nbs = storage.notebooks_created_since(start_epoch);
-        if !created_nbs.is_empty() {
-            if let Ok(local_nbs) = storage.list_onenote_notebooks() {
-                for nb in local_nbs {
-                    if created_nbs.contains(&nb.notebook_key)
-                        && !nb_res
-                            .notebooks
-                            .iter()
-                            .any(|existing| existing.notebook_key == nb.notebook_key)
-                    {
-                        nb_res.notebooks.push(nb);
+    let (notebooks, section_groups, sections, cursors) = storage
+        .blocking(move |s| {
+            // Guard against in-flight local notebook/section creations that completed after `start_epoch`.
+            if s.hierarchy_mutated_since(start_epoch) {
+                let created_nbs = s.notebooks_created_since(start_epoch);
+                if !created_nbs.is_empty() {
+                    if let Ok(local_nbs) = s.list_onenote_notebooks() {
+                        for nb in local_nbs {
+                            if created_nbs.contains(&nb.notebook_key)
+                                && !nb_res
+                                    .notebooks
+                                    .iter()
+                                    .any(|existing| existing.notebook_key == nb.notebook_key)
+                            {
+                                nb_res.notebooks.push(nb);
+                            }
+                        }
+                    }
+                }
+                let created_secs = s.sections_created_since(start_epoch);
+                if !created_secs.is_empty() {
+                    if let Ok(local_secs) = s.list_onenote_sections(None) {
+                        for sec in local_secs {
+                            if created_secs.contains(&sec.section_key)
+                                && !sec_res
+                                    .sections
+                                    .iter()
+                                    .any(|existing| existing.section_key == sec.section_key)
+                            {
+                                sec_res.sections.push(sec);
+                            }
+                        }
                     }
                 }
             }
-        }
-        let created_secs = storage.sections_created_since(start_epoch);
-        if !created_secs.is_empty() {
-            if let Ok(local_secs) = storage.list_onenote_sections(None) {
-                for sec in local_secs {
-                    if created_secs.contains(&sec.section_key)
-                        && !sec_res
-                            .sections
-                            .iter()
-                            .any(|existing| existing.section_key == sec.section_key)
-                    {
-                        sec_res.sections.push(sec);
-                    }
-                }
+
+            let reconciled_scopes: HashSet<String> = nb_res
+                .complete_scopes
+                .intersection(&sec_res.complete_scopes)
+                .cloned()
+                .collect();
+            if !reconciled_scopes.is_empty() {
+                s.reconcile_onenote_hierarchy_for_scopes(
+                    &nb_res.notebooks,
+                    &sec_res.section_groups,
+                    &sec_res.sections,
+                    &reconciled_scopes,
+                )?;
+            } else {
+                s.reconcile_onenote_notebooks_for_scopes(
+                    &nb_res.notebooks,
+                    &nb_res.complete_scopes,
+                )?;
+                s.reconcile_onenote_sections_for_scopes(
+                    &sec_res.section_groups,
+                    &sec_res.sections,
+                    &sec_res.complete_scopes,
+                )?;
             }
-        }
-    }
 
-    let reconciled_scopes: HashSet<String> = nb_res
-        .complete_scopes
-        .intersection(&sec_res.complete_scopes)
-        .cloned()
-        .collect();
-    if !reconciled_scopes.is_empty() {
-        storage.reconcile_onenote_hierarchy_for_scopes(
-            &nb_res.notebooks,
-            &sec_res.section_groups,
-            &sec_res.sections,
-            &reconciled_scopes,
-        )?;
-    } else {
-        storage.reconcile_onenote_notebooks_for_scopes(&nb_res.notebooks, &nb_res.complete_scopes)?;
-        storage.reconcile_onenote_sections_for_scopes(
-            &sec_res.section_groups,
-            &sec_res.sections,
-            &sec_res.complete_scopes,
-        )?;
-    }
+            let cursors: Vec<Option<SyncCursor>> = sec_res
+                .sections
+                .iter()
+                .map(|sec| {
+                    s.get_sync_cursor(&section_pages_cursor_key(&sec.section_key))
+                        .ok()
+                        .flatten()
+                })
+                .collect();
 
-    let notebooks = nb_res.notebooks;
-    let section_groups = sec_res.section_groups;
-    let sections = sec_res.sections;
+            Ok((
+                nb_res.notebooks,
+                sec_res.section_groups,
+                sec_res.sections,
+                cursors,
+            ))
+        })
+        .await?;
     let now = chrono::Utc::now();
 
     let mut ordered_sections: Vec<(&OnenoteSection, Option<SyncCursor>, bool)> = sections
         .iter()
-        .map(|s| {
-            let cur = storage
-                .get_sync_cursor(&section_pages_cursor_key(&s.section_key))
-                .ok()
-                .flatten();
+        .zip(cursors)
+        .map(|(s, cur)| {
             let modified_changed = cur.as_ref().is_none_or(|c| {
                 s.last_modified_at.is_none()
                     || c.delta_link.as_deref() != s.last_modified_at.as_deref()
@@ -482,13 +499,10 @@ async fn sync_hierarchy_and_sections_inner(
         .collect()
         .await;
 
-    let mut pages_synced = 0usize;
-    let mut sections_succeeded = 0usize;
     let mut auth_err: Option<anyhow::Error> = None;
     let mut first_err: Option<anyhow::Error> = None;
-    let mut invalidated_pages: Vec<String> = Vec::new();
-    let mut succeeded_sections: Vec<(OnenoteSection, Vec<OnenotePageSummary>, bool)> = Vec::new();
-    let mut synced_section_keys: HashSet<String> = HashSet::new();
+    let mut fetched_ok: Vec<(OnenoteSection, crate::graph::onenote::OnenotePageListing)> =
+        Vec::new();
     let rehydrate_cap = if force_all_sections {
         MAX_REHYDRATE_PER_SYNC
     } else {
@@ -497,15 +511,7 @@ async fn sync_hierarchy_and_sections_inner(
 
     for (sec, pages_res) in results {
         match pages_res {
-            Ok(mut listing) => {
-                // Without page levels, keep the cached subpage hierarchy.
-                if !listing.levels_known {
-                    let _ = storage
-                        .preserve_cached_page_hierarchy(&sec.section_key, &mut listing.pages);
-                }
-                synced_section_keys.insert(sec.section_key.clone());
-                succeeded_sections.push((sec, listing.pages, listing.has_more));
-            }
+            Ok(listing) => fetched_ok.push((sec, listing)),
             Err(err) => {
                 if classify_sync_error(&err) == SyncErrorKind::Unauthorized401 && auth_err.is_none()
                 {
@@ -517,60 +523,92 @@ async fn sync_hierarchy_and_sections_inner(
         }
     }
 
-    // Pass 1: Upsert all fetched pages across succeeded sections first so pages moved
-    // between sections update their `section_key` in place without losing cached `detail_json`.
-    // Guard against in-flight local page deletions/mutations started after `start_epoch`.
-    let protected_pages = storage.pages_protected_since(start_epoch);
-    for (sec, pages, _has_more) in &succeeded_sections {
-        let filtered_pages: Vec<OnenotePageSummary> = pages
-            .iter()
-            .filter(|p| {
-                !storage.page_deleted_since(&p.page_key, start_epoch)
-                    && !storage.page_mutated_since(&p.page_key, start_epoch)
-            })
-            .cloned()
-            .collect();
-        let invalidated = storage.reconcile_onenote_section_pages_returning_invalidated(
-            &sec.section_key,
-            &filtered_pages,
-            false,
-        )?;
-        for pk in invalidated {
-            if invalidated_pages.len() < rehydrate_cap && !invalidated_pages.contains(&pk) {
-                invalidated_pages.push(pk);
-            }
-        }
-        pages_synced += filtered_pages.len();
-        sections_succeeded += 1;
-    }
+    let (pages_synced, sections_succeeded, invalidated_pages, synced_section_keys) = storage
+        .blocking(move |s| {
+            let mut pages_synced = 0usize;
+            let mut sections_succeeded = 0usize;
+            let mut invalidated_pages: Vec<String> = Vec::new();
+            let mut succeeded_sections: Vec<(OnenoteSection, Vec<OnenotePageSummary>, bool)> =
+                Vec::with_capacity(fetched_ok.len());
+            let mut synced_section_keys: HashSet<String> = HashSet::with_capacity(fetched_ok.len());
 
-    // Pass 2: Prune deleted pages only for sections whose full page list was fetched,
-    // while preserving any pages created/mutated locally after `start_epoch`.
-    for (sec, pages, has_more) in &succeeded_sections {
-        if !has_more {
-            let filtered_pages: Vec<OnenotePageSummary> = pages
-                .iter()
-                .filter(|p| !storage.page_deleted_since(&p.page_key, start_epoch))
-                .cloned()
-                .collect();
-            storage.prune_onenote_section_pages_preserving_set(
-                &sec.section_key,
-                &filtered_pages,
-                &protected_pages,
-            )?;
-        }
-        let _ = storage.upsert_sync_cursor(&SyncCursor {
-            scope_key: section_pages_cursor_key(&sec.section_key),
-            delta_link: sec.last_modified_at.clone(),
-            history_next_link: None,
-            last_synced_at: chrono::Utc::now().to_rfc3339(),
-        });
-    }
+            for (sec, mut listing) in fetched_ok {
+                // Without page levels, keep the cached subpage hierarchy.
+                if !listing.levels_known {
+                    let _ = s.preserve_cached_page_hierarchy(&sec.section_key, &mut listing.pages);
+                }
+                synced_section_keys.insert(sec.section_key.clone());
+                succeeded_sections.push((sec, listing.pages, listing.has_more));
+            }
+
+            // Pass 1: Upsert all fetched pages across succeeded sections first so pages moved
+            // between sections update their `section_key` in place without losing cached `detail_json`.
+            // Guard against in-flight local page deletions/mutations started after `start_epoch`.
+            let protected_pages = s.pages_protected_since(start_epoch);
+            for (sec, pages, _has_more) in &succeeded_sections {
+                let filtered_pages: Vec<OnenotePageSummary> = pages
+                    .iter()
+                    .filter(|p| {
+                        !s.page_deleted_since(&p.page_key, start_epoch)
+                            && !s.page_mutated_since(&p.page_key, start_epoch)
+                    })
+                    .cloned()
+                    .collect();
+                let invalidated = s.reconcile_onenote_section_pages_returning_invalidated(
+                    &sec.section_key,
+                    &filtered_pages,
+                    false,
+                )?;
+                for pk in invalidated {
+                    if invalidated_pages.len() < rehydrate_cap && !invalidated_pages.contains(&pk) {
+                        invalidated_pages.push(pk);
+                    }
+                }
+                pages_synced += filtered_pages.len();
+                sections_succeeded += 1;
+            }
+
+            // Pass 2: Prune deleted pages only for sections whose full page list was fetched,
+            // while preserving any pages created/mutated locally after `start_epoch`.
+            for (sec, pages, has_more) in &succeeded_sections {
+                if !has_more {
+                    let filtered_pages: Vec<OnenotePageSummary> = pages
+                        .iter()
+                        .filter(|p| !s.page_deleted_since(&p.page_key, start_epoch))
+                        .cloned()
+                        .collect();
+                    s.prune_onenote_section_pages_preserving_set(
+                        &sec.section_key,
+                        &filtered_pages,
+                        &protected_pages,
+                    )?;
+                }
+                let _ = s.upsert_sync_cursor(&SyncCursor {
+                    scope_key: section_pages_cursor_key(&sec.section_key),
+                    delta_link: sec.last_modified_at.clone(),
+                    history_next_link: None,
+                    last_synced_at: chrono::Utc::now().to_rfc3339(),
+                });
+            }
+
+            Ok((
+                pages_synced,
+                sections_succeeded,
+                invalidated_pages,
+                synced_section_keys,
+            ))
+        })
+        .await?;
 
     if !invalidated_pages.is_empty() {
         let rehydrate_results: Vec<Option<crate::models::OnenotePageDetail>> =
             stream::iter(invalidated_pages.into_iter().map(|pk| async move {
-                let hint = storage.get_onenote_page_summary(&pk).ok().flatten();
+                let pk_lookup = pk.clone();
+                let hint = storage
+                    .blocking(move |s| s.get_onenote_page_summary(&pk_lookup))
+                    .await
+                    .ok()
+                    .flatten();
                 let (scope, raw_id) = resolve_effective_scope(&pk, hint.as_ref());
                 graph
                     .get_onenote_page_detail(&scope, &raw_id, hint)
@@ -580,10 +618,19 @@ async fn sync_hierarchy_and_sections_inner(
             .buffer_unordered(BOOTSTRAP_SECTION_CONCURRENCY)
             .collect()
             .await;
-        for detail in rehydrate_results.into_iter().flatten() {
-            if !storage.page_mutated_since(&detail.summary.page_key, start_epoch) {
-                let _ = storage.upsert_onenote_page_detail(&detail);
-            }
+        let details: Vec<crate::models::OnenotePageDetail> =
+            rehydrate_results.into_iter().flatten().collect();
+        if !details.is_empty() {
+            let _ = storage
+                .blocking(move |s| {
+                    for detail in &details {
+                        if !s.page_mutated_since(&detail.summary.page_key, start_epoch) {
+                            let _ = s.upsert_onenote_page_detail(detail);
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
         }
     }
 
@@ -596,12 +643,16 @@ async fn sync_hierarchy_and_sections_inner(
         }
     }
 
-    let _ = storage.upsert_sync_cursor(&SyncCursor {
-        scope_key: "onenote:hierarchy".to_string(),
-        delta_link: None,
-        history_next_link: None,
-        last_synced_at: chrono::Utc::now().to_rfc3339(),
-    });
+    let _ = storage
+        .blocking(move |s| {
+            s.upsert_sync_cursor(&SyncCursor {
+                scope_key: "onenote:hierarchy".to_string(),
+                delta_link: None,
+                history_next_link: None,
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+            })
+        })
+        .await;
 
     Ok(HierarchySyncOutcome {
         summary: OnenoteBootstrapSummary {
@@ -1086,8 +1137,14 @@ async fn apply_focus_change(
             if run_hydrate_page(graph, storage, event_tx, page_key).await {
                 schedule.mark_page_hydrated(page_key, Instant::now(), true);
             }
-        } else if let Ok(Some(detail)) = storage.get_onenote_page_detail(page_key) {
-            let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
+        } else {
+            let pk_owned = page_key.to_string();
+            if let Ok(Some(detail)) = storage
+                .blocking(move |s| s.get_onenote_page_detail(&pk_owned))
+                .await
+            {
+                let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
+            }
         }
         drain_matching_pending_commands(nudge_rx, pending, Some(page_key), None);
     }
@@ -1111,7 +1168,11 @@ async fn apply_focus_change(
                 );
             }
         } else {
-            let persisted = storage.list_onenote_pages(sec_key).unwrap_or_default();
+            let sk_owned = sec_key.to_string();
+            let persisted = storage
+                .blocking(move |s| s.list_onenote_pages(&sk_owned))
+                .await
+                .unwrap_or_default();
             let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
                 section_key: sec_key.to_string(),
                 pages: persisted,
@@ -1227,7 +1288,11 @@ async fn handle_sync_command(
                     );
                 }
             } else {
-                let persisted = storage.list_onenote_pages(&section_key).unwrap_or_default();
+                let sk_owned = section_key.clone();
+                let persisted = storage
+                    .blocking(move |s| s.list_onenote_pages(&sk_owned))
+                    .await
+                    .unwrap_or_default();
                 let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
                     section_key: section_key.clone(),
                     pages: persisted,
@@ -1245,8 +1310,14 @@ async fn handle_sync_command(
                     let is_focused = focus.page_key.as_deref() == Some(page_key.as_str());
                     schedule.mark_page_hydrated(&page_key, Instant::now(), is_focused);
                 }
-            } else if let Ok(Some(detail)) = storage.get_onenote_page_detail(&page_key) {
-                let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
+            } else {
+                let pk_owned = page_key.clone();
+                if let Ok(Some(detail)) = storage
+                    .blocking(move |s| s.get_onenote_page_detail(&pk_owned))
+                    .await
+                {
+                    let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
+                }
             }
             drain_matching_pending_commands(nudge_rx, pending_cmds, Some(&page_key), None);
         }
@@ -1355,14 +1426,23 @@ async fn run_full_refresh(
         focused_pages_ok
     } else {
         let target_sec = storage
-            .list_onenote_sections(None)
+            .blocking(|s| {
+                Ok(s.list_onenote_sections(None)
+                    .ok()
+                    .and_then(|secs| secs.into_iter().next().map(|sec| sec.section_key)))
+            })
+            .await
             .ok()
-            .and_then(|secs| secs.into_iter().next().map(|s| s.section_key));
+            .flatten();
         if let Some(sec_key) = target_sec {
             if !hierarchy_ok && shared.is_auth_paused(Instant::now()) {
                 false
             } else if synced_secs.contains(&sec_key) {
-                let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
+                let sk_owned = sec_key.clone();
+                let persisted = storage
+                    .blocking(move |s| s.list_onenote_pages(&sk_owned))
+                    .await
+                    .unwrap_or_default();
                 let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
                     section_key: sec_key,
                     pages: persisted,
@@ -1465,9 +1545,16 @@ async fn run_hierarchy_refresh(
                     summary: "Synced".to_string(),
                 });
             }
-            let notebooks = storage.list_onenote_notebooks().unwrap_or_default();
-            let section_groups = storage.list_onenote_section_groups().unwrap_or_default();
-            let sections = storage.list_onenote_sections(None).unwrap_or_default();
+            let (notebooks, section_groups, sections) = storage
+                .blocking(|s| {
+                    Ok((
+                        s.list_onenote_notebooks().unwrap_or_default(),
+                        s.list_onenote_section_groups().unwrap_or_default(),
+                        s.list_onenote_sections(None).unwrap_or_default(),
+                    ))
+                })
+                .await
+                .unwrap_or_default();
             let _ = event_tx.send(CoreEvent::OnenoteHierarchyUpdated {
                 notebooks,
                 section_groups,
@@ -1495,11 +1582,18 @@ async fn run_open_page_content_poll(
     now: Instant,
 ) -> bool {
     let start_epoch = storage.current_mutation_epoch();
-    let cached_detail = storage.get_onenote_page_detail(page_key).ok().flatten();
-    let cached_summary = cached_detail
-        .as_ref()
-        .map(|d| d.summary.clone())
-        .or_else(|| storage.get_onenote_page_summary(page_key).ok().flatten());
+    let pk_lookup = page_key.to_string();
+    let (cached_detail, cached_summary) = storage
+        .blocking(move |s| {
+            let detail = s.get_onenote_page_detail(&pk_lookup).ok().flatten();
+            let summary = detail
+                .as_ref()
+                .map(|d| d.summary.clone())
+                .or_else(|| s.get_onenote_page_summary(&pk_lookup).ok().flatten());
+            Ok((detail, summary))
+        })
+        .await
+        .unwrap_or((None, None));
     let prev_section_key = cached_summary
         .as_ref()
         .filter(|s| !s.section_id.trim().is_empty())
@@ -1529,7 +1623,10 @@ async fn run_open_page_content_poll(
                     Ok(fresh) => fresh,
                     Err(err) if crate::graph::onenote::is_not_found_error(&err) => {
                         if !storage.page_mutated_since(page_key, start_epoch) {
-                            let _ = storage.delete_onenote_page(page_key);
+                            let pk_del = page_key.to_string();
+                            let _ = storage
+                                .blocking(move |s| s.delete_onenote_page(&pk_del))
+                                .await;
                         }
                         return false;
                     }
@@ -1557,10 +1654,17 @@ async fn run_open_page_content_poll(
             if storage.page_mutated_since(page_key, start_epoch) {
                 return true;
             }
-            let detail = crate::parser::onenote::parse_onenote_page_xhtml(summary, &raw_xhtml);
-            if storage.upsert_onenote_page_detail(&detail).is_err() {
+            let Ok(detail) = storage
+                .blocking(move |s| {
+                    let detail =
+                        crate::parser::onenote::parse_onenote_page_xhtml(summary, &raw_xhtml);
+                    s.upsert_onenote_page_detail(&detail)?;
+                    Ok(detail)
+                })
+                .await
+            else {
                 return false;
-            }
+            };
             let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
             true
         }
@@ -1568,12 +1672,22 @@ async fn run_open_page_content_poll(
             if crate::graph::onenote::is_not_found_error(&err)
                 && !storage.page_mutated_since(page_key, start_epoch)
             {
-                let _ = storage.delete_onenote_page(page_key);
-                if let Some(sec_key) = prev_section_key {
-                    let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
+                let pk_del = page_key.to_string();
+                let sec_lookup = prev_section_key.clone();
+                let persisted = storage
+                    .blocking(move |s| {
+                        let _ = s.delete_onenote_page(&pk_del);
+                        Ok(sec_lookup
+                            .as_deref()
+                            .map(|sk| s.list_onenote_pages(sk).unwrap_or_default()))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                if let (Some(sec_key), Some(pages)) = (prev_section_key, persisted) {
                     let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
                         section_key: sec_key,
-                        pages: persisted,
+                        pages,
                         notify_candidate: None,
                     });
                 }
@@ -1611,8 +1725,10 @@ async fn run_section_pages_refresh(
 ) -> bool {
     let start_epoch = storage.current_mutation_epoch();
     let (scope, section_id) = split_onenote_entity_key(section_key);
+    let sk_for_keys = section_key.to_string();
     let prev_ids: HashSet<String> = storage
-        .list_onenote_page_keys(section_key)
+        .blocking(move |s| s.list_onenote_page_keys(&sk_for_keys))
+        .await
         .unwrap_or_default()
         .into_iter()
         .collect();
@@ -1625,7 +1741,14 @@ async fn run_section_pages_refresh(
             let (mut pages, has_more) = (listing.pages, listing.has_more);
             // Without page levels, keep the cached subpage hierarchy.
             if !listing.levels_known {
-                let _ = storage.preserve_cached_page_hierarchy(section_key, &mut pages);
+                let sk_owned = section_key.to_string();
+                pages = storage
+                    .blocking(move |s| {
+                        let _ = s.preserve_cached_page_hierarchy(&sk_owned, &mut pages);
+                        Ok(pages)
+                    })
+                    .await
+                    .unwrap_or_default();
             }
             // Prune only when Graph confirmed there is nothing past the limit.
             let is_complete = !has_more;
@@ -1641,7 +1764,12 @@ async fn run_section_pages_refresh(
                     let locally_touched = storage.page_created_since(open_pk, start_epoch)
                         || storage.page_deleted_since(open_pk, start_epoch);
                     if was_in_section && !still_in_list && !locally_touched {
-                        let cached_summary = storage.get_onenote_page_summary(open_pk).ok().flatten();
+                        let pk_lookup = open_pk.to_string();
+                        let cached_summary = storage
+                            .blocking(move |s| s.get_onenote_page_summary(&pk_lookup))
+                            .await
+                            .ok()
+                            .flatten();
                         let (page_scope, raw_page_id) =
                             resolve_effective_scope(open_pk, cached_summary.as_ref());
                         match graph
@@ -1657,19 +1785,22 @@ async fn run_section_pages_refresh(
                                 {
                                     // Relocate the last good XHTML and index atomically with the
                                     // summary. A transient replacement failure cannot blank them.
-                                    let stored = match storage
-                                        .get_onenote_page_detail(open_pk)
-                                        .ok()
-                                        .flatten()
-                                    {
-                                        Some(mut detail) => {
-                                            fresh_summary.preview_text = detail.summary.preview_text.clone();
-                                            fresh_summary.has_todo = detail.summary.has_todo;
-                                            detail.summary = fresh_summary;
-                                            storage.upsert_onenote_page_detail(&detail)
-                                        }
-                                        None => storage.upsert_onenote_pages(&[fresh_summary]),
-                                    };
+                                    let pk_move = open_pk.to_string();
+                                    let stored = storage
+                                        .blocking(move |s| {
+                                            match s.get_onenote_page_detail(&pk_move).ok().flatten() {
+                                                Some(mut detail) => {
+                                                    fresh_summary.preview_text =
+                                                        detail.summary.preview_text.clone();
+                                                    fresh_summary.has_todo =
+                                                        detail.summary.has_todo;
+                                                    detail.summary = fresh_summary;
+                                                    s.upsert_onenote_page_detail(&detail)
+                                                }
+                                                None => s.upsert_onenote_pages(&[fresh_summary]),
+                                            }
+                                        })
+                                        .await;
                                     if stored.is_ok() {
                                         moved_target = Some((open_pk.to_string(), new_sec_key));
                                     } else {
@@ -1683,7 +1814,10 @@ async fn run_section_pages_refresh(
                             Err(err) if crate::graph::onenote::is_not_found_error(&err) => {
                                 // Confirmed deleted (404/410): use existing cache + search cleanup.
                                 if !storage.page_mutated_since(open_pk, start_epoch) {
-                                    let _ = storage.delete_onenote_page(open_pk);
+                                    let pk_del = open_pk.to_string();
+                                    let _ = storage
+                                        .blocking(move |s| s.delete_onenote_page(&pk_del))
+                                        .await;
                                 }
                             }
                             Err(err) => {
@@ -1710,38 +1844,43 @@ async fn run_section_pages_refresh(
                 .cloned()
                 .collect();
 
-            let _ = storage.reconcile_onenote_section_pages_preserving_set(
-                section_key,
-                &filtered_pages,
-                is_complete,
-                &preserve_keys,
-                focused_page_key,
-            );
-            let prev_delta = storage
-                .get_sync_cursor(&section_pages_cursor_key(section_key))
-                .ok()
-                .flatten()
-                .and_then(|c| c.delta_link);
-            let _ = storage.upsert_sync_cursor(&SyncCursor {
-                scope_key: section_pages_cursor_key(section_key),
-                delta_link: prev_delta,
-                history_next_link: None,
-                last_synced_at: chrono::Utc::now().to_rfc3339(),
-            });
+            let notify_candidate = if background && !prev_ids.is_empty() {
+                find_new_page_notification(&prev_ids, &filtered_pages)
+            } else {
+                None
+            };
+            let sk_owned = section_key.to_string();
+            let focused_pk_owned = focused_page_key.map(str::to_string);
+            let persisted = storage
+                .blocking(move |s| {
+                    let _ = s.reconcile_onenote_section_pages_preserving_set(
+                        &sk_owned,
+                        &filtered_pages,
+                        is_complete,
+                        &preserve_keys,
+                        focused_pk_owned.as_deref(),
+                    );
+                    let prev_delta = s
+                        .get_sync_cursor(&section_pages_cursor_key(&sk_owned))
+                        .ok()
+                        .flatten()
+                        .and_then(|c| c.delta_link);
+                    let _ = s.upsert_sync_cursor(&SyncCursor {
+                        scope_key: section_pages_cursor_key(&sk_owned),
+                        delta_link: prev_delta,
+                        history_next_link: None,
+                        last_synced_at: chrono::Utc::now().to_rfc3339(),
+                    });
+                    Ok(s.list_onenote_pages(&sk_owned).unwrap_or(filtered_pages))
+                })
+                .await
+                .unwrap_or_default();
             if preserve_page_key.is_none() && backoff.record_success() {
                 let _ = event_tx.send(CoreEvent::SyncStateChanged {
                     busy: false,
                     summary: "Synced".to_string(),
                 });
             }
-            let notify_candidate = if background && !prev_ids.is_empty() {
-                find_new_page_notification(&prev_ids, &filtered_pages)
-            } else {
-                None
-            };
-            let persisted = storage
-                .list_onenote_pages(section_key)
-                .unwrap_or(filtered_pages);
             let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
                 section_key: section_key.to_string(),
                 pages: persisted,
@@ -1749,10 +1888,18 @@ async fn run_section_pages_refresh(
             });
 
             if let Some((moved_pk, new_sec_key)) = moved_target {
-                if let Ok(Some(detail)) = storage.get_onenote_page_detail(&moved_pk) {
+                let new_sec_for_db = new_sec_key.clone();
+                let (moved_detail, new_pages) = storage
+                    .blocking(move |s| {
+                        let detail = s.get_onenote_page_detail(&moved_pk).ok().flatten();
+                        let new_pages = s.list_onenote_pages(&new_sec_for_db).unwrap_or_default();
+                        Ok((detail, new_pages))
+                    })
+                    .await
+                    .unwrap_or((None, Vec::new()));
+                if let Some(detail) = moved_detail {
                     let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
                 }
-                let new_pages = storage.list_onenote_pages(&new_sec_key).unwrap_or_default();
                 let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
                     section_key: new_sec_key,
                     pages: new_pages,
@@ -1775,7 +1922,12 @@ async fn run_hydrate_page(
     page_key: &str,
 ) -> bool {
     let start_epoch = storage.current_mutation_epoch();
-    let summary_hint = storage.get_onenote_page_summary(page_key).ok().flatten();
+    let pk_lookup = page_key.to_string();
+    let summary_hint = storage
+        .blocking(move |s| s.get_onenote_page_summary(&pk_lookup))
+        .await
+        .ok()
+        .flatten();
     let prev_section_key = summary_hint
         .as_ref()
         .filter(|s| !s.section_id.trim().is_empty())
@@ -1789,7 +1941,10 @@ async fn run_hydrate_page(
             if storage.page_mutated_since(page_key, start_epoch) {
                 return true;
             }
-            let _ = storage.upsert_onenote_page_detail(&detail);
+            let detail_for_db = detail.clone();
+            let _ = storage
+                .blocking(move |s| s.upsert_onenote_page_detail(&detail_for_db))
+                .await;
             let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
             true
         }
@@ -1800,12 +1955,22 @@ async fn run_hydrate_page(
             if crate::graph::onenote::is_not_found_error(&err)
                 && !storage.page_mutated_since(page_key, start_epoch)
             {
-                let _ = storage.delete_onenote_page(page_key);
-                if let Some(sec_key) = prev_section_key {
-                    let persisted = storage.list_onenote_pages(&sec_key).unwrap_or_default();
+                let pk_del = page_key.to_string();
+                let sec_lookup = prev_section_key.clone();
+                let persisted = storage
+                    .blocking(move |s| {
+                        let _ = s.delete_onenote_page(&pk_del);
+                        Ok(sec_lookup
+                            .as_deref()
+                            .map(|sk| s.list_onenote_pages(sk).unwrap_or_default()))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                if let (Some(sec_key), Some(pages)) = (prev_section_key, persisted) {
                     let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
                         section_key: sec_key,
-                        pages: persisted,
+                        pages,
                         notify_candidate: None,
                     });
                 }
@@ -1828,29 +1993,36 @@ fn spawn_prefetch_section_pages(
     section_key: &str,
     skip_page_key: Option<&str>,
 ) {
-    let Ok(pages) = storage.list_onenote_pages(section_key) else {
-        return;
-    };
-    let candidates: Vec<OnenotePageSummary> = pages
-        .into_iter()
-        .filter(|p| Some(p.page_key.as_str()) != skip_page_key)
-        .filter(|p| !p.section_id.trim().is_empty())
-        .filter(|p| {
-            storage
-                .get_onenote_page_detail(&p.page_key)
-                .ok()
-                .flatten()
-                .is_none()
-        })
-        .take(SECTION_PAGE_PREFETCH_LIMIT)
-        .collect();
-    if candidates.is_empty() {
-        return;
-    }
-
     let budgeted_graph = graph.with_automatic_budget(budget, Instant::now(), budget_limit);
     let storage = storage.clone();
+    let section_key = section_key.to_string();
+    let skip_page_key = skip_page_key.map(str::to_string);
     tokio::spawn(async move {
+        let Ok(candidates) = storage
+            .blocking(move |s| {
+                let pages = s.list_onenote_pages(&section_key)?;
+                let candidates: Vec<OnenotePageSummary> = pages
+                    .into_iter()
+                    .filter(|p| skip_page_key.as_deref() != Some(p.page_key.as_str()))
+                    .filter(|p| !p.section_id.trim().is_empty())
+                    .filter(|p| {
+                        s.get_onenote_page_detail(&p.page_key)
+                            .ok()
+                            .flatten()
+                            .is_none()
+                    })
+                    .take(SECTION_PAGE_PREFETCH_LIMIT)
+                    .collect();
+                Ok(candidates)
+            })
+            .await
+        else {
+            return;
+        };
+        if candidates.is_empty() {
+            return;
+        }
+
         stream::iter(candidates)
             .for_each_concurrent(SECTION_PAGE_PREFETCH_CONCURRENCY, |summary| {
                 let graph = budgeted_graph.clone();
@@ -1866,7 +2038,9 @@ fn spawn_prefetch_section_pages(
                         if !storage.page_mutated_since(&pk, start_epoch)
                             && !storage.page_deleted_since(&pk, start_epoch)
                         {
-                            let _ = storage.upsert_onenote_page_detail(&detail);
+                            let _ = storage
+                                .blocking(move |s| s.upsert_onenote_page_detail(&detail))
+                                .await;
                         }
                     }
                 }

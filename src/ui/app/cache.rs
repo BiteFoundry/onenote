@@ -87,6 +87,7 @@ impl AppState {
                 .collect();
             self.evict_raw_image_urls(&urls);
         }
+        self.bump_canvas_gen();
     }
 
     pub fn clear_drafts_for_page(&mut self, page_key: &str) {
@@ -152,6 +153,7 @@ impl AppState {
                 } else {
                     self.page_details.remove(&p.page_key);
                 }
+                self.bump_canvas_gen();
             }
         }
     }
@@ -187,10 +189,12 @@ impl AppState {
                         detail.summary.notebook_id = row.notebook_id;
                         detail.summary.notebook_name = row.notebook_name;
                     }
+                    self.bump_canvas_gen();
                 }
                 Ok(None) => {
                     self.evict_image_cache_for_page(&pk);
                     self.page_details.remove(&pk);
+                    self.bump_canvas_gen();
                 }
                 Err(_) => {}
             }

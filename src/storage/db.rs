@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 70;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 71;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 72;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 73;
 
 /// Initializes SQLite PRAGMAs, OneNote tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `onenote_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -29,13 +29,14 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
     )
     .context("Failed to configure SQLite PRAGMAs")?;
 
+    let mut prev_user_version: i32 = 0;
     if !is_memory {
         let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
-        let user_version: i32 = conn
+        prev_user_version = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap_or(0);
-        if user_version == SCHEMA_USER_VERSION_TRIGRAM
-            || user_version == SCHEMA_USER_VERSION_UNICODE61
+        if prev_user_version == SCHEMA_USER_VERSION_TRIGRAM
+            || prev_user_version == SCHEMA_USER_VERSION_UNICODE61
         {
             let intact: bool = conn
                 .query_row(
@@ -48,7 +49,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                 )
                 .unwrap_or(false);
             if intact {
-                return Ok(user_version == SCHEMA_USER_VERSION_TRIGRAM);
+                return Ok(prev_user_version == SCHEMA_USER_VERSION_TRIGRAM);
             }
         }
     }
@@ -171,6 +172,46 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
     )?;
 
     if !is_memory {
+        // Safely migrate pre-v72 databases so `onenote_fts.rowid` matches `onenote_pages.rowid`
+        // for O(log N) rowid-indexed FTS5 deletes and primary-key joins.
+        let needs_fts_rowid_migration = prev_user_version < SCHEMA_USER_VERSION_UNICODE61
+            && (conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM onenote_pages)",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+                || conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM onenote_fts)",
+                        [],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false));
+        if needs_fts_rowid_migration {
+            conn.execute_batch(
+                "
+                BEGIN IMMEDIATE;
+                DELETE FROM onenote_fts;
+                INSERT INTO onenote_fts (
+                    rowid, page_key, section_key, title, notebook_name, section_name, body_plain
+                )
+                SELECT
+                    rowid,
+                    page_key,
+                    section_key,
+                    title,
+                    COALESCE(notebook_name, ''),
+                    COALESCE(section_name, ''),
+                    COALESCE(body_plain, preview_text, '')
+                FROM onenote_pages;
+                COMMIT;
+                ",
+            )
+            .context("Failed to migrate onenote_fts to rowid-indexed mapping")?;
+        }
+
         let version = if onenote_trigram {
             SCHEMA_USER_VERSION_TRIGRAM
         } else {
@@ -289,5 +330,55 @@ mod tests {
             .query_row("PRAGMA cache_size;", [], |row| row.get(0))
             .unwrap();
         assert_eq!(reader_cache, -4000);
+    }
+
+    #[test]
+    fn test_fts5_rowid_migration_realigns_legacy_v71_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy_v71.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let _ = init_connection(&conn, false).unwrap();
+            conn.execute(
+                "INSERT INTO onenote_pages (
+                    rowid, page_key, id, scope_json, scope_key, section_key, section_id,
+                    title, body_plain
+                ) VALUES (42, 'me|p1', 'p1', '\"Me\"', 'me', 'me|s1', 's1', 'Alpha Note', 'Migration target')",
+                [],
+            )
+            .unwrap();
+            // Simulate legacy v71 DB where onenote_fts.rowid != onenote_pages.rowid
+            conn.execute(
+                "INSERT INTO onenote_fts (
+                    rowid, page_key, section_key, title, notebook_name, section_name, body_plain
+                ) VALUES (1, 'me|p1', 'me|s1', 'Alpha Note', '', '', 'Migration target')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA user_version = 71;").unwrap();
+        }
+
+        let conn2 = Connection::open(&db_path).unwrap();
+        let trigram = init_connection(&conn2, false).unwrap();
+        let ver: i32 = conn2
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            ver,
+            if trigram {
+                SCHEMA_USER_VERSION_TRIGRAM
+            } else {
+                SCHEMA_USER_VERSION_UNICODE61
+            }
+        );
+        let fts_rowid: i64 = conn2
+            .query_row(
+                "SELECT rowid FROM onenote_fts WHERE page_key = 'me|p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_rowid, 42);
     }
 }

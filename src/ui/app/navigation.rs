@@ -150,6 +150,7 @@ impl AppState {
             if !self.page_details.contains_key(key) {
                 if let Ok(Some(detail)) = self.storage.get_onenote_page_detail(key) {
                     self.page_details.insert(key.clone(), detail);
+                    self.bump_canvas_gen();
                 }
             }
         }
@@ -164,6 +165,7 @@ impl AppState {
             return;
         }
         self.page_details.insert(key.clone(), detail);
+        self.bump_canvas_gen();
     }
 
     pub fn push_focus_to_sync(&self) {

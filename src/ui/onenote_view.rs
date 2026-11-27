@@ -52,6 +52,32 @@ pub struct RenderedLine {
     pub inline_hits: Vec<(u16, u16, HitTarget)>,
 }
 
+/// Cache key for pre-wrapped OneNote page canvas lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasCacheKey {
+    pub page_key: String,
+    pub content_gen: u64,
+    pub width: usize,
+    pub selected_block: usize,
+    pub show_inline_hrefs: bool,
+    pub inline_images: bool,
+    pub thumbs_count: usize,
+    pub theme_preset: crate::config::ThemePreset,
+    pub blocks_len: usize,
+    pub raw_xhtml_len: usize,
+    pub title: String,
+    pub last_modified_at: Option<String>,
+    pub synced_at: Option<String>,
+}
+
+/// Cached rendered canvas lines and block-to-line index ranges for the active OneNote page.
+#[derive(Debug, Clone)]
+pub struct CanvasRenderCache {
+    pub key: CanvasCacheKey,
+    pub lines: Vec<RenderedLine>,
+    pub block_line_ranges: HashMap<usize, (usize, usize)>,
+}
+
 impl RenderedLine {
     pub fn plain(line: Line<'static>) -> Self {
         Self {
@@ -681,7 +707,7 @@ fn draw_note_canvas(
         }
     }
 
-    let Some(detail) = app.active_page_detail().cloned() else {
+    if app.active_page_detail().is_none() {
         let msg = if app.loading_onenote_detail {
             "Loading OneNote page content..."
         } else if app.notebooks.is_empty() && app.syncing {
@@ -702,74 +728,133 @@ fn draw_note_canvas(
         );
         frame.render_widget(Paragraph::new(wrapped), inner);
         return None;
-    };
-
-    if !detail.blocks.is_empty() && ui.onenote_selected_block >= detail.blocks.len() {
-        ui.onenote_selected_block = detail.blocks.len() - 1;
     }
 
-    // Lazily fetch/decode inline terminal images when inline_images is enabled
+    // Lazily fetch/decode inline terminal images when inline_images is enabled,
+    // without cloning `OnenotePageDetail` or any `RenderedTerminalImage`.
     let width = inner.width as usize;
     let thumb_cols = width.saturating_sub(4).clamp(24, 72) as u16;
     let thumb_rows = 16u16;
     let inline_bg = ui.inline_image_bg_rgb();
     let (cw, ch) = ui.graphics_caps.cell_px;
-    let mut cached_thumbs: HashMap<usize, RenderedTerminalImage> = HashMap::new();
 
-    if ui.inline_images {
-        for block in &detail.blocks {
-            if let OnenoteBlockKind::Image { resource_index, .. } = &block.kind {
-                if let Some(res) = detail.resources.get(*resource_index) {
-                    let key = format!(
-                        "thumb:{}:{}:{}x{}:{}x{}:{:02x}{:02x}{:02x}",
-                        detail.summary.page_key,
-                        resource_index,
-                        thumb_cols,
-                        thumb_rows,
-                        cw,
-                        ch,
-                        inline_bg.0,
-                        inline_bg.1,
-                        inline_bg.2
-                    );
-                    if let Some(img) = render_terminal_image(&app.image_cache, &key) {
-                        cached_thumbs.insert(*resource_index, img);
-                    } else {
-                        let url = res
-                            .fullres_url
-                            .as_deref()
-                            .filter(|s| !s.trim().is_empty())
-                            .unwrap_or(&res.resource_url)
-                            .to_string();
-                        app.request_onenote_image(
-                            key,
-                            url,
-                            crate::img_preview::FitBox::contained(thumb_cols, thumb_rows),
-                            inline_bg,
-                            ui.graphics_caps,
-                            true,
+    let mut missing_thumbs: Vec<(String, String)> = Vec::new();
+    let mut thumb_keys: Vec<(usize, String)> = Vec::new();
+    if let Some(detail) = app.active_page_detail() {
+        if !detail.blocks.is_empty() && ui.onenote_selected_block >= detail.blocks.len() {
+            ui.onenote_selected_block = detail.blocks.len() - 1;
+        }
+        if ui.inline_images {
+            for block in &detail.blocks {
+                if let OnenoteBlockKind::Image { resource_index, .. } = &block.kind {
+                    if let Some(res) = detail.resources.get(*resource_index) {
+                        let key = format!(
+                            "thumb:{}:{}:{}x{}:{}x{}:{:02x}{:02x}{:02x}",
+                            detail.summary.page_key,
+                            resource_index,
+                            thumb_cols,
+                            thumb_rows,
+                            cw,
+                            ch,
+                            inline_bg.0,
+                            inline_bg.1,
+                            inline_bg.2
                         );
+                        if app.image_cache.contains_key(&key) {
+                            thumb_keys.push((*resource_index, key));
+                        } else if !app.inflight_images.contains(&key) {
+                            let url = res
+                                .fullres_url
+                                .as_deref()
+                                .filter(|s| !s.trim().is_empty())
+                                .unwrap_or(&res.resource_url)
+                                .to_string();
+                            missing_thumbs.push((key, url));
+                        }
                     }
                 }
             }
         }
     }
 
-    let (lines, block_line_ranges) = build_page_canvas_lines_with_opts(
-        &detail,
-        Some(ui.onenote_selected_block),
-        &cached_thumbs,
-        theme,
-        width,
-        ui.show_inline_hrefs,
-    );
+    for (key, url) in missing_thumbs {
+        app.request_onenote_image(
+            key,
+            url,
+            crate::img_preview::FitBox::contained(thumb_cols, thumb_rows),
+            inline_bg,
+            ui.graphics_caps,
+            true,
+        );
+    }
 
+    let detail = app.active_page_detail()?;
+
+    let cache_hit = ui.onenote_canvas_cache.as_ref().is_some_and(|c| {
+        c.key.page_key == detail.summary.page_key
+            && c.key.content_gen == app.canvas_content_gen
+            && c.key.width == width
+            && c.key.selected_block == ui.onenote_selected_block
+            && c.key.show_inline_hrefs == ui.show_inline_hrefs
+            && c.key.inline_images == ui.inline_images
+            && c.key.thumbs_count == thumb_keys.len()
+            && c.key.theme_preset == ui.theme_preset
+            && c.key.blocks_len == detail.blocks.len()
+            && c.key.raw_xhtml_len == detail.raw_xhtml.len()
+            && c.key.title == detail.summary.title
+            && c.key.last_modified_at == detail.summary.last_modified_at
+            && c.key.synced_at == detail.synced_at
+    });
+
+    if !cache_hit {
+        let mut cached_thumbs: HashMap<usize, &RenderedTerminalImage> =
+            HashMap::with_capacity(thumb_keys.len());
+        for (resource_index, key) in &thumb_keys {
+            if let Some(img) = app.image_cache.get(key) {
+                cached_thumbs.insert(*resource_index, img);
+            }
+        }
+        let (lines, block_line_ranges) = build_page_canvas_lines_with_thumb_refs(
+            detail,
+            Some(ui.onenote_selected_block),
+            &cached_thumbs,
+            theme,
+            width,
+            ui.show_inline_hrefs,
+        );
+        ui.onenote_canvas_cache = Some(CanvasRenderCache {
+            key: CanvasCacheKey {
+                page_key: detail.summary.page_key.clone(),
+                content_gen: app.canvas_content_gen,
+                width,
+                selected_block: ui.onenote_selected_block,
+                show_inline_hrefs: ui.show_inline_hrefs,
+                inline_images: ui.inline_images,
+                thumbs_count: thumb_keys.len(),
+                theme_preset: ui.theme_preset,
+                blocks_len: detail.blocks.len(),
+                raw_xhtml_len: detail.raw_xhtml.len(),
+                title: detail.summary.title.clone(),
+                last_modified_at: detail.summary.last_modified_at.clone(),
+                synced_at: detail.synced_at.clone(),
+            },
+            lines,
+            block_line_ranges,
+        });
+    }
+
+    let cache = ui
+        .onenote_canvas_cache
+        .as_ref()
+        .expect("canvas cache populated above");
     let height = inner.height as usize;
-    let total_lines = lines.len();
+    let total_lines = cache.lines.len();
 
     // Auto-scroll to keep the selected block visible when navigated by keyboard
     if ui.onenote_follow_selection {
-        if let Some(&(start_line, end_line)) = block_line_ranges.get(&ui.onenote_selected_block) {
+        if let Some(&(start_line, end_line)) =
+            cache.block_line_ranges.get(&ui.onenote_selected_block)
+        {
             ensure_range_visible(&mut ui.onenote_scroll, total_lines, start_line, end_line, height);
         }
         ui.onenote_follow_selection = false;
@@ -779,7 +864,7 @@ fn draw_note_canvas(
     let offset = ui.onenote_scroll.min(max_off);
     ui.onenote_scroll = offset;
 
-    render_scrolled_lines(frame, inner, &lines, offset, height, hitmap);
+    render_scrolled_lines(frame, inner, &cache.lines, offset, height, hitmap);
     None
 }
 
@@ -827,6 +912,26 @@ pub fn build_page_canvas_lines_with_opts(
     detail: &OnenotePageDetail,
     selected_block: Option<usize>,
     cached_thumbs: &HashMap<usize, RenderedTerminalImage>,
+    theme: &Theme,
+    width: usize,
+    show_inline_hrefs: bool,
+) -> (Vec<RenderedLine>, HashMap<usize, (usize, usize)>) {
+    let thumb_refs: HashMap<usize, &RenderedTerminalImage> =
+        cached_thumbs.iter().map(|(&k, v)| (k, v)).collect();
+    build_page_canvas_lines_with_thumb_refs(
+        detail,
+        selected_block,
+        &thumb_refs,
+        theme,
+        width,
+        show_inline_hrefs,
+    )
+}
+
+fn build_page_canvas_lines_with_thumb_refs(
+    detail: &OnenotePageDetail,
+    selected_block: Option<usize>,
+    cached_thumbs: &HashMap<usize, &RenderedTerminalImage>,
     theme: &Theme,
     width: usize,
     show_inline_hrefs: bool,
@@ -1089,7 +1194,7 @@ fn render_block_into(
     block_idx: usize,
     block: &OnenoteBlock,
     selected: bool,
-    cached_thumbs: &HashMap<usize, RenderedTerminalImage>,
+    cached_thumbs: &HashMap<usize, &RenderedTerminalImage>,
     theme: &Theme,
     width: usize,
 ) {

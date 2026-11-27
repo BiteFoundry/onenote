@@ -318,6 +318,19 @@ impl Storage {
         self.trigram_enabled
     }
 
+    /// Runs a blocking SQLite operation on Tokio's blocking thread pool so async worker threads
+    /// never stall on SQLite I/O or mutex waits.
+    pub async fn blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Storage) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || f(&storage))
+            .await
+            .map_err(|err| anyhow::anyhow!("SQLite worker task failed: {err}"))?
+    }
+
     /// Releases unused SQLite page-cache memory back to the OS (`PRAGMA shrink_memory`) and runs `PRAGMA optimize`.
     pub fn shrink_memory(&self) {
         if let Ok(conn) = self.writer.lock() {
@@ -588,7 +601,7 @@ impl Storage {
 
     pub fn list_all_onenote_pages(&self, limit: usize) -> Result<Vec<OnenotePageSummary>> {
         let conn = self.read_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 page_key, id, scope_json, scope_key, section_id, section_name,
@@ -712,39 +725,38 @@ impl Storage {
 
     pub fn get_sync_cursor(&self, scope_key: &str) -> Result<Option<SyncCursor>> {
         let conn = self.read_conn()?;
-        conn.query_row(
+        let mut stmt = conn.prepare_cached(
             "SELECT scope_key, delta_link, history_next_link, last_synced_at
              FROM sync_cursors WHERE scope_key = ?1",
-            [scope_key],
-            |row| {
-                Ok(SyncCursor {
-                    scope_key: row.get(0)?,
-                    delta_link: row.get(1)?,
-                    history_next_link: row.get(2)?,
-                    last_synced_at: row.get(3)?,
-                })
-            },
-        )
+        )?;
+        stmt.query_row([scope_key], |row| {
+            Ok(SyncCursor {
+                scope_key: row.get(0)?,
+                delta_link: row.get(1)?,
+                history_next_link: row.get(2)?,
+                last_synced_at: row.get(3)?,
+            })
+        })
         .optional()
         .map_err(Into::into)
     }
 
     pub fn upsert_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute(
+        let mut stmt = conn.prepare_cached(
             "INSERT INTO sync_cursors (scope_key, delta_link, history_next_link, last_synced_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(scope_key) DO UPDATE SET
                  delta_link = excluded.delta_link,
                  history_next_link = excluded.history_next_link,
                  last_synced_at = excluded.last_synced_at",
-            params![
-                cursor.scope_key,
-                cursor.delta_link,
-                cursor.history_next_link,
-                cursor.last_synced_at,
-            ],
         )?;
+        stmt.execute(params![
+            cursor.scope_key,
+            cursor.delta_link,
+            cursor.history_next_link,
+            cursor.last_synced_at,
+        ])?;
         Ok(())
     }
 

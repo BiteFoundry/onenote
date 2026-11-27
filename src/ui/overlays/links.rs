@@ -231,13 +231,13 @@ pub fn extract_links_from_onenote_page(detail: &OnenotePageDetail) -> Vec<Extrac
 
     // 2. HTML <a href> anchors in raw_xhtml
     if !detail.raw_xhtml.trim().is_empty() {
+        static LINK_HREF_SELECTOR: std::sync::LazyLock<Selector> =
+            std::sync::LazyLock::new(|| Selector::parse("a[href]").expect("valid a[href] selector"));
         let doc = Html::parse_document(&detail.raw_xhtml);
-        if let Ok(sel) = Selector::parse("a[href]") {
-            for el in doc.select(&sel) {
-                if let Some(href) = el.value().attr("href") {
-                    let text: String = el.text().collect();
-                    push_link(&mut out, &mut index_by_url, &text, href);
-                }
+        for el in doc.select(&LINK_HREF_SELECTOR) {
+            if let Some(href) = el.value().attr("href") {
+                let text: String = el.text().collect();
+                push_link(&mut out, &mut index_by_url, &text, href);
             }
         }
     }

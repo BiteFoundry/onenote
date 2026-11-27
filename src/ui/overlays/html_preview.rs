@@ -35,11 +35,19 @@ use crate::{
     },
 };
 
+struct CachedGraphicCrop {
+    key: (u16, u16, u16),
+    payload: String,
+    draw_cols: u16,
+    draw_rows: u16,
+}
+
 struct CachedHtmlGraphic {
     source_bytes: Arc<[u8]>,
     cell_px: (u16, u16),
     bg_rgb: (u8, u8, u8),
     rendered: RenderedTerminalImage,
+    last_crop: Option<CachedGraphicCrop>,
 }
 
 pub struct HtmlPreviewOverlay {
@@ -453,48 +461,30 @@ impl HtmlPreviewOverlay {
             inner.height
         };
 
+        // Reserve the vertical scrollbar column upfront so `HtmlViewSession::render` runs once
+        // per frame at a stable width (avoiding 2-pass 1-slot cache thrashing on scrollable docs).
         let html_theme = theme.to_html_theme();
-        let initial_w = inner.width.max(12);
-        let initial_len = self
-            .session
-            .render(initial_w, &html_theme, ui.show_inline_hrefs)
-            .lines
-            .len();
-
-        let show_scrollbar = initial_len > viewport_h as usize && inner.width > 3;
-        let avail_w = if show_scrollbar {
+        let reserve_scrollbar = inner.width > 3;
+        let avail_w = if reserve_scrollbar {
             inner.width.saturating_sub(1)
         } else {
             inner.width
         };
 
-        let (total_lines, control_count, controls_meta, mut lines_to_render, graphics) = {
+        let focused_idx = self.session.focused_control;
+        let (total_lines, control_count, focused_line, focused_label) = {
             let rendered = self
                 .session
                 .render(avail_w, &html_theme, ui.show_inline_hrefs);
-            let meta: Vec<(usize, String)> = rendered
-                .controls
-                .iter()
-                .map(|c| (c.line, c.label.clone()))
-                .collect();
+            let focused = focused_idx.and_then(|idx| rendered.controls.get(idx));
             (
                 rendered.lines.len(),
                 rendered.controls.len(),
-                meta,
-                rendered.lines.clone(),
-                rendered.graphics.clone(),
+                focused.map(|c| c.line),
+                focused.map(|c| c.label.clone()),
             )
         };
-        let focused_line = self
-            .session
-            .focused_control
-            .and_then(|idx| controls_meta.get(idx))
-            .map(|(line, _)| *line);
-        let focused_label = self
-            .session
-            .focused_control
-            .and_then(|idx| controls_meta.get(idx))
-            .map(|(_, label)| label.clone());
+        let show_scrollbar = total_lines > viewport_h as usize && reserve_scrollbar;
 
         self.content_rect = Rect::new(inner.x, inner.y, avail_w, viewport_h);
         self.last_width = avail_w;
@@ -516,20 +506,39 @@ impl HtmlPreviewOverlay {
         }
         self.session.scroll_y = self.session.scroll_y.min(max_scroll_y);
 
+        // Slice ONLY the visible viewport rows (O(viewport_h) instead of cloning the full document).
+        let scroll_top = self.session.scroll_y as usize;
+        let scroll_bottom = scroll_top.saturating_add(viewport_h as usize).min(total_lines);
+        let (mut visible_lines, visible_graphics) = {
+            let rendered = self
+                .session
+                .render(avail_w, &html_theme, ui.show_inline_hrefs);
+            let vis = if scroll_top < scroll_bottom {
+                rendered.lines[scroll_top..scroll_bottom].to_vec()
+            } else {
+                Vec::new()
+            };
+            let g_vis: Vec<_> = rendered
+                .graphics
+                .iter()
+                .filter(|g| {
+                    let g_end = g.line_start.saturating_add(g.line_count);
+                    g.line_count > 0 && g_end > scroll_top && g.line_start < scroll_bottom
+                })
+                .cloned()
+                .collect();
+            (vis, g_vis)
+        };
+
         // Render intersecting inline graphics (`<svg>`, `<canvas>`, `data:image/*`) into their
         // reserved line slots without shifting any downstream line indices or control coordinates.
-        let scroll_top = self.session.scroll_y as usize;
-        let scroll_bottom = scroll_top.saturating_add(viewport_h as usize);
         let caps = ui.graphics_caps;
         let proto = caps.protocol;
         let bg_rgb = img_preview::color_to_rgb(theme.bg_elevated, (24, 24, 30));
         let mut pixel_skip_rects: Vec<Rect> = Vec::new();
 
-        for g in &graphics {
+        for g in &visible_graphics {
             let g_end = g.line_start.saturating_add(g.line_count);
-            if g.line_count == 0 || g_end <= scroll_top || g.line_start >= scroll_bottom {
-                continue;
-            }
             let cache_key = (g.node_id.0, avail_w, proto);
             let needs_decode = self.graphic_cache.get(&cache_key).is_none_or(|entry| {
                 !Arc::ptr_eq(&entry.source_bytes, &g.image_bytes)
@@ -556,6 +565,7 @@ impl HtmlPreviewOverlay {
                             cell_px: caps.cell_px,
                             bg_rgb,
                             rendered: rendered_img,
+                            last_crop: None,
                         },
                     );
                 } else {
@@ -563,35 +573,63 @@ impl HtmlPreviewOverlay {
                 }
             }
 
-            let Some(cached) = self.graphic_cache.get(&cache_key) else {
+            let Some(cached) = self.graphic_cache.get_mut(&cache_key) else {
                 continue;
             };
-            let rendered_img = &cached.rendered;
-            let slot_end = g_end.min(lines_to_render.len());
-            let slot_len = slot_end.saturating_sub(g.line_start);
+            let vis_start = g.line_start.max(scroll_top);
+            let vis_end = g_end.min(scroll_bottom);
 
-            if !proto.is_pixel() || rendered_img.pixel_payload.is_none() {
-                for offset in 0..slot_len {
-                    lines_to_render[g.line_start + offset] = rendered_img
-                        .lines
-                        .get(offset)
-                        .cloned()
-                        .unwrap_or_default();
+            if !proto.is_pixel() || cached.rendered.pixel_payload.is_none() {
+                for doc_line in vis_start..vis_end {
+                    let g_offset = doc_line - g.line_start;
+                    let vis_idx = doc_line - scroll_top;
+                    if vis_idx < visible_lines.len() {
+                        visible_lines[vis_idx] = cached
+                            .rendered
+                            .lines
+                            .get(g_offset)
+                            .cloned()
+                            .unwrap_or_default();
+                    }
                 }
             } else {
-                let vis_start = g.line_start.max(scroll_top);
-                let vis_end = g_end.min(scroll_bottom);
                 let vis_rows = vis_end.saturating_sub(vis_start) as u16;
                 let crop_y = vis_start.saturating_sub(g.line_start) as u16;
                 if vis_rows > 0 {
-                    if let Some((payload, draw_cols, draw_rows)) =
-                        rendered_img.viewport_pixel_payload(0, crop_y, avail_w, vis_rows)
+                    let crop_key = (crop_y, avail_w, vis_rows);
+                    let cached_crop = if cached
+                        .last_crop
+                        .as_ref()
+                        .is_some_and(|c| c.key == crop_key)
                     {
+                        cached
+                            .last_crop
+                            .as_ref()
+                            .map(|c| (c.payload.clone(), c.draw_cols, c.draw_rows))
+                    } else if let Some((payload, draw_cols, draw_rows)) =
+                        cached
+                            .rendered
+                            .viewport_pixel_payload(0, crop_y, avail_w, vis_rows)
+                    {
+                        cached.last_crop = Some(CachedGraphicCrop {
+                            key: crop_key,
+                            payload: payload.clone(),
+                            draw_cols,
+                            draw_rows,
+                        });
+                        Some((payload, draw_cols, draw_rows))
+                    } else {
+                        None
+                    };
+                    if let Some((payload, draw_cols, draw_rows)) = cached_crop {
                         let fit_cols = draw_cols.min(avail_w);
                         let fit_rows = draw_rows.min(vis_rows);
                         if fit_cols > 0 && fit_rows > 0 {
-                            for offset in 0..slot_len {
-                                lines_to_render[g.line_start + offset] = Line::default();
+                            for doc_line in vis_start..vis_end {
+                                let vis_idx = doc_line - scroll_top;
+                                if vis_idx < visible_lines.len() {
+                                    visible_lines[vis_idx] = Line::default();
+                                }
                             }
                             let screen_y = self.content_rect.y + (vis_start - scroll_top) as u16;
                             let draw_rect =
@@ -622,9 +660,8 @@ impl HtmlPreviewOverlay {
         }
 
         frame.render_widget(
-            Paragraph::new(lines_to_render)
-                .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
-                .scroll((self.session.scroll_y, 0)),
+            Paragraph::new(visible_lines)
+                .style(Style::default().bg(theme.bg_elevated).fg(theme.fg)),
             self.content_rect,
         );
 

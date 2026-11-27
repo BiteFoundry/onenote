@@ -933,23 +933,44 @@ pub async fn search_onenote_with_offset(
     let sec_filter = section_filter.map(str::trim).filter(|s| !s.is_empty());
     let end = offset.saturating_add(limit);
     let want = end.saturating_add(1);
+    let query_owned = query.to_string();
     let raw = match sec_filter {
-        None => storage.search_onenote_pages(query, None, want)?,
+        None => {
+            storage
+                .blocking(move |s| s.search_onenote_pages(&query_owned, None, want))
+                .await?
+        }
         Some(sec_q) if sec_q.contains('|') => {
-            storage.search_onenote_pages(query, Some(sec_q), want)?
+            let sec_owned = sec_q.to_string();
+            storage
+                .blocking(move |s| s.search_onenote_pages(&query_owned, Some(&sec_owned), want))
+                .await?
         }
         Some(sec_q) if sec_q.contains('/') => {
             let sec = resolve_onenote_section_query(storage, graph, sec_q, true).await?;
-            storage.search_onenote_pages(query, Some(&sec.section_key), want)?
+            let sec_key = sec.section_key;
+            storage
+                .blocking(move |s| s.search_onenote_pages(&query_owned, Some(&sec_key), want))
+                .await?
         }
         // A plain name is resolved to section keys first so the SQL limit applies
         // inside those sections instead of to a window of global hits.
         Some(sec_q) => {
-            let keys = section_keys_matching_name(storage, sec_q)?;
-            if keys.is_empty() {
-                return Ok((Vec::new(), Some(false)));
+            let sec_owned = sec_q.to_string();
+            let maybe_hits = storage
+                .blocking(move |s| {
+                    let keys = section_keys_matching_name(s, &sec_owned)?;
+                    if keys.is_empty() {
+                        return Ok(None);
+                    }
+                    s.search_onenote_pages_in_sections(&query_owned, &keys, want)
+                        .map(Some)
+                })
+                .await?;
+            match maybe_hits {
+                Some(hits) => hits,
+                None => return Ok((Vec::new(), Some(false))),
             }
-            storage.search_onenote_pages_in_sections(query, &keys, want)?
         }
     };
     let has_more = Some(raw.len() > end);

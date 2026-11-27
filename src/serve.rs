@@ -785,9 +785,11 @@ async fn create_notebook(
         .create_onenote_notebook(&scope, body.name.trim())
         .await
         .map_err(onenote_api_error)?;
+    let created_for_db = created.clone();
     let _ = state
         .storage
-        .upsert_onenote_notebooks(std::slice::from_ref(&created));
+        .blocking(move |s| s.upsert_onenote_notebooks(std::slice::from_ref(&created_for_db)))
+        .await;
     Ok(Json(json!({ "ok": true, "notebook": created })))
 }
 
@@ -826,9 +828,11 @@ async fn create_section(
         .create_onenote_section(&nb.scope, &nb.id, body.name.trim())
         .await
         .map_err(onenote_api_error)?;
+    let created_for_db = created.clone();
     let _ = state
         .storage
-        .upsert_onenote_sections(std::slice::from_ref(&created));
+        .blocking(move |s| s.upsert_onenote_sections(std::slice::from_ref(&created_for_db)))
+        .await;
     Ok(Json(json!({
         "ok": true,
         "notebook": nb,
@@ -880,7 +884,10 @@ async fn create_page(
     crate::graph::onenote::validate_page_creation_level(body.level)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let paths: Vec<PathBuf> = body.image_paths.iter().map(PathBuf::from).collect();
-    let inline_images = cli::load_inline_images_from_paths(&paths).map_err(onenote_api_error)?;
+    let inline_images = tokio::task::spawn_blocking(move || cli::load_inline_images_from_paths(&paths))
+        .await
+        .map_err(|err| ApiError::internal(format!("Failed to load inline images: {err}")))?
+        .map_err(onenote_api_error)?;
     let (section, page) = cli::create_onenote_page_helper(
         &state.storage,
         &state.graph,
@@ -983,8 +990,14 @@ async fn delete_page(
     )
     .await
     .map_err(onenote_api_error)?;
-    let section_key = resolver::resolve_page_cached(&state.storage, &target_page, None)
-        .and_then(resolver::PageResolution::into_option)
+    let target_for_resolve = target_page.clone();
+    let section_key = state
+        .storage
+        .blocking(move |s| {
+            resolver::resolve_page_cached(s, &target_for_resolve, None)
+                .and_then(resolver::PageResolution::into_option)
+        })
+        .await
         .map_err(onenote_api_error)?
         .map(|s| s.scope.make_entity_key(&s.section_id));
     let deleted = cli::delete_onenote_page_helper(&state.storage, &state.graph, &target_page)
@@ -1012,7 +1025,10 @@ async fn append_page(
     }
     let raw_image_paths = body.image_paths.or(body.images).unwrap_or_default();
     let paths: Vec<PathBuf> = raw_image_paths.iter().map(PathBuf::from).collect();
-    let inline_images = cli::load_inline_images_from_paths(&paths).map_err(onenote_api_error)?;
+    let inline_images = tokio::task::spawn_blocking(move || cli::load_inline_images_from_paths(&paths))
+        .await
+        .map_err(|err| ApiError::internal(format!("Failed to load inline images: {err}")))?
+        .map_err(onenote_api_error)?;
     let target_page = cli::resolve_page_query_in_section(
         &state.storage,
         &state.graph,

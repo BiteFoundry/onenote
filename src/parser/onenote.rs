@@ -1,6 +1,7 @@
 //! Microsoft OneNote XHTML <-> Rich AST / GFM Markdown parser and surgical Graph `PATCH` compiler.
 
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
 use anyhow::{bail, Context, Result};
 use bitefoundry_html::pulldown_cmark::{
@@ -16,6 +17,11 @@ use crate::models::{
     TextStyleFlags,
 };
 
+static TITLE_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("head > title, title").expect("valid title selector"));
+static BODY_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("body").expect("valid body selector"));
+
 // ---------------------------------------------------------------------------
 // 1. OneNote XHTML -> OnenotePageDetail (Rich AST + Markdown + Plain Text)
 // ---------------------------------------------------------------------------
@@ -30,20 +36,16 @@ pub fn parse_onenote_page_xhtml(
     let doc = Html::parse_document(&normalized_xhtml);
 
     // Populate title from <head><title> whenever present so stale cached summaries stay aligned.
-    if let Ok(title_sel) = Selector::parse("head > title, title") {
-        if let Some(title_el) = doc.select(&title_sel).next() {
-            let extracted_title = collapse_html_whitespace(&collect_raw_text(title_el))
-                .trim()
-                .to_string();
-            if !extracted_title.is_empty() {
-                summary.title = extracted_title;
-            }
+    if let Some(title_el) = doc.select(&TITLE_SELECTOR).next() {
+        let extracted_title = collapse_html_whitespace(&collect_raw_text(title_el))
+            .trim()
+            .to_string();
+        if !extracted_title.is_empty() {
+            summary.title = extracted_title;
         }
     }
 
-    let body_el = Selector::parse("body")
-        .ok()
-        .and_then(|sel| doc.select(&sel).next());
+    let body_el = doc.select(&BODY_SELECTOR).next();
 
     let primary_div_id = body_el.and_then(|body| {
         body.children()
@@ -1381,24 +1383,13 @@ fn normalize_xhtml_for_html5ever(raw: &str) -> Cow<'_, str> {
 }
 
 fn is_html5_void_tag(tag_name: &str) -> bool {
-    matches!(
-        tag_name.to_ascii_lowercase().as_str(),
-        "area"
-            | "base"
-            | "br"
-            | "col"
-            | "embed"
-            | "hr"
-            | "img"
-            | "input"
-            | "keygen"
-            | "link"
-            | "meta"
-            | "param"
-            | "source"
-            | "track"
-            | "wbr"
-    )
+    const VOID_TAGS: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "keygen", "link", "meta",
+        "param", "source", "track", "wbr",
+    ];
+    VOID_TAGS
+        .iter()
+        .any(|&void_tag| tag_name.eq_ignore_ascii_case(void_tag))
 }
 
 fn parse_data_tag(attr: Option<&str>) -> Option<OnenoteTagKind> {
@@ -3135,8 +3126,6 @@ fn replace_element(target: &str, content: String) -> OnenotePatchCommand {
 }
 
 fn page_body(doc: &Html) -> Option<ElementRef<'_>> {
-    static BODY_SELECTOR: std::sync::LazyLock<Selector> =
-        std::sync::LazyLock::new(|| Selector::parse("body").expect("valid body selector"));
     doc.select(&BODY_SELECTOR).next()
 }
 
@@ -3923,7 +3912,7 @@ fn parse_opening_tag_at(raw: &str, lt_idx: usize) -> Option<ParsedOpeningTag> {
                 if pos >= bytes.len() {
                     return None;
                 }
-                let val = unescape_basic_xml_entities(&raw[val_start..pos]);
+                let val = unescape_basic_xml_entities(&raw[val_start..pos]).into_owned();
                 pos += 1;
                 (pos, Some(val))
             } else {
@@ -3935,7 +3924,7 @@ fn parse_opening_tag_at(raw: &str, lt_idx: usize) -> Option<ParsedOpeningTag> {
                 {
                     pos += 1;
                 }
-                let val = unescape_basic_xml_entities(&raw[val_start..pos]);
+                let val = unescape_basic_xml_entities(&raw[val_start..pos]).into_owned();
                 (pos, Some(val))
             }
         } else {
@@ -4142,7 +4131,7 @@ fn rewrite_opening_tag_data_tag(raw: &str, mode: TagRewriteMode<'_>) -> Option<S
                 if pos >= bytes.len() {
                     return None;
                 }
-                let val = unescape_basic_xml_entities(&raw[val_start..pos]);
+                let val = unescape_basic_xml_entities(&raw[val_start..pos]).into_owned();
                 pos += 1;
                 (pos, Some(val))
             } else {
@@ -4154,7 +4143,7 @@ fn rewrite_opening_tag_data_tag(raw: &str, mode: TagRewriteMode<'_>) -> Option<S
                 {
                     pos += 1;
                 }
-                let val = unescape_basic_xml_entities(&raw[val_start..pos]);
+                let val = unescape_basic_xml_entities(&raw[val_start..pos]).into_owned();
                 (pos, Some(val))
             }
         } else {
@@ -4238,14 +4227,59 @@ fn rewrite_opening_tag_data_tag(raw: &str, mode: TagRewriteMode<'_>) -> Option<S
     }
 }
 
-fn unescape_basic_xml_entities(input: &str) -> String {
-    input
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
+fn unescape_basic_xml_entities(input: &str) -> Cow<'_, str> {
+    let bytes = input.as_bytes();
+    let Some(first_amp) = bytes.iter().position(|&b| b == b'&') else {
+        return Cow::Borrowed(input);
+    };
+    let mut out = String::with_capacity(input.len());
+    out.push_str(&input[..first_amp]);
+    let mut i = first_amp;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            let rest = &input[i..];
+            if rest.starts_with("&quot;") {
+                out.push('"');
+                i += 6;
+                continue;
+            }
+            if rest.starts_with("&#39;") {
+                out.push('\'');
+                i += 5;
+                continue;
+            }
+            if rest.starts_with("&apos;") {
+                out.push('\'');
+                i += 6;
+                continue;
+            }
+            if rest.starts_with("&lt;") {
+                out.push('<');
+                i += 4;
+                continue;
+            }
+            if rest.starts_with("&gt;") {
+                out.push('>');
+                i += 4;
+                continue;
+            }
+            if rest.starts_with("&amp;") {
+                out.push('&');
+                i += 5;
+                continue;
+            }
+            out.push('&');
+            i += 1;
+        } else {
+            let next_amp = bytes[i..]
+                .iter()
+                .position(|&b| b == b'&')
+                .map_or(bytes.len(), |rel| i + rel);
+            out.push_str(&input[i..next_amp]);
+            i = next_amp;
+        }
+    }
+    Cow::Owned(out)
 }
 
 fn reconstruct_block_xhtml_with_tag(

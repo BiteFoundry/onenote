@@ -231,6 +231,7 @@ pub struct UiState {
     pub onenote_scroll: usize,
     pub onenote_selected_block: usize,
     pub onenote_follow_selection: bool,
+    pub onenote_canvas_cache: Option<crate::ui::onenote_view::CanvasRenderCache>,
     pub inline_editor: Option<crate::ui::inline_editor::OnenoteInlineEditor>,
     pub pending_pixel_graphics: Vec<PendingPixelGraphic>,
     pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
@@ -275,6 +276,7 @@ impl UiState {
             onenote_scroll: 0,
             onenote_selected_block: 0,
             onenote_follow_selection: false,
+            onenote_canvas_cache: None,
             inline_editor: None,
             pending_pixel_graphics: Vec::new(),
             active_pixel_graphic: None,
@@ -358,6 +360,7 @@ pub struct AppState {
     pub sections: Vec<OnenoteSection>,
     pub pages: Vec<OnenotePageSummary>,
     pub page_details: HashMap<String, OnenotePageDetail>,
+    pub canvas_content_gen: u64,
     pub(super) previous_page_key: Option<String>,
 
     pub active_notebook_key: Option<String>,
@@ -450,6 +453,7 @@ impl AppState {
             sections: Vec::new(),
             pages: Vec::new(),
             page_details: HashMap::new(),
+            canvas_content_gen: 0,
             previous_page_key: None,
             active_notebook_key: None,
             active_section_key: None,
@@ -472,6 +476,10 @@ impl AppState {
             locally_created_notebooks: HashMap::new(),
             locally_created_sections: HashMap::new(),
         }
+    }
+
+    pub fn bump_canvas_gen(&mut self) {
+        self.canvas_content_gen = self.canvas_content_gen.wrapping_add(1);
     }
 }
 

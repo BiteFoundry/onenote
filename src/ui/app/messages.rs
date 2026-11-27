@@ -89,6 +89,7 @@ impl AppState {
             } => {
                 self.inflight_images.remove(&cache_key);
                 self.image_cache.insert(cache_key, rendered);
+                self.bump_canvas_gen();
             }
             UiMsg::ImageLoadFailed { cache_key, error } => {
                 self.handle_image_load_failed(ui, cache_key, error);
@@ -206,6 +207,7 @@ impl AppState {
             // Display the locally rendered preview immediately while background
             // `HydratePage` (triggered by `select_page`) upgrades with Graph `data-id`s.
             self.page_details.insert(pk.clone(), preview_detail);
+            self.bump_canvas_gen();
             self.select_page(pk, ui);
         }
         self.refresh_active_search(ui);
@@ -388,6 +390,7 @@ impl AppState {
         ui.tasks.finish(task_id);
         if let Some(prev) = rollback_detail {
             self.page_details.insert(page_key.clone(), *prev);
+            self.bump_canvas_gen();
         }
         if let Some(ref mut ed) = ui.inline_editor {
             if ed.page_key == page_key {
